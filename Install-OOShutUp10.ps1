@@ -65,6 +65,29 @@ $ExecutableName = "OOSU10.exe"
 
 #region Helper Functions
 
+function Update-ScriptProgress {
+    <#
+    .SYNOPSIS
+        Updates the overall script progress bar
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [int]$PercentComplete,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Status,
+
+        [Parameter(Mandatory = $false)]
+        [string]$CurrentOperation = ""
+    )
+
+    Write-Progress -Activity "O&O ShutUp10++ Installation and Configuration" `
+                   -Status $Status `
+                   -PercentComplete $PercentComplete `
+                   -CurrentOperation $CurrentOperation
+}
+
 function Initialize-LogFile {
     <#
     .SYNOPSIS
@@ -169,16 +192,14 @@ function Invoke-ScriptRelocation {
         Ensures the script is running from the default location
     #>
     [CmdletBinding()]
-    param()
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$CurrentScriptPath
+    )
 
     try {
-        $currentScriptPath = $MyInvocation.PSCommandPath
-        if ([string]::IsNullOrEmpty($currentScriptPath)) {
-            $currentScriptPath = $PSCommandPath
-        }
-
         # Check if already running from default location
-        if ($currentScriptPath -eq $DefaultScriptPath) {
+        if ($CurrentScriptPath -eq $DefaultScriptPath) {
             Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [INFO] Script is already running from default location" -ForegroundColor Cyan
             return $true
         }
@@ -192,21 +213,23 @@ function Invoke-ScriptRelocation {
         }
 
         # Copy script to default location
-        Copy-Item -Path $currentScriptPath -Destination $DefaultScriptPath -Force
+        Copy-Item -Path $CurrentScriptPath -Destination $DefaultScriptPath -Force
         Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [SUCCESS] Script copied to: $DefaultScriptPath" -ForegroundColor Green
 
         # Re-execute from default location with same parameters
         Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [INFO] Re-executing from default location..." -ForegroundColor Cyan
+        Write-Host ""
 
-        $arguments = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$DefaultScriptPath`"", "-SkipRelocate")
+        # Execute the relocated script directly using the call operator
         if ($ReapplyOnly) {
-            $arguments += "-ReapplyOnly"
+            & $DefaultScriptPath -SkipRelocate -ReapplyOnly
+        }
+        else {
+            & $DefaultScriptPath -SkipRelocate
         }
 
-        Start-Process -FilePath "PowerShell.exe" -ArgumentList $arguments -Wait -NoNewWindow
-
         # Exit this instance
-        exit 0
+        exit $LASTEXITCODE
     }
     catch {
         Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [ERROR] Failed to relocate script: $($_.Exception.Message)" -ForegroundColor Red
@@ -380,25 +403,62 @@ function Invoke-OOShutUpConfiguration {
 function New-SystemRestorePoint {
     <#
     .SYNOPSIS
-        Creates a system restore point
+        Creates a system restore point with progress indication
     #>
     [CmdletBinding()]
     param()
 
     try {
         Write-Log "Creating system restore point..." -Level INFO
+        Write-Log "This may take a few minutes. Please wait..." -Level INFO
 
         # Enable System Restore on C: drive if not already enabled
         Enable-ComputerRestore -Drive "C:\" -ErrorAction SilentlyContinue
 
-        # Create restore point
+        # Create restore point with progress indication
         $description = "Before O&O ShutUp10++ Privacy Settings - $(Get-Date -Format 'yyyy-MM-dd HH:mm')"
-        Checkpoint-Computer -Description $description -RestorePointType "MODIFY_SETTINGS"
+
+        # Start a background job to create the restore point
+        $job = Start-Job -ScriptBlock {
+            param($desc)
+            Checkpoint-Computer -Description $desc -RestorePointType "MODIFY_SETTINGS"
+        } -ArgumentList $description
+
+        # Show progress while waiting for the job to complete
+        $elapsed = 0
+        $maxWait = 300 # 5 minutes max
+
+        while ($job.State -eq 'Running' -and $elapsed -lt $maxWait) {
+            $seconds = $elapsed % 60
+            $minutes = [Math]::Floor($elapsed / 60)
+
+            if ($minutes -gt 0) {
+                $timeStr = "$minutes min $seconds sec"
+            } else {
+                $timeStr = "$seconds seconds"
+            }
+
+            Write-Progress -Activity "Creating System Restore Point" `
+                          -Status "Elapsed time: $timeStr" `
+                          -PercentComplete (($elapsed / $maxWait) * 100) `
+                          -CurrentOperation "Please wait while Windows creates a restore point..."
+
+            Start-Sleep -Seconds 1
+            $elapsed++
+        }
+
+        # Wait for job to complete and get result
+        $result = Wait-Job -Job $job | Receive-Job
+        Remove-Job -Job $job
+
+        # Clear the progress bar
+        Write-Progress -Activity "Creating System Restore Point" -Completed
 
         Write-Log "System restore point created successfully" -Level SUCCESS
         return $true
     }
     catch {
+        Write-Progress -Activity "Creating System Restore Point" -Completed
         Write-Log "Warning: Could not create restore point: $($_.Exception.Message)" -Level WARNING
         return $false
     }
@@ -487,7 +547,9 @@ function New-WindowsUpdateScheduledTask {
 "@
 
         # Use schtasks.exe for more reliable event trigger creation
-        # Build XML with proper variable substitution
+        # Build XML with proper escaping for the script path
+        $escapedScriptPath = $ScriptPath -replace '"', '&quot;'
+
         $schtasksXml = @"
 <?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
@@ -525,7 +587,7 @@ function New-WindowsUpdateScheduledTask {
   <Actions Context="Author">
     <Exec>
       <Command>PowerShell.exe</Command>
-      <Arguments>-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File &quot;$ScriptPath&quot; -ReapplyOnly -SkipRelocate</Arguments>
+      <Arguments>-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "$escapedScriptPath" -ReapplyOnly -SkipRelocate</Arguments>
     </Exec>
   </Actions>
 </Task>
@@ -565,14 +627,21 @@ function New-WindowsUpdateScheduledTask {
 try {
     # Step 0: Ensure script is running from default location (unless SkipRelocate is set)
     if (-not $SkipRelocate) {
+        Update-ScriptProgress -PercentComplete 5 -Status "Initializing..." -CurrentOperation "Checking script location"
+
         $currentPath = $PSCommandPath
+        if ([string]::IsNullOrEmpty($currentPath)) {
+            $currentPath = $MyInvocation.MyCommand.Path
+        }
+
         if ($currentPath -ne $DefaultScriptPath) {
-            Invoke-ScriptRelocation
+            Invoke-ScriptRelocation -CurrentScriptPath $currentPath
             # If we reach here, relocation failed, but continue anyway
         }
     }
 
     # Initialize logging
+    Update-ScriptProgress -PercentComplete 10 -Status "Initializing..." -CurrentOperation "Setting up logging"
     Initialize-LogFile | Out-Null
 
     # If ReapplyOnly mode, just reapply settings and exit
@@ -614,6 +683,7 @@ try {
     Write-Log "" -Level INFO
 
     # Step 1: Check if already installed
+    Update-ScriptProgress -PercentComplete 15 -Status "Step 1 of 5: Checking Installation" -CurrentOperation "Checking if O&O ShutUp10++ is already installed"
     Write-Log "Step 1: Checking if O&O ShutUp10++ is already installed..." -Level INFO
     $isInstalled = Test-OOShutUpInstalled
 
@@ -621,10 +691,12 @@ try {
         Write-Log "O&O ShutUp10++ not found. Proceeding with download..." -Level INFO
 
         # Step 2: Download the application
+        Update-ScriptProgress -PercentComplete 20 -Status "Step 1 of 5: Installing Application" -CurrentOperation "Downloading O&O ShutUp10++"
         Write-Log "Step 2: Downloading O&O ShutUp10++..." -Level INFO
         $downloadSuccess = Install-OOShutUp
 
         if (-not $downloadSuccess) {
+            Write-Progress -Activity "O&O ShutUp10++ Installation and Configuration" -Completed
             Write-Log "Failed to download O&O ShutUp10++. Exiting." -Level ERROR
             exit 1
         }
@@ -634,32 +706,39 @@ try {
     }
 
     # Step 3: Get executable path
+    Update-ScriptProgress -PercentComplete 25 -Status "Step 1 of 5: Verifying Installation" -CurrentOperation "Locating O&O ShutUp10++ executable"
     $exePath = Get-OOShutUpPath
     if (-not $exePath) {
+        Write-Progress -Activity "O&O ShutUp10++ Installation and Configuration" -Completed
         Write-Log "Could not locate O&O ShutUp10++ executable. Exiting." -Level ERROR
         exit 1
     }
 
     Write-Log "Using O&O ShutUp10++ at: $exePath" -Level INFO
 
-    # Step 3: Configure registry to allow frequent restore points
+    # Step 2: Configure registry to allow frequent restore points
+    Update-ScriptProgress -PercentComplete 30 -Status "Step 2 of 5: Configuring System" -CurrentOperation "Configuring registry for frequent restore points"
     Write-Log "Step 2: Configuring system for frequent restore points..." -Level INFO
     Set-RestorePointFrequency | Out-Null
 
-    # Step 4: Create restore point BEFORE applying settings
+    # Step 3: Create restore point BEFORE applying settings
+    Update-ScriptProgress -PercentComplete 40 -Status "Step 3 of 5: Creating Restore Point" -CurrentOperation "Creating system restore point (this may take a few minutes)"
     Write-Log "Step 3: Creating system restore point..." -Level INFO
     New-SystemRestorePoint | Out-Null
 
-    # Step 5: Apply recommended settings
+    # Step 4: Apply recommended settings
+    Update-ScriptProgress -PercentComplete 70 -Status "Step 4 of 5: Applying Privacy Settings" -CurrentOperation "Applying recommended privacy settings"
     Write-Log "Step 4: Applying recommended privacy settings..." -Level INFO
     $configSuccess = Invoke-OOShutUpConfiguration -ExecutablePath $exePath
 
     if (-not $configSuccess) {
+        Write-Progress -Activity "O&O ShutUp10++ Installation and Configuration" -Completed
         Write-Log "Failed to apply privacy settings. Please run O&O ShutUp10++ manually." -Level ERROR
         exit 1
     }
 
-    # Step 6: Create scheduled task for post-Windows Update execution
+    # Step 5: Create scheduled task for post-Windows Update execution
+    Update-ScriptProgress -PercentComplete 85 -Status "Step 5 of 5: Creating Scheduled Task" -CurrentOperation "Setting up automatic reapplication after Windows updates"
     Write-Log "Step 5: Creating scheduled task for post-Windows Update execution..." -Level INFO
     # Always use the default script path for the scheduled task
     $taskCreated = New-WindowsUpdateScheduledTask -ScriptPath $DefaultScriptPath
@@ -671,7 +750,8 @@ try {
         Write-Log "Warning: Could not create scheduled task. Privacy settings may need manual reapplication after Windows updates." -Level WARNING
     }
 
-    # Step 7: Completion message
+    # Step 6: Completion
+    Update-ScriptProgress -PercentComplete 100 -Status "Complete!" -CurrentOperation "Configuration completed successfully"
     Write-Log "" -Level INFO
     Write-Log "=== Configuration Complete ===" -Level SUCCESS
     Write-Log "" -Level INFO
@@ -683,6 +763,9 @@ try {
     Write-Log "" -Level INFO
     Write-Log "IMPORTANT: Please restart your computer to activate all privacy settings." -Level WARNING
     Write-Log "" -Level INFO
+
+    # Clear the progress bar
+    Write-Progress -Activity "O&O ShutUp10++ Installation and Configuration" -Completed
 
     # Prompt for restart
     $restart = Read-Host "Would you like to restart now? (Y/N)"
@@ -696,6 +779,7 @@ try {
     }
 }
 catch {
+    Write-Progress -Activity "O&O ShutUp10++ Installation and Configuration" -Completed
     Write-Log "An unexpected error occurred: $($_.Exception.Message)" -Level ERROR
     Write-Log "Stack Trace: $($_.ScriptStackTrace)" -Level ERROR
     exit 1

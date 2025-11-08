@@ -1,5 +1,52 @@
 # O&O ShutUp10++ Automated Installation and Configuration
 
+---
+
+## Developed by myTech.Today
+
+**Professional IT Services - Serving the Midwest**
+
+This PowerShell automation script is developed and maintained by **myTech.Today**, a professional IT consulting and managed services provider with 20+ years of experience delivering customized technology solutions.
+
+### About myTech.Today
+
+**myTech.Today** specializes in providing expert IT consulting, automation, and support services to businesses and individuals across the Midwest. We deliver personalized solutions that improve efficiency, enhance security, and drive business value.
+
+**Our Services:**
+- IT Consulting and Support
+- Custom PowerShell Automation and Scripting
+- Infrastructure Optimization and System Administration
+- Cloud Integration (Azure, AWS, Microsoft 365)
+- Network Design and Management
+- Cybersecurity and Compliance Solutions
+- Database Management and Custom Development
+- System Setup, Upgrades, and Troubleshooting
+- Virus and Spyware Removal
+- Hardware Procurement, Installation, and Configuration
+
+**Service Area:**
+- Chicagoland, IL (Lake Zurich and surrounding areas)
+- Northern Illinois
+- Southern Wisconsin
+- Northern Indiana
+- Southern Michigan
+
+**Contact Information:**
+- **Email:** sales@mytech.today
+- **Phone:** (847) 767-4914
+- **Website:** https://mytech.today
+- **GitHub:** [@mytech-today-now](https://github.com/mytech-today-now)
+- **LinkedIn:** [linkedin.com/in/kylerode](https://linkedin.com/in/kylerode)
+
+**Why Choose myTech.Today?**
+- 20+ years of IT consulting and software development experience
+- Personalized service to 190+ satisfied clients
+- 5-star review rating with consistent 24-hour solution delivery
+- Payment-upon-success terms available
+- Expertise in Windows automation, PowerShell scripting, and system optimization
+
+---
+
 ## Overview
 
 This PowerShell script automates the installation and configuration of **O&O ShutUp10++**, a privacy tool that helps protect Windows users from Microsoft telemetry and spyware by applying recommended privacy settings.
@@ -278,10 +325,86 @@ This script is provided as-is for educational and personal use. O&O ShutUp10++ i
 
 ## Author
 
-Auto-generated based on requirements for automated O&O ShutUp10++ installation and configuration with post-Windows Update protection.
+**Developed by:** myTech.Today
+**Author:** Kyle C. Rode
+**Copyright:** (c) 2025 myTech.Today. All rights reserved.
+
+This script was developed based on requirements for automated O&O ShutUp10++ installation and configuration with post-Windows Update protection, leveraging 20+ years of IT consulting and PowerShell automation expertise.
 
 ## Version History
 
 - **v1.0** - Initial release with basic installation and configuration
 - **v2.0** - Added scheduled task for post-Windows Update reapplication
+- **v3.0** - Added script relocation, file-based logging, and registry modification for restore points
+
+---
+
+## Need Professional IT Support?
+
+**myTech.Today** is here to help with all your technology needs!
+
+### Our Expertise
+
+With over 20 years of experience in IT consulting and software development, we provide comprehensive technology solutions tailored to your specific needs. From simple troubleshooting to complex infrastructure optimization, we deliver results that drive business value.
+
+### Services We Offer
+
+**IT Consulting & Support:**
+- Expert consultation on purchasing decisions and system setup
+- Troubleshooting and problem resolution
+- System upgrades and optimization
+- Virus and spyware removal
+- Security solutions and compliance
+
+**Custom Development & Automation:**
+- PowerShell scripting and automation
+- Custom application development (C#, Python, React/Node)
+- Database management and integration
+- Workflow optimization
+- EDI and ERP systems integration
+
+**Infrastructure & Cloud Services:**
+- Infrastructure optimization and system administration
+- Cloud integration (Azure, AWS, Microsoft 365)
+- Network design and management
+- Server administration (Windows & Linux)
+- Backup and disaster recovery solutions
+
+**Specialized Services:**
+- Active Directory and Group Policy management
+- Email server setup and configuration
+- Website design and maintenance
+- SEO and digital marketing
+- Remote support and VPN solutions
+
+### Why Choose myTech.Today?
+
+- **Experienced:** 20+ years delivering technology solutions
+- **Trusted:** Serving 190+ satisfied clients with a 5-star rating
+- **Responsive:** Consistent 24-hour solution delivery
+- **Flexible:** Payment-upon-success terms available
+- **Results-Driven:** Proven track record of exceeding client goals
+
+### Service Area
+
+We proudly serve businesses and individuals throughout the Midwest:
+- **Chicagoland, IL** - Lake Zurich and surrounding areas
+- **Northern Illinois**
+- **Southern Wisconsin**
+- **Northern Indiana**
+- **Southern Michigan**
+
+### Get in Touch
+
+Ready to optimize your technology infrastructure? Contact us today!
+
+**Email:** sales@mytech.today
+**Phone:** (847) 767-4914
+**Website:** https://mytech.today
+**GitHub:** [@mytech-today-now](https://github.com/mytech-today-now)
+**LinkedIn:** [linkedin.com/in/kylerode](https://linkedin.com/in/kylerode)
+
+---
+
+**myTech.Today** - *Professional IT Services Delivering Results Since 2016*
 
