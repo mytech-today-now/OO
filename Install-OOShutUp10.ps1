@@ -18,10 +18,32 @@
     If specified, only reapplies privacy settings without installation or task creation.
     This is used by the scheduled task after Windows updates.
 
+.PARAMETER SkipRelocate
+    If specified, skips the script relocation to the default location.
+    Used internally to prevent infinite loops.
+
 .NOTES
     File Name      : Install-OOShutUp10.ps1
-    Author         : Auto-generated
+    Author         : Kyle C. Rode / myTech.Today
+    Company        : myTech.Today
+    Version        : 2.0.0
+    DateCreated    : 2025-01-08
+    LastModified   : 2025-01-08
+    Copyright      : (c) 2025 myTech.Today. All rights reserved.
     Prerequisite   : PowerShell 5.1+, Administrator privileges
+
+    About myTech.Today:
+    myTech.Today is a Chicagoland-based MSP and IT consulting firm specializing in
+    PowerShell automation, infrastructure optimization, and custom development solutions.
+    With 20+ years of experience, we deliver tech solutions that improve efficiency
+    and drive business value.
+
+    Contact Information:
+    - Email: sales@mytech.today
+    - Website: https://mytech.today
+    - Phone: (847) 767-4914
+    - Location: Lake Zurich, IL (Chicagoland area)
+    - GitHub: https://github.com/mytech-today-now
 
 .EXAMPLE
     .\Install-OOShutUp10.ps1
@@ -30,6 +52,12 @@
 .EXAMPLE
     .\Install-OOShutUp10.ps1 -ReapplyOnly
     Only reapplies privacy settings (used by scheduled task)
+
+.LINK
+    https://mytech.today
+
+.LINK
+    https://github.com/mytech-today-now/OO
 #>
 
 [CmdletBinding()]
@@ -64,6 +92,53 @@ $InstallPath = "$env:ProgramFiles\OO Software\O&O ShutUp10"
 $ExecutableName = "OOSU10.exe"
 
 #region Helper Functions
+
+function Show-MyTechTodayBanner {
+    <#
+    .SYNOPSIS
+        Displays the myTech.Today marketing banner
+    #>
+    param()
+
+    # Each line must be exactly 78 characters between the pipes
+    $lines = @(
+        "",
+        "+==============================================================================+",
+        "|                                                                              |",
+        "|                            myTech.Today                                      |",
+        "|                   Professional IT Solutions & Automation                     |",
+        "|                                                                              |",
+        "+==============================================================================+",
+        "|                                                                              |",
+        "|  This script is brought to you by myTech.Today - Your trusted partner       |",
+        "|  for IT consulting, managed services, and custom automation solutions.      |",
+        "|                                                                              |",
+        "|  Services:                                                                   |",
+        "|    - PowerShell Automation & Scripting                                      |",
+        "|    - Infrastructure Optimization                                            |",
+        "|    - Custom Application Development                                         |",
+        "|    - Cloud Integration (AWS, Azure, Google Cloud)                           |",
+        "|    - Managed IT Services (MSP)                                              |",
+        "|    - IT Consulting & Support                                                |",
+        "|                                                                              |",
+        "|  Service Area: Chicagoland (Lake Zurich, IL) & Remote Support Available     |",
+        "|                                                                              |",
+        "|  Contact Us:                                                                 |",
+        "|    Email:    sales@mytech.today                                             |",
+        "|    Website:  https://mytech.today                                           |",
+        "|    Phone:    (847) 767-4914                                                 |",
+        "|    GitHub:   https://github.com/mytech-today-now                            |",
+        "|                                                                              |",
+        "|  20+ Years of Experience | 190+ Satisfied Clients | 5-Star Rating           |",
+        "|                                                                              |",
+        "+==============================================================================+",
+        ""
+    )
+
+    foreach ($line in $lines) {
+        Write-Host $line -ForegroundColor Cyan
+    }
+}
 
 function Update-ScriptProgress {
     <#
@@ -117,9 +192,41 @@ function Initialize-LogFile {
         if (-not (Test-Path $LogFilePath)) {
             $header = @"
 # O&O ShutUp10++ Installation and Configuration Log
+
+**Created by**: myTech.Today
+**Author**: Kyle C. Rode
+**Website**: https://mytech.today
+**Email**: sales@mytech.today
+**Phone**: (847) 767-4914
+**Location**: Lake Zurich, IL (Chicagoland area)
+
 **Log Started**: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
 
 ---
+
+## About myTech.Today
+
+myTech.Today is a professional IT consulting and managed services provider (MSP)
+specializing in PowerShell automation, infrastructure optimization, and custom
+development solutions. With over 20 years of experience, we deliver technology
+solutions that improve efficiency and drive business value.
+
+**Our Services:**
+- PowerShell Automation & Scripting
+- Infrastructure Optimization
+- Custom Application Development
+- Cloud Integration (AWS, Azure, Google Cloud)
+- Managed IT Services (MSP)
+- IT Consulting & Support
+
+**Service Area**: Chicagoland (Lake Zurich, IL) with remote support available nationwide
+
+**Contact Us**: For professional IT services and custom automation solutions,
+visit https://mytech.today or call (847) 767-4914
+
+---
+
+## Installation Log
 
 "@
             $header | Out-File -FilePath $LogFilePath -Encoding UTF8 -Force
@@ -372,26 +479,35 @@ function Invoke-OOShutUpConfiguration {
         [Parameter(Mandatory = $true)]
         [string]$ExecutablePath
     )
-    
+
     try {
         Write-Log "Applying recommended privacy settings..." -Level INFO
-        
+
         # O&O ShutUp10++ command line arguments:
         # /quiet - Silent mode
         # /nosrp - Don't create restore point (we'll create our own)
         # ooshutup10.cfg - Apply recommended settings
-        
+
         $arguments = "/quiet /nosrp ooshutup10.cfg"
-        
+
         $processInfo = Start-Process -FilePath $ExecutablePath -ArgumentList $arguments -Wait -PassThru -NoNewWindow
-        
-        if ($processInfo.ExitCode -eq 0) {
+
+        # O&O ShutUp10++ exit codes:
+        # 0 = Success (no changes needed)
+        # 30 = Success (settings applied successfully) - This is the NORMAL success code
+        # Other codes may indicate issues
+
+        if ($processInfo.ExitCode -eq 0 -or $processInfo.ExitCode -eq 30) {
             Write-Log "Successfully applied recommended privacy settings" -Level SUCCESS
+            if ($processInfo.ExitCode -eq 30) {
+                Write-Log "Settings were applied and changes were made (exit code 30 is normal)" -Level INFO
+            }
             return $true
         }
         else {
-            Write-Log "O&O ShutUp10++ exited with code: $($processInfo.ExitCode)" -Level WARNING
-            return $true  # Still return true as some exit codes are non-critical
+            Write-Log "O&O ShutUp10++ exited with unexpected code: $($processInfo.ExitCode)" -Level WARNING
+            Write-Log "Settings may not have been applied correctly. Please check manually." -Level WARNING
+            return $false
         }
     }
     catch {
@@ -421,7 +537,13 @@ function New-SystemRestorePoint {
         # Start a background job to create the restore point
         $job = Start-Job -ScriptBlock {
             param($desc)
-            Checkpoint-Computer -Description $desc -RestorePointType "MODIFY_SETTINGS"
+            try {
+                Checkpoint-Computer -Description $desc -RestorePointType "MODIFY_SETTINGS" -ErrorAction Stop
+                return @{ Success = $true; Message = "Restore point created successfully" }
+            }
+            catch {
+                return @{ Success = $false; Message = $_.Exception.Message }
+            }
         } -ArgumentList $description
 
         # Show progress while waiting for the job to complete
@@ -447,15 +569,31 @@ function New-SystemRestorePoint {
             $elapsed++
         }
 
-        # Wait for job to complete and get result
-        $result = Wait-Job -Job $job | Receive-Job
-        Remove-Job -Job $job
+        # Check if job completed or timed out
+        if ($job.State -eq 'Running') {
+            # Job timed out
+            Write-Log "Restore point creation timed out after $maxWait seconds" -Level WARNING
+            Stop-Job -Job $job
+            Remove-Job -Job $job -Force
+            Write-Progress -Activity "Creating System Restore Point" -Completed
+            return $false
+        }
+
+        # Job completed - get the result
+        $result = Receive-Job -Job $job -Wait -AutoRemoveJob
 
         # Clear the progress bar
         Write-Progress -Activity "Creating System Restore Point" -Completed
 
-        Write-Log "System restore point created successfully" -Level SUCCESS
-        return $true
+        if ($result -and $result.Success) {
+            Write-Log "System restore point created successfully" -Level SUCCESS
+            return $true
+        }
+        else {
+            $errorMsg = if ($result.Message) { $result.Message } else { "Unknown error" }
+            Write-Log "Warning: Could not create restore point: $errorMsg" -Level WARNING
+            return $false
+        }
     }
     catch {
         Write-Progress -Activity "Creating System Restore Point" -Completed
@@ -664,6 +802,18 @@ try {
         }
     }
 
+    # Determine if we're running from the default location
+    $currentScriptPath = $PSCommandPath
+    if ([string]::IsNullOrEmpty($currentScriptPath)) {
+        $currentScriptPath = $MyInvocation.MyCommand.Path
+    }
+    $isRunningFromDefaultLocation = ($currentScriptPath -eq $DefaultScriptPath)
+
+    # Display myTech.Today banner only when running from default location
+    if ($isRunningFromDefaultLocation) {
+        Show-MyTechTodayBanner
+    }
+
     # Initialize logging
     Update-ScriptProgress -PercentComplete 10 -Status "Initializing..." -CurrentOperation "Setting up logging"
     Initialize-LogFile | Out-Null
@@ -790,6 +940,50 @@ try {
 
     # Clear the progress bar
     Write-Progress -Activity "O&O ShutUp10++ Installation and Configuration" -Completed
+
+    # Display marketing footer only when running from default location
+    if ($isRunningFromDefaultLocation) {
+        $footerLines = @(
+            "",
+            "+==============================================================================+",
+            "|                                                                              |",
+            "|                   Thank You for Using myTech.Today Scripts!                 |",
+            "|                                                                              |",
+            "+==============================================================================+",
+            "|                                                                              |",
+            "|  Need Professional IT Support or Custom Automation?                         |",
+            "|                                                                              |",
+            "|  myTech.Today offers comprehensive IT services including:                   |",
+            "|    - Custom PowerShell automation and scripting solutions                   |",
+            "|    - Infrastructure optimization and management                             |",
+            "|    - Cloud migration and integration services                               |",
+            "|    - Managed IT services (MSP) for businesses                               |",
+            "|    - 24/7 IT support and consulting                                         |",
+            "|                                                                              |",
+            "|  Why Choose myTech.Today?                                                   |",
+            "|    - 20+ years of IT experience                                             |",
+            "|    - 190+ satisfied clients                                                 |",
+            "|    - 5-star customer rating                                                 |",
+            "|    - Fast 24-hour solution delivery                                         |",
+            "|    - Serving Chicagoland and remote clients nationwide                      |",
+            "|                                                                              |",
+            "|  Get a Free Consultation:                                                   |",
+            "|    Call: (847) 767-4914                                                     |",
+            "|    Email: sales@mytech.today                                                |",
+            "|    Visit: https://mytech.today                                              |",
+            "|                                                                              |",
+            "|  Follow Us:                                                                  |",
+            "|    GitHub: https://github.com/mytech-today-now                              |",
+            "|    LinkedIn: https://linkedin.com/in/kylerode                               |",
+            "|                                                                              |",
+            "+==============================================================================+",
+            ""
+        )
+
+        foreach ($line in $footerLines) {
+            Write-Host $line -ForegroundColor Green
+        }
+    }
 
     # Prompt for restart
     $restart = Read-Host "Would you like to restart now? (Y/N)"
