@@ -488,70 +488,129 @@ function New-WindowsUpdateScheduledTask {
             schtasks.exe /Delete /TN $taskName /F 2>$null | Out-Null
         }
 
-        # Build the task XML with proper escaping
-        # Note: We need to escape special XML characters in the script path
-        $xmlScriptPath = [System.Security.SecurityElement]::Escape($ScriptPath)
+        # Build the task XML using XmlDocument for proper escaping
+        $xml = New-Object System.Xml.XmlDocument
 
-        # Build the arguments string
-        $arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File &quot;$xmlScriptPath&quot; -ReapplyOnly -SkipRelocate"
+        # Create XML declaration
+        $xmlDeclaration = $xml.CreateXmlDeclaration("1.0", "UTF-16", $null)
+        $xml.AppendChild($xmlDeclaration) | Out-Null
 
-        # Create the complete task XML
-        $taskXml = @"
-<?xml version="1.0" encoding="UTF-16"?>
-<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <RegistrationInfo>
-    <Description>$taskDescription</Description>
-    <Author>myTech.Today</Author>
-    <URI>\$taskName</URI>
-  </RegistrationInfo>
-  <Triggers>
-    <EventTrigger>
-      <Enabled>true</Enabled>
-      <Subscription>&lt;QueryList&gt;&lt;Query Id="0" Path="System"&gt;&lt;Select Path="System"&gt;*[System[Provider[@Name='Microsoft-Windows-WindowsUpdateClient'] and (EventID=19 or EventID=43)]]&lt;/Select&gt;&lt;/Query&gt;&lt;/QueryList&gt;</Subscription>
-      <Delay>PT2M</Delay>
-    </EventTrigger>
-  </Triggers>
-  <Principals>
-    <Principal id="Author">
-      <UserId>S-1-5-18</UserId>
-      <RunLevel>HighestAvailable</RunLevel>
-    </Principal>
-  </Principals>
-  <Settings>
-    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
-    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
-    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
-    <AllowHardTerminate>true</AllowHardTerminate>
-    <StartWhenAvailable>true</StartWhenAvailable>
-    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
-    <AllowStartOnDemand>true</AllowStartOnDemand>
-    <Enabled>true</Enabled>
-    <Hidden>false</Hidden>
-    <RunOnlyIfIdle>false</RunOnlyIfIdle>
-    <WakeToRun>false</WakeToRun>
-    <ExecutionTimeLimit>PT1H</ExecutionTimeLimit>
-    <Priority>7</Priority>
-  </Settings>
-  <Actions Context="Author">
-    <Exec>
-      <Command>PowerShell.exe</Command>
-      <Arguments>$arguments</Arguments>
-    </Exec>
-  </Actions>
-</Task>
-"@
+        # Create root Task element
+        $task = $xml.CreateElement("Task")
+        $task.SetAttribute("version", "1.2")
+        $task.SetAttribute("xmlns", "http://schemas.microsoft.com/windows/2004/02/mit/task")
+        $xml.AppendChild($task) | Out-Null
+
+        # RegistrationInfo
+        $regInfo = $xml.CreateElement("RegistrationInfo")
+        $desc = $xml.CreateElement("Description")
+        $desc.InnerText = $taskDescription
+        $regInfo.AppendChild($desc) | Out-Null
+        $task.AppendChild($regInfo) | Out-Null
+
+        # Triggers
+        $triggers = $xml.CreateElement("Triggers")
+        $eventTrigger = $xml.CreateElement("EventTrigger")
+
+        $enabled = $xml.CreateElement("Enabled")
+        $enabled.InnerText = "true"
+        $eventTrigger.AppendChild($enabled) | Out-Null
+
+        $subscription = $xml.CreateElement("Subscription")
+        $subscription.InnerText = "<QueryList><Query Id=`"0`" Path=`"System`"><Select Path=`"System`">*[System[Provider[@Name='Microsoft-Windows-WindowsUpdateClient'] and (EventID=19 or EventID=43)]]</Select></Query></QueryList>"
+        $eventTrigger.AppendChild($subscription) | Out-Null
+
+        $delay = $xml.CreateElement("Delay")
+        $delay.InnerText = "PT2M"
+        $eventTrigger.AppendChild($delay) | Out-Null
+
+        $triggers.AppendChild($eventTrigger) | Out-Null
+        $task.AppendChild($triggers) | Out-Null
+
+        # Principals
+        $principals = $xml.CreateElement("Principals")
+        $principal = $xml.CreateElement("Principal")
+        $principal.SetAttribute("id", "Author")
+
+        $userId = $xml.CreateElement("UserId")
+        $userId.InnerText = "S-1-5-18"
+        $principal.AppendChild($userId) | Out-Null
+
+        $runLevel = $xml.CreateElement("RunLevel")
+        $runLevel.InnerText = "HighestAvailable"
+        $principal.AppendChild($runLevel) | Out-Null
+
+        $principals.AppendChild($principal) | Out-Null
+        $task.AppendChild($principals) | Out-Null
+
+        # Settings
+        $settings = $xml.CreateElement("Settings")
+
+        $multipleInstances = $xml.CreateElement("MultipleInstancesPolicy")
+        $multipleInstances.InnerText = "IgnoreNew"
+        $settings.AppendChild($multipleInstances) | Out-Null
+
+        $disallowBattery = $xml.CreateElement("DisallowStartIfOnBatteries")
+        $disallowBattery.InnerText = "false"
+        $settings.AppendChild($disallowBattery) | Out-Null
+
+        $stopBattery = $xml.CreateElement("StopIfGoingOnBatteries")
+        $stopBattery.InnerText = "false"
+        $settings.AppendChild($stopBattery) | Out-Null
+
+        $startAvailable = $xml.CreateElement("StartWhenAvailable")
+        $startAvailable.InnerText = "true"
+        $settings.AppendChild($startAvailable) | Out-Null
+
+        $enabled2 = $xml.CreateElement("Enabled")
+        $enabled2.InnerText = "true"
+        $settings.AppendChild($enabled2) | Out-Null
+
+        $task.AppendChild($settings) | Out-Null
+
+        # Actions
+        $actions = $xml.CreateElement("Actions")
+        $actions.SetAttribute("Context", "Author")
+
+        $exec = $xml.CreateElement("Exec")
+
+        $command = $xml.CreateElement("Command")
+        $command.InnerText = "PowerShell.exe"
+        $exec.AppendChild($command) | Out-Null
+
+        $arguments = $xml.CreateElement("Arguments")
+        $arguments.InnerText = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$ScriptPath`" -ReapplyOnly -SkipRelocate"
+        $exec.AppendChild($arguments) | Out-Null
+
+        $actions.AppendChild($exec) | Out-Null
+        $task.AppendChild($actions) | Out-Null
+
+        # Convert XML to string
+        $stringWriter = New-Object System.IO.StringWriter
+        $xmlWriter = New-Object System.Xml.XmlTextWriter($stringWriter)
+        $xmlWriter.Formatting = "Indented"
+        $xml.WriteContentTo($xmlWriter)
+        $xmlWriter.Flush()
+        $stringWriter.Flush()
+        $taskXml = $stringWriter.ToString()
 
         # Save XML to temp file with UTF-16 encoding (required by schtasks)
         $tempXmlPath = "$env:TEMP\OOShutUp10Task.xml"
 
+        # Also save a copy for debugging
+        $debugXmlPath = "$env:TEMP\OOShutUp10Task_Debug.xml"
+
         # Write the XML file with proper encoding
         [System.IO.File]::WriteAllText($tempXmlPath, $taskXml, [System.Text.Encoding]::Unicode)
+        [System.IO.File]::WriteAllText($debugXmlPath, $taskXml, [System.Text.Encoding]::Unicode)
+
+        Write-Log "Task XML saved to: $debugXmlPath (for debugging)" -Level INFO
 
         # Create the task using schtasks.exe
         Write-Log "Registering scheduled task with Windows Task Scheduler..." -Level INFO
         $result = schtasks.exe /Create /TN $taskName /XML $tempXmlPath /F 2>&1
 
-        # Clean up temp file
+        # Clean up temp file (but keep debug file)
         Remove-Item $tempXmlPath -Force -ErrorAction SilentlyContinue
 
         # Check if task creation was successful
