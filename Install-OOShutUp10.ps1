@@ -481,80 +481,28 @@ function New-WindowsUpdateScheduledTask {
         $taskName = "OOShutUp10-PostWindowsUpdate"
         $taskDescription = "Reapplies O&O ShutUp10++ privacy settings after Windows updates to prevent Microsoft from resetting privacy configurations"
 
-        # Check if task already exists
+        # Delete existing task if it exists
         $existingTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
         if ($existingTask) {
             Write-Log "Scheduled task already exists. Removing old task..." -Level INFO
-            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
+            schtasks.exe /Delete /TN $taskName /F 2>$null | Out-Null
         }
 
-        # Create action - run PowerShell with the script in ReapplyOnly mode
-        $action = New-ScheduledTaskAction -Execute "PowerShell.exe" `
-            -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$ScriptPath`" -ReapplyOnly -SkipRelocate"
+        # Build the task XML with proper escaping
+        # Note: We need to escape special XML characters in the script path
+        $xmlScriptPath = [System.Security.SecurityElement]::Escape($ScriptPath)
 
-        # Create multiple triggers for different Windows Update events
-        # Trigger 1: Windows Update successful installation (Event ID 19)
-        $trigger1 = New-ScheduledTaskTrigger -AtLogOn
-        $trigger1CimInstance = Get-CimInstance -ClassName MSFT_TaskEventTrigger -Namespace Root/Microsoft/Windows/TaskScheduler -Property * |
-            Where-Object { $_.Subscription -eq $null } | Select-Object -First 1
+        # Build the arguments string
+        $arguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File &quot;$xmlScriptPath&quot; -ReapplyOnly -SkipRelocate"
 
-        # Create Event Trigger XML for Windows Update completion
-        $triggerXml = @"
-<QueryList>
-  <Query Id="0" Path="System">
-    <Select Path="System">
-      *[System[Provider[@Name='Microsoft-Windows-WindowsUpdateClient'] and (EventID=19 or EventID=43)]]
-    </Select>
-  </Query>
-</QueryList>
-"@
-
-        # Create the trigger using CIM
-        $trigger = New-ScheduledTaskTrigger -AtStartup  # Temporary trigger, will be replaced
-
-        # Create principal (run with highest privileges as SYSTEM)
-        $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-
-        # Create settings
-        $settings = New-ScheduledTaskSettingsSet `
-            -AllowStartIfOnBatteries `
-            -DontStopIfGoingOnBatteries `
-            -StartWhenAvailable `
-            -RunOnlyIfNetworkAvailable:$false `
-            -DontStopOnIdleEnd `
-            -MultipleInstances IgnoreNew
-
-        # Register the task
-        $task = Register-ScheduledTask `
-            -TaskName $taskName `
-            -Description $taskDescription `
-            -Action $action `
-            -Trigger $trigger `
-            -Principal $principal `
-            -Settings $settings `
-            -Force
-
-        # Now update the task with the proper Event Trigger using XML
-        $taskXml = Export-ScheduledTask -TaskName $taskName
-
-        # Replace the trigger section with event-based trigger
-        $eventTrigger = @"
-    <EventTrigger>
-      <Enabled>true</Enabled>
-      <Subscription>&lt;QueryList&gt;&lt;Query Id="0" Path="System"&gt;&lt;Select Path="System"&gt;*[System[Provider[@Name='Microsoft-Windows-WindowsUpdateClient'] and (EventID=19 or EventID=43)]]&lt;/Select&gt;&lt;/Query&gt;&lt;/QueryList&gt;</Subscription>
-      <Delay>PT2M</Delay>
-    </EventTrigger>
-"@
-
-        # Use schtasks.exe for more reliable event trigger creation
-        # Build XML with proper escaping for the script path
-        $escapedScriptPath = $ScriptPath -replace '"', '&quot;'
-
-        $schtasksXml = @"
+        # Create the complete task XML
+        $taskXml = @"
 <?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
     <Description>$taskDescription</Description>
+    <Author>myTech.Today</Author>
+    <URI>\$taskName</URI>
   </RegistrationInfo>
   <Triggers>
     <EventTrigger>
@@ -587,35 +535,52 @@ function New-WindowsUpdateScheduledTask {
   <Actions Context="Author">
     <Exec>
       <Command>PowerShell.exe</Command>
-      <Arguments>-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "$escapedScriptPath" -ReapplyOnly -SkipRelocate</Arguments>
+      <Arguments>$arguments</Arguments>
     </Exec>
   </Actions>
 </Task>
 "@
 
-        # Save XML to temp file
+        # Save XML to temp file with UTF-16 encoding (required by schtasks)
         $tempXmlPath = "$env:TEMP\OOShutUp10Task.xml"
-        $schtasksXml | Out-File -FilePath $tempXmlPath -Encoding Unicode -Force
 
-        # Delete existing task and recreate with schtasks
-        schtasks.exe /Delete /TN $taskName /F 2>$null | Out-Null
+        # Write the XML file with proper encoding
+        [System.IO.File]::WriteAllText($tempXmlPath, $taskXml, [System.Text.Encoding]::Unicode)
+
+        # Create the task using schtasks.exe
+        Write-Log "Registering scheduled task with Windows Task Scheduler..." -Level INFO
         $result = schtasks.exe /Create /TN $taskName /XML $tempXmlPath /F 2>&1
 
         # Clean up temp file
         Remove-Item $tempXmlPath -Force -ErrorAction SilentlyContinue
 
+        # Check if task creation was successful
         if ($LASTEXITCODE -eq 0) {
             Write-Log "Successfully created scheduled task '$taskName'" -Level SUCCESS
-            Write-Log "Task will run after Windows Update events (Event IDs 19, 43)" -Level INFO
-            return $true
+            Write-Log "Task will run 2 minutes after Windows Update events (Event IDs 19, 43)" -Level INFO
+
+            # Verify the task was created
+            $verifyTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+            if ($verifyTask) {
+                Write-Log "Task verification: Scheduled task is registered and ready" -Level SUCCESS
+                return $true
+            }
+            else {
+                Write-Log "Warning: Task creation reported success but task not found in scheduler" -Level WARNING
+                return $false
+            }
         }
         else {
-            Write-Log "Warning: Could not create event-based trigger: $result" -Level WARNING
+            # Parse the error message
+            $errorMsg = $result | Out-String
+            Write-Log "Error creating scheduled task: $errorMsg" -Level ERROR
+            Write-Log "Exit code: $LASTEXITCODE" -Level ERROR
             return $false
         }
     }
     catch {
         Write-Log "Error creating scheduled task: $($_.Exception.Message)" -Level ERROR
+        Write-Log "Stack trace: $($_.ScriptStackTrace)" -Level ERROR
         return $false
     }
 }
