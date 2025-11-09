@@ -326,7 +326,6 @@ This script is provided as-is for educational and personal use. O&O ShutUp10++ i
 ## Author
 
 **Developed by:** myTech.Today
-**Author:** Kyle C. Rode
 **Copyright:** (c) 2025 myTech.Today. All rights reserved.
 
 This script was developed based on requirements for automated O&O ShutUp10++ installation and configuration with post-Windows Update protection, leveraging 20+ years of IT consulting and PowerShell automation expertise.
@@ -402,7 +401,6 @@ Ready to optimize your technology infrastructure? Contact us today!
 **Phone:** (847) 767-4914
 **Website:** https://mytech.today
 **GitHub:** [@mytech-today-now](https://github.com/mytech-today-now)
-**LinkedIn:** [linkedin.com/in/kylerode](https://linkedin.com/in/kylerode)
 
 ---
 
