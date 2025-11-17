@@ -74,8 +74,8 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
 # Default installation paths
-$DefaultScriptRoot = "$env:SystemRoot\myTech.Today\OOShutup"
-$DefaultLogRoot = "$env:SystemRoot\myTech.Today\logs"
+$DefaultScriptRoot = "$env:USERPROFILE\myTech.Today\OOShutup"
+$DefaultLogRoot = "$env:USERPROFILE\myTech.Today\"
 $ScriptFileName = "Install-OOShutUp10.ps1"
 $DefaultScriptPath = Join-Path $DefaultScriptRoot $ScriptFileName
 
@@ -83,6 +83,97 @@ $DefaultScriptPath = Join-Path $DefaultScriptRoot $ScriptFileName
 $LogFileName = "OOShutup-$(Get-Date -Format 'yyyy-MM').md"
 $LogFilePath = Join-Path $DefaultLogRoot $LogFileName
 $MaxLogSizeBytes = 10MB  # Rotate log if it exceeds 10MB
+
+# Import generic logging module from GitHub for centralized logging
+$loggingUrl = 'https://raw.githubusercontent.com/mytech-today-now/scripts/refs/heads/main/logging.ps1'
+$script:LoggingModuleLoaded = $false
+
+try {
+    Write-Host "Loading generic logging module for O&O ShutUp10++..." -ForegroundColor Cyan
+    Invoke-Expression (Invoke-WebRequest -Uri $loggingUrl -UseBasicParsing).Content
+    $script:LoggingModuleLoaded = $true
+    Write-Host "[OK] Generic logging module loaded successfully" -ForegroundColor Green
+}
+catch {
+    Write-Host "[WARN] Could not load generic logging module from GitHub: $($_.Exception.Message)" -ForegroundColor Yellow
+    Write-Host "[WARN] Falling back to local lightweight logging implementation." -ForegroundColor Yellow
+
+    function Initialize-LocalLogging {
+        [CmdletBinding()]
+        param()
+
+        try {
+            # Ensure log directory exists
+            $logDir = Split-Path $LogFilePath -Parent
+            if (-not (Test-Path $logDir)) {
+                New-Item -Path $logDir -ItemType Directory -Force | Out-Null
+            }
+
+            if (-not (Test-Path $LogFilePath)) {
+                $header = @"
+# O&O ShutUp10++ Log
+
+**Script Version:** 2.0.0
+**Log Started:** $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+**Computer:** $env:COMPUTERNAME
+**User:** $env:USERNAME
+
+---
+
+## Activity Log
+
+| Timestamp | Level | Message |
+|-----------|-------|---------|
+
+"@
+                Set-Content -Path $LogFilePath -Value $header -Force
+            }
+
+            $script:LogPath = $LogFilePath
+        }
+        catch {
+            Write-Warning "Failed to initialize local logging: $_"
+        }
+    }
+
+    function Write-Log {
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory = $true)]
+            [string]$Message,
+
+            [Parameter(Mandatory = $false)]
+            [ValidateSet('INFO', 'WARNING', 'ERROR', 'SUCCESS')]
+            [string]$Level = 'INFO'
+        )
+
+        try {
+            $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+            $icon = switch ($Level) {
+                'INFO'    { '[i]' }
+                'WARNING' { '[!]' }
+                'ERROR'   { '[X]' }
+                'SUCCESS' { '[OK]' }
+            }
+
+            $entry = "| $timestamp | $icon **$Level** | $Message |"
+
+            if ($LogFilePath -and (Test-Path $LogFilePath)) {
+                Add-Content -Path $LogFilePath -Value $entry -ErrorAction SilentlyContinue
+            }
+
+            switch ($Level) {
+                'INFO'    { Write-Host "INFO: $Message" -ForegroundColor Cyan }
+                'WARNING' { Write-Warning $Message }
+                'ERROR'   { Write-Host "ERROR: $Message" -ForegroundColor Red }
+                'SUCCESS' { Write-Host "SUCCESS: $Message" -ForegroundColor Green }
+            }
+        }
+        catch {
+            Write-Warning "Failed to write log: $_"
+        }
+    }
+}
 
 # O&O ShutUp10++ configuration
 $AppName = "O&O ShutUp10++"
@@ -163,135 +254,6 @@ function Update-ScriptProgress {
                    -CurrentOperation $CurrentOperation
 }
 
-function Initialize-LogFile {
-    <#
-    .SYNOPSIS
-        Initializes the log file and ensures directory exists
-    #>
-    param()
-
-    try {
-        # Create log directory if it doesn't exist
-        if (-not (Test-Path $DefaultLogRoot)) {
-            New-Item -Path $DefaultLogRoot -ItemType Directory -Force | Out-Null
-        }
-
-        # Check if log file exists and is too large
-        if (Test-Path $LogFilePath) {
-            $logFile = Get-Item $LogFilePath
-            if ($logFile.Length -gt $MaxLogSizeBytes) {
-                # Rotate log file
-                $rotatedName = "OOShutup-$(Get-Date -Format 'yyyy-MM-dd_HHmmss').md"
-                $rotatedPath = Join-Path $DefaultLogRoot $rotatedName
-                Move-Item -Path $LogFilePath -Destination $rotatedPath -Force
-                Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [INFO] Log file rotated to: $rotatedName" -ForegroundColor Cyan
-            }
-        }
-
-        # Create log file if it doesn't exist
-        if (-not (Test-Path $LogFilePath)) {
-            $header = @"
-# O&O ShutUp10++ Installation and Configuration Log
-
-**Created by**: myTech.Today
-**Author**: Kyle C. Rode
-**Website**: https://mytech.today
-**Email**: sales@mytech.today
-**Phone**: (847) 767-4914
-**Location**: Lake Zurich, IL (Chicagoland area)
-
-**Log Started**: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
-
----
-
-## About myTech.Today
-
-myTech.Today is a professional IT consulting and managed services provider (MSP)
-specializing in PowerShell automation, infrastructure optimization, and custom
-development solutions. With over 20 years of experience, we deliver technology
-solutions that improve efficiency and drive business value.
-
-**Our Services:**
-- PowerShell Automation & Scripting
-- Infrastructure Optimization
-- Custom Application Development
-- Cloud Integration (AWS, Azure, Google Cloud)
-- Managed IT Services (MSP)
-- IT Consulting & Support
-
-**Service Area**: Chicagoland (Lake Zurich, IL) with remote support available nationwide
-
-**Contact Us**: For professional IT services and custom automation solutions,
-visit https://mytech.today or call (847) 767-4914
-
----
-
-## Installation Log
-
-"@
-            $header | Out-File -FilePath $LogFilePath -Encoding UTF8 -Force
-        }
-
-        return $true
-    }
-    catch {
-        Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [WARNING] Could not initialize log file: $($_.Exception.Message)" -ForegroundColor Yellow
-        return $false
-    }
-}
-
-function Write-Log {
-    <#
-    .SYNOPSIS
-        Writes formatted log messages to console and file
-    #>
-    param(
-        [Parameter(Mandatory = $false)]
-        [string]$Message = "",
-
-        [Parameter(Mandatory = $false)]
-        [ValidateSet('INFO', 'SUCCESS', 'WARNING', 'ERROR')]
-        [string]$Level = 'INFO'
-    )
-
-    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-
-    # Allow empty messages for spacing
-    if ([string]::IsNullOrEmpty($Message)) {
-        Write-Host ""
-        # Add spacing to log file too
-        try {
-            "" | Out-File -FilePath $LogFilePath -Append -Encoding UTF8 -ErrorAction SilentlyContinue
-        } catch {}
-        return
-    }
-
-    $color = switch ($Level) {
-        'INFO'    { 'Cyan' }
-        'SUCCESS' { 'Green' }
-        'WARNING' { 'Yellow' }
-        'ERROR'   { 'Red' }
-    }
-
-    # Console output
-    Write-Host "[$timestamp] [$Level] $Message" -ForegroundColor $color
-
-    # File output in Markdown format
-    try {
-        $mdLevel = switch ($Level) {
-            'INFO'    { '📘' }
-            'SUCCESS' { '✅' }
-            'WARNING' { '⚠️' }
-            'ERROR'   { '❌' }
-        }
-
-        $logEntry = "**[$timestamp]** $mdLevel **$Level**: $Message"
-        $logEntry | Out-File -FilePath $LogFilePath -Append -Encoding UTF8 -ErrorAction SilentlyContinue
-    }
-    catch {
-        # Silently fail if we can't write to log file
-    }
-}
 
 function Invoke-ScriptRelocation {
     <#
@@ -383,28 +345,28 @@ function Test-OOShutUpInstalled {
     [CmdletBinding()]
     [OutputType([bool])]
     param()
-    
+
     # Check common installation paths
     $possiblePaths = @(
         "$env:ProgramFiles\OO Software\O&O ShutUp10\$ExecutableName",
         "$env:ProgramFiles\OOShutUp10\$ExecutableName",
         "$env:LOCALAPPDATA\Programs\OOShutUp10\$ExecutableName"
     )
-    
+
     foreach ($path in $possiblePaths) {
         if (Test-Path $path) {
             Write-Log "Found O&O ShutUp10++ at: $path" -Level SUCCESS
             return $true
         }
     }
-    
+
     # Check if executable exists in PATH
     $exeInPath = Get-Command $ExecutableName -ErrorAction SilentlyContinue
     if ($exeInPath) {
         Write-Log "Found O&O ShutUp10++ in PATH: $($exeInPath.Source)" -Level SUCCESS
         return $true
     }
-    
+
     return $false
 }
 
@@ -416,25 +378,25 @@ function Get-OOShutUpPath {
     [CmdletBinding()]
     [OutputType([string])]
     param()
-    
+
     $possiblePaths = @(
         "$env:ProgramFiles\OO Software\O&O ShutUp10\$ExecutableName",
         "$env:ProgramFiles\OOShutUp10\$ExecutableName",
         "$env:LOCALAPPDATA\Programs\OOShutUp10\$ExecutableName",
         "$TempPath"
     )
-    
+
     foreach ($path in $possiblePaths) {
         if (Test-Path $path) {
             return $path
         }
     }
-    
+
     $exeInPath = Get-Command $ExecutableName -ErrorAction SilentlyContinue
     if ($exeInPath) {
         return $exeInPath.Source
     }
-    
+
     return $null
 }
 
@@ -445,14 +407,14 @@ function Install-OOShutUp {
     #>
     [CmdletBinding()]
     param()
-    
+
     try {
         Write-Log "Downloading O&O ShutUp10++ from: $DownloadUrl" -Level INFO
-        
+
         # Download the executable
         $webClient = New-Object System.Net.WebClient
         $webClient.DownloadFile($DownloadUrl, $TempPath)
-        
+
         if (Test-Path $TempPath) {
             $fileSize = (Get-Item $TempPath).Length / 1MB
             Write-Log "Successfully downloaded O&O ShutUp10++ ($([Math]::Round($fileSize, 2)) MB)" -Level SUCCESS
@@ -816,12 +778,35 @@ try {
 
     # Initialize logging
     Update-ScriptProgress -PercentComplete 10 -Status "Initializing..." -CurrentOperation "Setting up logging"
-    Initialize-LogFile | Out-Null
+
+    if ($script:LoggingModuleLoaded -and (Get-Command Initialize-Log -ErrorAction SilentlyContinue)) {
+        $script:LogPath = Initialize-Log -ScriptName "Install-OOShutUp10.ps1" -ScriptVersion "2.0.0"
+
+        if ($script:LogPath) {
+            Write-Log "Logging initialized using generic logging module" -Level INFO
+            Write-Log "Log Location: $script:LogPath" -Level INFO
+        }
+        else {
+            Write-Host "[WARN] Logging module did not return a log path. Logging may be limited." -ForegroundColor Yellow
+        }
+    }
+    elseif (Get-Command Initialize-LocalLogging -ErrorAction SilentlyContinue) {
+        Initialize-LocalLogging
+        $script:LogPath = $LogFilePath
+        if (Get-Command Write-Log -ErrorAction SilentlyContinue) {
+            Write-Log "Logging initialized using local fallback implementation" -Level INFO
+            Write-Log "Log Location: $script:LogPath" -Level INFO
+        }
+    }
+    else {
+        Write-Host "[WARN] No logging implementation available. Logging will be limited to console output." -ForegroundColor Yellow
+    }
+
 
     # If ReapplyOnly mode, just reapply settings and exit
     if ($ReapplyOnly) {
         Write-Log "=== O&O ShutUp10++ Post-Windows Update Reapplication ===" -Level INFO
-        Write-Log "" -Level INFO
+        Write-Log " " -Level INFO
         Write-Log "Running in ReapplyOnly mode (triggered by Windows Update)" -Level INFO
 
         # Get executable path
@@ -851,10 +836,10 @@ try {
 
     # Normal installation mode
     Write-Log "=== O&O ShutUp10++ Automated Installation and Configuration ===" -Level INFO
-    Write-Log "" -Level INFO
+    Write-Log " " -Level INFO
     Write-Log "Script Location: $DefaultScriptPath" -Level INFO
-    Write-Log "Log Location: $LogFilePath" -Level INFO
-    Write-Log "" -Level INFO
+    Write-Log "Log Location: $script:LogPath" -Level INFO
+    Write-Log " " -Level INFO
 
     # Step 1: Check if already installed
     Update-ScriptProgress -PercentComplete 15 -Status "Step 1 of 5: Checking Installation" -CurrentOperation "Checking if O&O ShutUp10++ is already installed"
@@ -926,17 +911,17 @@ try {
 
     # Step 6: Completion
     Update-ScriptProgress -PercentComplete 100 -Status "Complete!" -CurrentOperation "Configuration completed successfully"
-    Write-Log "" -Level INFO
+    Write-Log " " -Level INFO
     Write-Log "=== Configuration Complete ===" -Level SUCCESS
-    Write-Log "" -Level INFO
+    Write-Log " " -Level INFO
     Write-Log "O&O ShutUp10++ has been configured with recommended privacy settings." -Level SUCCESS
     Write-Log "A system restore point has been created for safety." -Level SUCCESS
     if ($taskCreated) {
         Write-Log "A scheduled task has been created to reapply settings after Windows updates." -Level SUCCESS
     }
-    Write-Log "" -Level INFO
+    Write-Log " " -Level INFO
     Write-Log "IMPORTANT: Please restart your computer to activate all privacy settings." -Level WARNING
-    Write-Log "" -Level INFO
+    Write-Log " " -Level INFO
 
     # Clear the progress bar
     Write-Progress -Activity "O&O ShutUp10++ Installation and Configuration" -Completed

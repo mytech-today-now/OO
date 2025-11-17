@@ -1,0 +1,41 @@
+# Ignore OS-specific and editor files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# VS Code and other IDE metadata
+.vscode/
+*.code-workspace
+.idea/
+*.suo
+*.user
+
+# PowerShell/local overrides and backups
+*.ps1.local
+*.psm1.local
+*.ps1.bak
+*.ps1.backup
+*.ps1.tmp
+*.ps1~*
+*.psm1.bak
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+*.cache
+
+# Test and coverage outputs (if generated locally)
+TestResults/
+coverage/
+
+# Archives / packaged artifacts
+*.zip
+*.7z
+*.rar
+*.tar
+*.gz
+
+# Ignore local content folders
+other_files/
+
