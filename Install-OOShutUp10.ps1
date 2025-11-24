@@ -73,16 +73,13 @@ param(
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
+# Script metadata
+$script:ScriptVersion = '2.0.0'
+
 # Default installation paths
-$DefaultScriptRoot = "$env:USERPROFILE\myTech.Today\OOShutup"
-$DefaultLogRoot = "$env:USERPROFILE\myTech.Today\logs"
+$DefaultScriptRoot = "$env:USERPROFILE\myTech.Today\scripts\Install-OOShutUp10"
 $ScriptFileName = "Install-OOShutUp10.ps1"
 $DefaultScriptPath = Join-Path $DefaultScriptRoot $ScriptFileName
-
-# Log configuration
-$LogFileName = "OOShutup-$(Get-Date -Format 'yyyy-MM').md"
-$LogFilePath = Join-Path $DefaultLogRoot $LogFileName
-$MaxLogSizeBytes = 10MB  # Rotate log if it exceeds 10MB
 
 # O&O ShutUp10++ configuration
 $AppName = "O&O ShutUp10++"
@@ -90,6 +87,40 @@ $DownloadUrl = "https://dl5.oo-software.com/files/ooshutup10/OOSU10.exe"
 $TempPath = "$env:TEMP\OOSU10.exe"
 $InstallPath = "$env:ProgramFiles\OO Software\O&O ShutUp10"
 $ExecutableName = "OOSU10.exe"
+
+#region Load Logging Module
+
+# Load shared logging module from GitHub
+$loggingUrl = 'https://raw.githubusercontent.com/mytech-today-now/scripts/refs/heads/main/logging.ps1'
+$script:LoggingModuleLoaded = $false
+
+try {
+    Write-Host "[INFO] Loading logging module..." -ForegroundColor Cyan
+    Invoke-Expression (Invoke-WebRequest -Uri $loggingUrl -UseBasicParsing).Content
+    $script:LoggingModuleLoaded = $true
+    Write-Host "[OK] Logging module loaded successfully" -ForegroundColor Green
+}
+catch {
+    Write-Host "[FAIL] Failed to load logging module: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "[INFO] Continuing without centralized logging..." -ForegroundColor Yellow
+
+    # Fallback logging function (minimal implementation)
+    function Write-Log {
+        param(
+            [Parameter(Mandatory = $true)]
+            [string]$Message,
+
+            [Parameter(Mandatory = $false)]
+            [ValidateSet('INFO', 'SUCCESS', 'WARNING', 'ERROR')]
+            [string]$Level = 'INFO'
+        )
+
+        $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+        Write-Host "[$timestamp] [$Level] $Message"
+    }
+}
+
+#endregion
 
 #region Helper Functions
 
@@ -163,135 +194,25 @@ function Update-ScriptProgress {
                    -CurrentOperation $CurrentOperation
 }
 
+#region Logging Wrapper
+
 function Initialize-LogFile {
     <#
     .SYNOPSIS
-        Initializes the log file and ensures directory exists
+        Initializes centralized myTech.Today logging for this script.
     #>
     param()
 
-    try {
-        # Create log directory if it doesn't exist
-        if (-not (Test-Path $DefaultLogRoot)) {
-            New-Item -Path $DefaultLogRoot -ItemType Directory -Force | Out-Null
-        }
-
-        # Check if log file exists and is too large
-        if (Test-Path $LogFilePath) {
-            $logFile = Get-Item $LogFilePath
-            if ($logFile.Length -gt $MaxLogSizeBytes) {
-                # Rotate log file
-                $rotatedName = "OOShutup-$(Get-Date -Format 'yyyy-MM-dd_HHmmss').md"
-                $rotatedPath = Join-Path $DefaultLogRoot $rotatedName
-                Move-Item -Path $LogFilePath -Destination $rotatedPath -Force
-                Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [INFO] Log file rotated to: $rotatedName" -ForegroundColor Cyan
-            }
-        }
-
-        # Create log file if it doesn't exist
-        if (-not (Test-Path $LogFilePath)) {
-            $header = @"
-# O&O ShutUp10++ Installation and Configuration Log
-
-**Created by**: myTech.Today
-**Author**: Kyle C. Rode
-**Website**: https://mytech.today
-**Email**: sales@mytech.today
-**Phone**: (847) 767-4914
-**Location**: Lake Zurich, IL (Chicagoland area)
-
-**Log Started**: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
-
----
-
-## About myTech.Today
-
-myTech.Today is a professional IT consulting and managed services provider (MSP)
-specializing in PowerShell automation, infrastructure optimization, and custom
-development solutions. With over 20 years of experience, we deliver technology
-solutions that improve efficiency and drive business value.
-
-**Our Services:**
-- PowerShell Automation & Scripting
-- Infrastructure Optimization
-- Custom Application Development
-- Cloud Integration (AWS, Azure, Google Cloud)
-- Managed IT Services (MSP)
-- IT Consulting & Support
-
-**Service Area**: Chicagoland (Lake Zurich, IL) with remote support available nationwide
-
-**Contact Us**: For professional IT services and custom automation solutions,
-visit https://mytech.today or call (847) 767-4914
-
----
-
-## Installation Log
-
-"@
-            $header | Out-File -FilePath $LogFilePath -Encoding UTF8 -Force
-        }
-
+    if ($script:LoggingModuleLoaded -and (Get-Command -Name Initialize-Log -ErrorAction SilentlyContinue)) {
+        Initialize-Log -ScriptName 'Install-OOShutUp10' -ScriptVersion $script:ScriptVersion
         return $true
     }
-    catch {
-        Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [WARNING] Could not initialize log file: $($_.Exception.Message)" -ForegroundColor Yellow
-        return $false
-    }
+
+    # Fallback: no centralized logging available
+    return $false
 }
 
-function Write-Log {
-    <#
-    .SYNOPSIS
-        Writes formatted log messages to console and file
-    #>
-    param(
-        [Parameter(Mandatory = $false)]
-        [string]$Message = "",
-
-        [Parameter(Mandatory = $false)]
-        [ValidateSet('INFO', 'SUCCESS', 'WARNING', 'ERROR')]
-        [string]$Level = 'INFO'
-    )
-
-    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-
-    # Allow empty messages for spacing
-    if ([string]::IsNullOrEmpty($Message)) {
-        Write-Host ""
-        # Add spacing to log file too
-        try {
-            "" | Out-File -FilePath $LogFilePath -Append -Encoding UTF8 -ErrorAction SilentlyContinue
-        } catch {}
-        return
-    }
-
-    $color = switch ($Level) {
-        'INFO'    { 'Cyan' }
-        'SUCCESS' { 'Green' }
-        'WARNING' { 'Yellow' }
-        'ERROR'   { 'Red' }
-    }
-
-    # Console output
-    Write-Host "[$timestamp] [$Level] $Message" -ForegroundColor $color
-
-    # File output in Markdown format
-    try {
-        $mdLevel = switch ($Level) {
-            'INFO'    { '📘' }
-            'SUCCESS' { '✅' }
-            'WARNING' { '⚠️' }
-            'ERROR'   { '❌' }
-        }
-
-        $logEntry = "**[$timestamp]** $mdLevel **$Level**: $Message"
-        $logEntry | Out-File -FilePath $LogFilePath -Append -Encoding UTF8 -ErrorAction SilentlyContinue
-    }
-    catch {
-        # Silently fail if we can't write to log file
-    }
-}
+#endregion
 
 function Invoke-ScriptRelocation {
     <#
@@ -616,14 +537,32 @@ function New-WindowsUpdateScheduledTask {
     try {
         Write-Log "Creating scheduled task for post-Windows Update execution..." -Level INFO
 
-        $taskName = "OOShutUp10-PostWindowsUpdate"
+        # Task is created as Install-OOShutUp10 under \myTech.Today\
+        $taskName     = "Install-OOShutUp10"
+        $taskFolder   = "myTech.Today"
+        $taskFullPath = "\$taskFolder\$taskName"
         $taskDescription = "Reapplies O&O ShutUp10++ privacy settings after Windows updates to prevent Microsoft from resetting privacy configurations"
 
-        # Delete existing task if it exists
-        $existingTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-        if ($existingTask) {
-            Write-Log "Scheduled task already exists. Removing old task..." -Level INFO
-            schtasks.exe /Delete /TN $taskName /F 2>$null | Out-Null
+        # Remove any existing tasks with this name, including legacy tasks outside \myTech.Today\
+        $existingTasks = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+        if ($existingTasks) {
+            foreach ($task in @($existingTasks)) {
+                $fullPath = "${($task.TaskPath)}${($task.TaskName)}"
+
+                if ($task.TaskPath -eq "\$taskFolder\") {
+                    Write-Log "Removing existing scheduled task in \myTech.Today\ folder so it can be recreated with the latest configuration: $fullPath" -Level INFO
+                }
+                else {
+                    Write-Log "Removing legacy scheduled task outside \myTech.Today\ folder: $fullPath" -Level INFO
+                }
+
+                try {
+                    schtasks.exe /Delete /TN $fullPath /F 2>$null | Out-Null
+                }
+                catch {
+                    Write-Log "Warning: Failed to remove existing scheduled task at path $fullPath : $($_.Exception.Message)" -Level WARNING
+                }
+            }
         }
 
         # Build the task XML using XmlDocument for proper escaping
@@ -744,22 +683,23 @@ function New-WindowsUpdateScheduledTask {
 
         Write-Log "Task XML saved to: $debugXmlPath (for debugging)" -Level INFO
 
-        # Create the task using schtasks.exe
-        Write-Log "Registering scheduled task with Windows Task Scheduler..." -Level INFO
-        $result = schtasks.exe /Create /TN $taskName /XML $tempXmlPath /F 2>&1
+        # Create the task using schtasks.exe under the \myTech.Today\ folder
+        Write-Log "Registering scheduled task with Windows Task Scheduler under \\myTech.Today\\..." -Level INFO
+        $result = schtasks.exe /Create /TN $taskFullPath /XML $tempXmlPath /F 2>&1
 
         # Clean up temp file (but keep debug file)
         Remove-Item $tempXmlPath -Force -ErrorAction SilentlyContinue
 
         # Check if task creation was successful
         if ($LASTEXITCODE -eq 0) {
-            Write-Log "Successfully created scheduled task '$taskName'" -Level SUCCESS
+            Write-Log "Successfully created scheduled task '$taskFullPath'" -Level SUCCESS
             Write-Log "Task will run 2 minutes after Windows Update events (Event IDs 19, 43)" -Level INFO
 
-            # Verify the task was created
-            $verifyTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+            # Verify the task was created in the correct folder
+            $verifyTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue |
+                Where-Object { $_.TaskPath -eq "\$taskFolder\" }
             if ($verifyTask) {
-                Write-Log "Task verification: Scheduled task is registered and ready" -Level SUCCESS
+                Write-Log "Task verification: Scheduled task is registered under \\myTech.Today\\ and ready" -Level SUCCESS
                 return $true
             }
             else {
@@ -816,12 +756,17 @@ try {
 
     # Initialize logging
     Update-ScriptProgress -PercentComplete 10 -Status "Initializing..." -CurrentOperation "Setting up logging"
-    Initialize-LogFile | Out-Null
+    try {
+        Initialize-LogFile | Out-Null
+    }
+    catch {
+        Write-Host "[WARN] Could not initialize centralized logging: $_" -ForegroundColor Yellow
+    }
 
     # If ReapplyOnly mode, just reapply settings and exit
     if ($ReapplyOnly) {
         Write-Log "=== O&O ShutUp10++ Post-Windows Update Reapplication ===" -Level INFO
-        Write-Log "" -Level INFO
+        Write-Log " " -Level INFO
         Write-Log "Running in ReapplyOnly mode (triggered by Windows Update)" -Level INFO
 
         # Get executable path
@@ -851,10 +796,18 @@ try {
 
     # Normal installation mode
     Write-Log "=== O&O ShutUp10++ Automated Installation and Configuration ===" -Level INFO
-    Write-Log "" -Level INFO
+    Write-Log " " -Level INFO
     Write-Log "Script Location: $DefaultScriptPath" -Level INFO
-    Write-Log "Log Location: $LogFilePath" -Level INFO
-    Write-Log "" -Level INFO
+    try {
+        $logPath = Get-LogPath
+        if ($logPath) {
+            Write-Log "Log Location: $logPath" -Level INFO
+        }
+    }
+    catch {
+        Write-Log "Log Location: (unavailable - Get-LogPath failed)" -Level WARNING
+    }
+    Write-Log " " -Level INFO
 
     # Step 1: Check if already installed
     Update-ScriptProgress -PercentComplete 15 -Status "Step 1 of 5: Checking Installation" -CurrentOperation "Checking if O&O ShutUp10++ is already installed"
@@ -926,17 +879,17 @@ try {
 
     # Step 6: Completion
     Update-ScriptProgress -PercentComplete 100 -Status "Complete!" -CurrentOperation "Configuration completed successfully"
-    Write-Log "" -Level INFO
+    Write-Log " " -Level INFO
     Write-Log "=== Configuration Complete ===" -Level SUCCESS
-    Write-Log "" -Level INFO
+    Write-Log " " -Level INFO
     Write-Log "O&O ShutUp10++ has been configured with recommended privacy settings." -Level SUCCESS
     Write-Log "A system restore point has been created for safety." -Level SUCCESS
     if ($taskCreated) {
         Write-Log "A scheduled task has been created to reapply settings after Windows updates." -Level SUCCESS
     }
-    Write-Log "" -Level INFO
+    Write-Log " " -Level INFO
     Write-Log "IMPORTANT: Please restart your computer to activate all privacy settings." -Level WARNING
-    Write-Log "" -Level INFO
+    Write-Log " " -Level INFO
 
     # Clear the progress bar
     Write-Progress -Activity "O&O ShutUp10++ Installation and Configuration" -Completed
