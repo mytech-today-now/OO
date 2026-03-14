@@ -66,7 +66,10 @@ param(
     [switch]$ReapplyOnly,
 
     [Parameter(Mandatory = $false)]
-    [switch]$SkipRelocate
+    [switch]$SkipRelocate,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$NonInteractive
 )
 
 # PowerShell 7+ Version Check - myTech.Today standard
@@ -85,7 +88,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
 # Script metadata
-$script:ScriptVersion = '2.0.0'
+$script:ScriptVersion = '2.1.0'
 
 # Default installation paths
 $DefaultScriptRoot = "$env:USERPROFILE\myTech.Today\scripts\Install-OOShutUp10"
@@ -260,12 +263,10 @@ function Invoke-ScriptRelocation {
         Write-Host ""
 
         # Execute the relocated script directly using the call operator
-        if ($ReapplyOnly) {
-            & $DefaultScriptPath -SkipRelocate -ReapplyOnly
-        }
-        else {
-            & $DefaultScriptPath -SkipRelocate
-        }
+        $relocateParams = @('-SkipRelocate')
+        if ($ReapplyOnly) { $relocateParams += '-ReapplyOnly' }
+        if ($NonInteractive) { $relocateParams += '-NonInteractive' }
+        & $DefaultScriptPath @relocateParams
 
         # Exit this instance
         exit $LASTEXITCODE
@@ -949,16 +950,24 @@ try {
         }
     }
 
-    # Prompt for restart
-    $restart = Read-Host "Would you like to restart now? (Y/N)"
-    if ($restart -eq 'Y' -or $restart -eq 'y') {
-        Write-Log "Restarting computer in 10 seconds..." -Level WARNING
-        Start-Sleep -Seconds 10
-        Restart-Computer -Force
+    # Prompt for restart (skip in non-interactive mode)
+    if ($NonInteractive) {
+        Write-Log "Non-interactive mode: Skipping restart prompt. Please restart manually." -Level INFO
     }
     else {
-        Write-Log "Please remember to restart your computer manually." -Level WARNING
+        $restart = Read-Host "Would you like to restart now? (Y/N)"
+        if ($restart -eq 'Y' -or $restart -eq 'y') {
+            Write-Log "Restarting computer in 10 seconds..." -Level WARNING
+            Start-Sleep -Seconds 10
+            Restart-Computer -Force
+        }
+        else {
+            Write-Log "Please remember to restart your computer manually." -Level WARNING
+        }
     }
+
+    # Explicit success exit code
+    exit 0
 }
 catch {
     Write-Progress -Activity "O&O ShutUp10++ Installation and Configuration" -Completed

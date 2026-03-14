@@ -335,6 +335,7 @@ This script was developed based on requirements for automated O&O ShutUp10++ ins
 - **v1.0** - Initial release with basic installation and configuration
 - **v2.0** - Added scheduled task for post-Windows Update reapplication
 - **v3.0** - Added script relocation, file-based logging, and registry modification for restore points
+- **v2.1.0** - Added `-NonInteractive` switch for GUI/automated contexts (suppresses `Read-Host` prompts)
 
 ---
 
