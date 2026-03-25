@@ -85,19 +85,29 @@ This PowerShell script automates the installation and configuration of **O&O Shu
 - **Windows 10 or Windows 11**
 - **Internet connection** (for initial download)
 
+## Set Execution Policy
+
+Before running the script, set the PowerShell execution policy (one-time setup):
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy Unrestricted
+```
+
 ## Usage
 
 ### Initial Installation and Setup
 
+Run the script as Administrator in CMD:
+
+```cmd (elevated)
+<drive>:\path\to\script\install.bat
+```
+
 Run the script as Administrator:
 
 ```powershell
-# Using call operator (recommended for paths with special characters)
-& "Q:\_kyle\temp_documents\GitHub\PowerShellScripts\OO\Install-OOShutUp10.ps1"
-
-# Or navigate to directory first
-cd "Q:\_kyle\temp_documents\GitHub\PowerShellScripts\OO"
-.\Install-OOShutUp10.ps1
+Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy Unrestricted
+cd "<drive>:\path\to\script\" & .\Install-OOShutUp10.ps1
 ```
 
 ### What Happens During Installation
@@ -248,7 +258,7 @@ O&O ShutUp10++ is executed with the following arguments:
 If you get an execution policy error, run PowerShell as Administrator and execute:
 
 ```powershell
-Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy Unrestricted
 ```
 
 ### Path Contains Special Characters Error

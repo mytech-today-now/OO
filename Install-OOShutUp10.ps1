@@ -46,6 +46,10 @@
     - GitHub: https://github.com/mytech-today-now
 
 .EXAMPLE
+    Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy Unrestricted
+    Set the execution policy to allow running scripts (run once before first use)
+
+.EXAMPLE
     .\Install-OOShutUp10.ps1
     Installs O&O ShutUp10++ and applies recommended settings
 

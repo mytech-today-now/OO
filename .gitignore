@@ -38,4 +38,6 @@ coverage/
 
 # Ignore local content folders
 other_files/
+ai-prompts/
+.augment/
 
