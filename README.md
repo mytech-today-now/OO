@@ -43,8 +43,8 @@ This PowerShell automation script is developed and maintained by **myTech.Today*
 
 <h4>📍 Service Area</h4>
 <ul>
-<li>Chicagoland, IL (Lake Zurich and surrounding areas)</li>
-<li>Northern Illinois</li>
+<li>Chicagoland, IL</li>
+<li>Illinois</li>
 <li>Southern Wisconsin</li>
 <li>Northern Indiana</li>
 <li>Southern Michigan</li>
