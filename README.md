@@ -8,42 +8,86 @@
 
 This PowerShell automation script is developed and maintained by **myTech.Today**, a professional IT consulting and managed services provider with 20+ years of experience delivering customized technology solutions.
 
-### About myTech.Today
+<div align="center">
 
-**myTech.Today** specializes in providing expert IT consulting, automation, and support services to businesses and individuals across the Midwest. We deliver personalized solutions that improve efficiency, enhance security, and drive business value.
+<!-- ── Header ── -->
+<table>
+<tr>
+<td colspan="2" align="center">
+<h3>🏢 About myTech.Today</h3>
+<p><strong>myTech.Today</strong> specializes in providing expert IT consulting, automation, and support services to businesses and individuals across the Midwest. We deliver personalized solutions that improve efficiency, enhance security, and drive business value.</p>
+</td>
+</tr>
+</table>
 
-**Our Services:**
-- IT Consulting and Support
-- Custom PowerShell Automation and Scripting
-- Infrastructure Optimization and System Administration
-- Cloud Integration (Azure, AWS, Microsoft 365)
-- Network Design and Management
-- Cybersecurity and Compliance Solutions
-- Database Management and Custom Development
-- System Setup, Upgrades, and Troubleshooting
-- Virus and Spyware Removal
-- Hardware Procurement, Installation, and Configuration
+<!-- ── Info Cards ── -->
+<table>
+<tr>
 
-**Service Area:**
-- Chicagoland, IL (Lake Zurich and surrounding areas)
-- Northern Illinois
-- Southern Wisconsin
-- Northern Indiana
-- Southern Michigan
+<!-- Left Column -->
+<td width="50%" valign="top">
 
-**Contact Information:**
-- **Email:** sales@mytech.today
-- **Phone:** (847) 767-4914
-- **Website:** https://mytech.today
-- **GitHub:** [@mytech-today-now](https://github.com/mytech-today-now)
-- **LinkedIn:** [linkedin.com/in/kylerode](https://linkedin.com/in/kylerode)
+<h4>🛠️ Our Services</h4>
+<ul>
+<li>IT Consulting and Support</li>
+<li>Custom PowerShell Automation and Scripting</li>
+<li>Infrastructure Optimization and System Administration</li>
+<li>Cloud Integration (Azure, AWS, Microsoft 365)</li>
+<li>Network Design and Management</li>
+<li>Cybersecurity and Compliance Solutions</li>
+<li>Database Management and Custom Development</li>
+<li>System Setup, Upgrades, and Troubleshooting</li>
+<li>Virus and Spyware Removal</li>
+<li>Hardware Procurement, Installation, and Configuration</li>
+</ul>
 
-**Why Choose myTech.Today?**
-- 20+ years of IT consulting and software development experience
-- Personalized service to 190+ satisfied clients
-- 5-star review rating with consistent 24-hour solution delivery
-- Payment-upon-success terms available
-- Expertise in Windows automation, PowerShell scripting, and system optimization
+<h4>📍 Service Area</h4>
+<ul>
+<li>Chicagoland, IL (Lake Zurich and surrounding areas)</li>
+<li>Northern Illinois</li>
+<li>Southern Wisconsin</li>
+<li>Northern Indiana</li>
+<li>Southern Michigan</li>
+</ul>
+
+</td>
+
+<!-- Right Column -->
+<td width="50%" valign="top">
+
+<h4>⭐ Why Choose myTech.Today?</h4>
+<ul>
+<li>20+ years of IT consulting and software development experience</li>
+<li>Personalized service to 190+ satisfied clients</li>
+<li>5-star review rating with consistent 24-hour solution delivery</li>
+<li>Payment-upon-success terms available</li>
+<li>Expertise in Windows automation, PowerShell scripting, and system optimization</li>
+</ul>
+
+<h4>📬 Contact Information</h4>
+<table>
+<tr><td>📧 <strong>Email</strong></td><td><a href="mailto:sales@mytech.today">sales@mytech.today</a></td></tr>
+<tr><td>📞 <strong>Phone</strong></td><td>(847) 767-4914</td></tr>
+<tr><td>🌐 <strong>Website</strong></td><td><a href="https://mytech.today">mytech.today</a></td></tr>
+<tr><td>💻 <strong>GitHub</strong></td><td><a href="https://github.com/mytech-today-now">@mytech-today-now</a></td></tr>
+<tr><td>🔗 <strong>LinkedIn</strong></td><td><a href="https://linkedin.com/in/kylerode">linkedin.com/in/kylerode</a></td></tr>
+</table>
+
+</td>
+
+</tr>
+</table>
+
+<!-- ── Footer ── -->
+<table>
+<tr>
+<td colspan="2" align="center">
+<sub><strong>myTech.Today</strong> · Professional IT Services · Serving the Midwest · <a href="https://mytech.today">mytech.today</a> · (847) 767-4914</sub>
+</td>
+</tr>
+</table>
+
+</div>
 
 ---
 
