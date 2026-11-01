@@ -115,9 +115,9 @@ This PowerShell script automates the installation and configuration of **O&O Shu
 
 ### ✅ **Post-Windows Update Protection** 🆕
 - **Automatically creates a scheduled task** that runs after Windows updates
-- Reapplies privacy settings after major, minor, or patch updates
-- Prevents Microsoft from resetting privacy configurations during updates
-- Triggers on Windows Update Event IDs 19 and 43 (successful installations)
+- Reapplies the approved profile after Windows Update reports a successful installation
+- Triggers only on Windows Update Client event 19, with a two-minute delay
+- Queues overlapping reapplications so a later successful update is not discarded
 
 ### ✅ **Comprehensive Logging**
 - Color-coded console output with timestamps
@@ -131,13 +131,11 @@ This PowerShell script automates the installation and configuration of **O&O Shu
 - **Windows 10 or Windows 11**
 - **Internet connection** (for initial download)
 
-## Set Execution Policy
+## Execution Policy and Safe Launch
 
-Before running the script, set the PowerShell execution policy (one-time setup):
+Do not change the stored `CurrentUser` or `LocalMachine` execution policy to run this installer. Prefer an organization-approved signed copy and follow your organization's launch policy. If your policy owner approves a process-scoped launch for this unsigned or local copy, the `-ExecutionPolicy Bypass` examples below apply only to the new PowerShell process; they do not change stored policy values.
 
-```powershell
-Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy Unrestricted
-```
+On Windows, `MachinePolicy` and `UserPolicy` Group Policy settings take precedence. When neither is set, precedence is `Process`, then `CurrentUser`, then `LocalMachine`. A process-scoped launch cannot override Group Policy. Execution policy is a safety feature, not a security boundary. See [Microsoft's execution policy documentation](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_execution_policies).
 
 ## Usage
 
@@ -149,11 +147,26 @@ Run the script as Administrator in CMD:
 <drive>:\path\to\script\install.bat
 ```
 
-Run the script as Administrator:
+The batch wrapper starts PowerShell 7 (`pwsh`) with `-ExecutionPolicy Bypass` for that child process. Use it only when your organization's policy permits that launch. The wrapper does not change stored policy values, and Group Policy can still block the launch.
 
-```powershell
-Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy Unrestricted
-cd "<drive>:\path\to\script\" & .\Install-OOShutUp10.ps1
+If PowerShell 7 is missing, an interactive launch calls WinGet without agreement-acceptance flags so WinGet can show its source and package terms. A launch with redirected input fails closed unless you separately reviewed both agreements and set `MYTECH_ACCEPT_WINGET_AGREEMENTS=YES`. When set on a launch that needs WinGet, this variable passes both acceptance flags and skips those WinGet prompts:
+
+```cmd
+set "MYTECH_ACCEPT_WINGET_AGREEMENTS=YES"
+call install.bat
+set "MYTECH_ACCEPT_WINGET_AGREEMENTS="
+```
+
+The consent variable is independent of the selected package. Without it, unattended installation stops before WinGet runs. Agreement rejection is not retried, and WinGet's native failure code is returned. If a non-agreement WinGet failure leaves package state uncertain, inspect it first with `winget list --id Microsoft.PowerShell --exact`; if removal is appropriate, uninstall it manually with `winget uninstall --id Microsoft.PowerShell --exact --source winget`. The launcher does not automatically remove a package.
+
+To launch directly from an elevated CMD prompt, use the engine approved for your environment. These process-scoped examples work with Windows PowerShell 5.1 and PowerShell 7, respectively:
+
+```cmd
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<drive>:\path\to\script\Install-OOShutUp10.ps1"
+```
+
+```cmd
+pwsh.exe -NoProfile -ExecutionPolicy Bypass -File "<drive>:\path\to\script\Install-OOShutUp10.ps1"
 ```
 
 ### What Happens During Installation
@@ -163,7 +176,19 @@ cd "<drive>:\path\to\script\" & .\Install-OOShutUp10.ps1
 3. ✅ Attempts a system restore point
 4. ✅ Applies the approved profile quietly
 5. ✅ **Creates a scheduled task** to reapply settings after Windows updates
-6. ✅ Prompts for restart only when O&O reports that settings changed
+6. ✅ Offers a graceful, cancellable restart only when O&O reports that settings changed
+
+### Restart Behavior
+
+The restart prompt is shown after the settings and scheduled-task outcome is reported. Press **Y** to request a graceful restart, or **N** / **Esc** to defer. No response within 60 seconds defers the restart. After **Y**, a 60-second save window begins; press any key during that window to cancel. If restart is deferred, the reported setup status remains unchanged; save your work and restart later.
+
+The default restart does not use `Restart-Computer -Force`, so Windows and applications can block or cancel shutdown while handling unsaved work. Force-closing applications requires the separate `-ForceRestart` option and may lose unsaved changes:
+
+```powershell
+.\Install-OOShutUp10.ps1 -ForceRestart
+```
+
+`-NonInteractive` always skips restarting, including when `-ForceRestart` is supplied.
 
 ### Reapply Settings Only (Used by Scheduled Task)
 
@@ -181,20 +206,21 @@ This mode is automatically used by the scheduled task after Windows updates.
 `\myTech.Today\Install-OOShutUp10`
 
 ### Task Description
-Reapplies O&O ShutUp10++ privacy settings after Windows updates to prevent Microsoft from resetting privacy configurations
+Reapplies the approved O&O ShutUp10++ profile after successful Windows Update installation events, when executable and profile checks pass.
 
 ### Trigger Events
-The task triggers on the following Windows Update events:
-- **Event ID 19**: Windows Update successful installation
-- **Event ID 43**: Windows Update installation completed
+The task triggers only on Windows Update Client **event ID 19** (installation successful). Event ID 20 (installation failure) and event ID 43 (installation started) do not trigger reapplication.
 
 ### Execution Details
 - **Runs as**: SYSTEM account
 - **Privileges**: Highest available
-- **Delay**: 2 minutes after Windows Update completion
+- **Delay**: 2 minutes after the successful installation event
+- **Overlapping runs**: Queued and run sequentially
 - **Execution**: Hidden PowerShell window (no user interaction)
 - **Command**: `PowerShell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "<ScriptPath>" -ReapplyOnly -SkipRelocate -NonInteractive -ApprovedProfileSha256 "<PinnedProfileSHA256>" -ApprovedProfileManifestSha256 "<PinnedManifestSHA256>"`
 - **Working directory**: the directory containing `<ScriptPath>`
+
+If the approved settings are applied but the update task cannot be verified, setup is reported as partial and the installer exits with code `2`. The installer prints recovery instructions for repairing `\myTech.Today\Install-OOShutUp10`. Exit code `0` requires verified settings, an acceptable restore-point outcome, and a verified task.
 
 ### Viewing the Scheduled Task
 
@@ -235,11 +261,11 @@ Unregister-ScheduledTask -TaskName "Install-OOShutUp10" -TaskPath "\myTech.Today
 3. Attempt a system restore point.
 4. Apply the approved profile quietly.
 5. Create the SYSTEM task only when every profile entry is reviewed as machine-scoped; pin both profile and manifest digests.
-6. Prompt for a restart only when O&O reports that settings changed.
+6. Offer a graceful, cancellable restart only when O&O reports that settings changed; force-closing applications requires `-ForceRestart`.
 
 ### Post-Windows Update Flow
 
-1. Windows Update event 19 or 43 starts the task after a two-minute delay.
+1. Windows Update Client event 19 starts the task after a two-minute delay. Event 20 and event 43 do not trigger it.
 2. The task runs `-ReapplyOnly -NonInteractive` with its pinned profile and manifest digests.
 3. A digest mismatch, unknown scope, or current-user entry stops execution before O&O launches.
 4. Only an entirely machine-scoped, digest-matched profile can be reapplied by LocalSystem; the script reports whether settings changed.
@@ -295,11 +321,11 @@ Before applying the profile, the script attempts to create a Windows restore poi
 
 ### Script Won't Run - Execution Policy Error
 
-If you get an execution policy error, run PowerShell as Administrator and execute:
+If the launch is blocked, stop. Do not change a stored execution policy or retry with a broader scope. Use this guidance:
 
-```powershell
-Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy Unrestricted
-```
+> PowerShell policy blocks this script. No policy was changed; use an approved signed or process-scoped launch.
+
+If Group Policy blocks the script, contact your administrator for an approved signed script or launch method. A process-scoped option cannot override Group Policy.
 
 ### Path Contains Special Characters Error
 
@@ -313,7 +339,7 @@ If you get an ampersand error, use the call operator:
 
 1. Verify the task exists:
    ```powershell
-   Get-ScheduledTask -TaskName "OOShutUp10-PostWindowsUpdate"
+   Get-ScheduledTask -TaskName "Install-OOShutUp10" -TaskPath "\myTech.Today\"
    ```
 
 2. Check task history in Task Scheduler:
@@ -323,7 +349,7 @@ If you get an ampersand error, use the call operator:
 
 3. Manually test the task:
    ```powershell
-   Start-ScheduledTask -TaskName "OOShutUp10-PostWindowsUpdate"
+   Start-ScheduledTask -TaskName "Install-OOShutUp10" -TaskPath "\myTech.Today\"
    ```
 
 ### O&O ShutUp10++ Not Found After Installation
@@ -384,6 +410,8 @@ This script was developed based on requirements for automated O&O ShutUp10++ ins
 - **v2.1.0** - Added `-NonInteractive` switch for GUI/automated contexts
 - **v2.2.0** - Requires an interactive profile review or an exact approved digest for unattended runs
 - **v2.3.0** - Adds reviewed per-setting scope, machine-only SYSTEM reapplication, and a pinned manifest digest
+
+For unversioned changes, see [CHANGELOG.md](CHANGELOG.md).
 
 ---
 

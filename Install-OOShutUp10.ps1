@@ -12,7 +12,7 @@
     3. Attempt a system restore point before applying the profile
     4. Apply the approved privacy settings profile quietly
     5. Create a scheduled task pinned to the approved profile and manifest digests
-    6. Ask for a restart only when O&O reports that settings changed
+    6. Offer a graceful, cancellable restart only when O&O reports changed settings; force requires -ForceRestart
 
 .PARAMETER ReapplyOnly
     If specified, only reapplies privacy settings without installation or task creation.
@@ -20,6 +20,10 @@
 
 .PARAMETER NonInteractive
     Suppresses prompts only when both approved profile and manifest SHA-256 digests match.
+
+.PARAMETER ForceRestart
+    Explicitly permits Restart-Computer to force-close applications when a restart is confirmed.
+    Unsaved work may be lost; use only when that risk is accepted.
 
 .PARAMETER ApprovedProfileSha256
     The exact SHA-256 digest of the reviewed O&O settings export approved for unattended use.
@@ -51,6 +55,12 @@
     Copyright      : (c) 2025 myTech.Today. All rights reserved.
     Prerequisite   : PowerShell 5.1+, Administrator privileges
 
+    Execution policy:
+    Prefer an organization-approved signed copy. The -ExecutionPolicy Bypass examples below are process-scoped
+    and must only be used when approved by your policy owner. MachinePolicy and UserPolicy Group Policy settings
+    take precedence; otherwise Process takes precedence over CurrentUser and LocalMachine. A blocked launch must
+    stop without changing stored policy. PowerShell policy blocks this script. No policy was changed; use an approved signed or process-scoped launch.
+
     About myTech.Today:
     myTech.Today is a Chicagoland-based MSP and IT consulting firm specializing in
     PowerShell automation, infrastructure optimization, and custom development solutions.
@@ -65,8 +75,12 @@
     - GitHub: https://github.com/mytech-today-now
 
 .EXAMPLE
-    Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy Unrestricted
-    Set the execution policy to allow running scripts (run once before first use)
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\Install-OOShutUp10.ps1"
+    Starts Windows PowerShell 5.1 with a process-scoped policy. Use only when approved by your policy owner.
+
+.EXAMPLE
+    pwsh.exe -NoProfile -ExecutionPolicy Bypass -File ".\Install-OOShutUp10.ps1"
+    Starts PowerShell 7 with a process-scoped policy. Use only when approved by your policy owner.
 
 .EXAMPLE
     .\Install-OOShutUp10.ps1
@@ -93,6 +107,9 @@ param(
 
     [Parameter(Mandatory = $false)]
     [switch]$NonInteractive,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$ForceRestart,
 
     [Parameter(Mandatory = $false)]
     [string]$ApprovedProfileSha256,
@@ -159,10 +176,18 @@ $script:OOShutUpRestorePointFrequencyRegistryPath = 'SOFTWARE\Microsoft\Windows 
 $script:OOShutUpRestorePointFrequencyRegistryName = 'SystemRestorePointCreationFrequency'
 $script:OOShutUpTaskAclFailureMessage = 'The SYSTEM task target ACL could not be verified. No task was registered; move the script to a protected path and retry.'
 $script:OOShutUpTaskOwnershipFailureMessage = 'Task ownership is ambiguous. No task was deleted; inspect the listed path and retry after confirming ownership.'
+$script:OOShutUpPartialSetupMessage = 'The privacy settings may be applied, but the update task was not verified. Setup is partial; repair the task before relying on automatic reapplication.'
+$script:OOShutUpTaskRecoveryMessage = 'Recovery: resolve the logged Task Scheduler error, open PowerShell as Administrator, and rerun this installer with the approved profile (or use -NonInteractive -ApprovedProfileSha256 <profile SHA-256> -ApprovedProfileManifestSha256 <manifest SHA-256>). Verify \myTech.Today\Install-OOShutUp10 in Task Scheduler before relying on automatic reapplication. The retry inspects and replaces only this verified task; same-named tasks in other folders are left unchanged.'
 $script:OOShutUpManagedPathFailureMessage = 'The approved O&O executable path is unavailable to the scheduled task. Reapplication was skipped; restore the verified machine copy.'
+$script:OOShutUpUpdateEventSubscription = '<QueryList><Query Id="0" Path="System"><Select Path="System">*[System[Provider[@Name=''Microsoft-Windows-WindowsUpdateClient''] and (EventID=19)]]</Select></Query></QueryList>'
+$script:OOShutUpUpdateEventDelay = 'PT2M'
+$script:OOShutUpUpdateMultipleInstancesPolicy = 'Queue'
 $script:OOShutUpApprovedDigest = $null
 $script:OOShutUpApprovedManifestDigest = $null
 $script:OOShutUpLastRunChanged = $false
+$script:OOShutUpRestartDeferredMessage = 'Restart was deferred. Setup status remains unchanged; save your work and restart when ready.'
+$script:OOShutUpRestartPromptTimeoutSeconds = 60
+$script:OOShutUpRestartSaveWindowSeconds = 60
 # Accept only Authenticode-valid O&O Software GmbH signatures for O&O ShutUp10 at the current supported release floor.
 # Vendor release policy reviewed 2026-10-31: https://www.oo-software.com/en/shutup10/update
 $ExpectedOOShutUpPublisher = 'O&O Software GmbH'
@@ -184,6 +209,130 @@ function Write-Log {
 
     $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     Write-Host "[$timestamp] [$Level] $Message"
+}
+
+#endregion
+
+#region Restart Handling
+
+function Read-OOShutUpRestartKey {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $false)]
+        [int]$TimeoutSeconds = 60
+    )
+
+    if ($TimeoutSeconds -le 0) {
+        return $null
+    }
+
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($timer.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
+        try {
+            if ([System.Console]::KeyAvailable) {
+                $key = [System.Console]::ReadKey($true)
+                return [string]$key.Key
+            }
+
+            Start-Sleep -Milliseconds 100
+        }
+        catch {
+            return $null
+        }
+    }
+
+    return $null
+}
+
+function Wait-OOShutUpRestartSaveWindow {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $false)]
+        [int]$Seconds = 60
+    )
+
+    if ($Seconds -le 0) {
+        return $true
+    }
+
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($timer.Elapsed.TotalSeconds -lt $Seconds) {
+        try {
+            if ([System.Console]::KeyAvailable) {
+                [System.Console]::ReadKey($true) | Out-Null
+                return $false
+            }
+
+            Start-Sleep -Milliseconds 100
+        }
+        catch {
+            return $false
+        }
+    }
+
+    return $true
+}
+
+function Invoke-OOShutUpRestart {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $false)]
+        [switch]$NonInteractive,
+
+        [Parameter(Mandatory = $false)]
+        [switch]$ForceRestart
+    )
+
+    if ($NonInteractive) {
+        Write-Log 'Settings changed. Non-interactive mode skipped the restart prompt.' -Level WARNING
+        Write-Log $script:OOShutUpRestartDeferredMessage -Level WARNING
+        return
+    }
+
+    if ($ForceRestart) {
+        Write-Log 'The explicit -ForceRestart option can close applications that have unsaved work.' -Level WARNING
+    }
+
+    Write-Host 'Configuration status is shown above. Save your work before restarting.'
+    Write-Host ('Press Y to restart, N or Esc to defer. No key within {0} seconds defers the restart.' -f $script:OOShutUpRestartPromptTimeoutSeconds)
+
+    try {
+        $restartKey = Read-OOShutUpRestartKey -TimeoutSeconds $script:OOShutUpRestartPromptTimeoutSeconds
+    }
+    catch {
+        $restartKey = $null
+    }
+
+    if ($restartKey -ne 'Y') {
+        Write-Log $script:OOShutUpRestartDeferredMessage -Level WARNING
+        return
+    }
+
+    Write-Host ('Save your work now. The restart begins in {0} seconds; press any key to cancel.' -f $script:OOShutUpRestartSaveWindowSeconds)
+    try {
+        $saveWindowElapsed = Wait-OOShutUpRestartSaveWindow -Seconds $script:OOShutUpRestartSaveWindowSeconds
+    }
+    catch {
+        $saveWindowElapsed = $false
+    }
+
+    if (-not $saveWindowElapsed) {
+        Write-Log $script:OOShutUpRestartDeferredMessage -Level WARNING
+        return
+    }
+
+    try {
+        if ($ForceRestart) {
+            Restart-Computer -Force
+        }
+        else {
+            Restart-Computer
+        }
+    }
+    catch {
+        Write-Log ("Restart could not be started: {0}" -f $_.Exception.Message) -Level WARNING
+        Write-Log $script:OOShutUpRestartDeferredMessage -Level WARNING
+    }
 }
 
 #endregion
@@ -345,6 +494,7 @@ function Invoke-ScriptRelocation {
         $relocateParams = @('-SkipRelocate')
         if ($ReapplyOnly) { $relocateParams += '-ReapplyOnly' }
         if ($NonInteractive) { $relocateParams += '-NonInteractive' }
+        if ($ForceRestart) { $relocateParams += '-ForceRestart' }
         if ($AllowWithoutRestorePoint) { $relocateParams += '-AllowWithoutRestorePoint' }
         if ($script:OOShutUpApprovalConfirmed -and $script:OOShutUpApprovedDigest -and $script:OOShutUpApprovedManifestDigest) {
             $relocateParams += @(
@@ -1645,6 +1795,20 @@ function Test-WindowsUpdateTaskDefinition {
             return $false
         }
 
+        $settings = $Task.Settings
+        if ($null -eq $settings -or
+            -not [string]::Equals([string]$settings.MultipleInstances, $script:OOShutUpUpdateMultipleInstancesPolicy, [System.StringComparison]::Ordinal)) {
+            return $false
+        }
+
+        $triggers = @($Task.Triggers)
+        if ($triggers.Count -ne 1 -or
+            -not [bool]$triggers[0].Enabled -or
+            -not [string]::Equals([string]$triggers[0].Delay, $script:OOShutUpUpdateEventDelay, [System.StringComparison]::Ordinal) -or
+            -not [string]::Equals([string]$triggers[0].Subscription, $script:OOShutUpUpdateEventSubscription, [System.StringComparison]::Ordinal)) {
+            return $false
+        }
+
         return $true
     }
     catch {
@@ -1838,6 +2002,7 @@ function New-WindowsUpdateScheduledTask {
         Write-Log ("Scheduled task principal SID S-1-5-18 passed the machine-scope gate for {0} settings (profile SHA-256 {1}; manifest SHA-256 {2}); setting values are omitted." -f $currentApprovedProfile.SettingCount, $currentApprovedProfile.Sha256, $currentApprovedProfile.ManifestSha256) -Level INFO
 
         Write-Log "Creating scheduled task for post-Windows Update execution..." -Level INFO
+        Write-Log 'The task listens for Windows Update installation-success event 19 with a two-minute delay; overlapping reapplications are queued sequentially.' -Level INFO
 
         $taskName     = "Install-OOShutUp10"
         $taskFolder   = "myTech.Today"
@@ -1874,11 +2039,11 @@ function New-WindowsUpdateScheduledTask {
         $eventTrigger.AppendChild($enabled) | Out-Null
 
         $subscription = $xml.CreateElement("Subscription")
-        $subscription.InnerText = "<QueryList><Query Id=`"0`" Path=`"System`"><Select Path=`"System`">*[System[Provider[@Name='Microsoft-Windows-WindowsUpdateClient'] and (EventID=19 or EventID=43)]]</Select></Query></QueryList>"
+        $subscription.InnerText = $script:OOShutUpUpdateEventSubscription
         $eventTrigger.AppendChild($subscription) | Out-Null
 
         $delay = $xml.CreateElement("Delay")
-        $delay.InnerText = "PT2M"
+        $delay.InnerText = $script:OOShutUpUpdateEventDelay
         $eventTrigger.AppendChild($delay) | Out-Null
 
         $triggers.AppendChild($eventTrigger) | Out-Null
@@ -1904,7 +2069,7 @@ function New-WindowsUpdateScheduledTask {
         $settings = $xml.CreateElement("Settings")
 
         $multipleInstances = $xml.CreateElement("MultipleInstancesPolicy")
-        $multipleInstances.InnerText = "IgnoreNew"
+        $multipleInstances.InnerText = $script:OOShutUpUpdateMultipleInstancesPolicy
         $settings.AppendChild($multipleInstances) | Out-Null
 
         $disallowBattery = $xml.CreateElement("DisallowStartIfOnBatteries")
@@ -2058,7 +2223,7 @@ function New-WindowsUpdateScheduledTask {
             })
         }
 
-        # Register a disabled candidate first. The current task remains untouched until its action and principal verify.
+        # Register a disabled candidate first. The current task remains untouched until its action, trigger, settings, and principal verify.
         $stagingTaskName = '{0}-validation-{1}' -f $taskName, [guid]::NewGuid().ToString('N')
         $stagingTaskAttempted = $true
         $taskSchedulerOperationStarted = $true
@@ -2068,7 +2233,7 @@ function New-WindowsUpdateScheduledTask {
             Select-Object -First 1
         if ($null -eq $stagedTask -or [string]$stagedTask.State -ne 'Disabled' -or
             -not (Test-WindowsUpdateTaskDefinition -Task $stagedTask -TaskPath $taskPath -TaskName $stagingTaskName -TaskDescription $taskDescription -ScriptPath $ScriptPath -ApprovedProfileSha256 $ApprovedProfileSha256 -ApprovedProfileManifestSha256 $ApprovedProfileManifestSha256 -ApprovedOOSExecutablePath $approvedOOSExecutablePath)) {
-            throw 'The disabled candidate task did not match the approved SYSTEM action; the existing task was left unchanged.'
+            throw 'The disabled candidate task did not match the approved SYSTEM action, trigger, and queue settings; the existing task was left unchanged.'
         }
 
         # The verified candidate is ready. Replace prior tasks and roll them back if final verification fails.
@@ -2084,7 +2249,7 @@ function New-WindowsUpdateScheduledTask {
             Select-Object -First 1
         if ($null -eq $verifiedTask -or
             -not (Test-WindowsUpdateTaskDefinition -Task $verifiedTask -TaskPath $taskPath -TaskName $taskName -TaskDescription $taskDescription -ScriptPath $ScriptPath -ApprovedProfileSha256 $ApprovedProfileSha256 -ApprovedProfileManifestSha256 $ApprovedProfileManifestSha256 -ApprovedOOSExecutablePath $approvedOOSExecutablePath)) {
-            throw 'The replacement task did not match the approved SYSTEM action after registration.'
+            throw 'The replacement task did not match the approved SYSTEM action, success trigger, and queue settings after registration.'
         }
 
         try {
@@ -2215,6 +2380,127 @@ function New-WindowsUpdateScheduledTask {
 }
 
 #endregion
+
+function Invoke-OOShutUpTaskSetup {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ScriptPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ApprovedProfileSha256,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ApprovedProfileManifestSha256
+    )
+
+    $taskVerified = $false
+    $exceptionMessage = $null
+    try {
+        $taskResult = New-WindowsUpdateScheduledTask `
+            -ScriptPath $ScriptPath `
+            -ApprovedProfileSha256 $ApprovedProfileSha256 `
+            -ApprovedProfileManifestSha256 $ApprovedProfileManifestSha256
+        $taskVerified = [object]::Equals($taskResult, [bool]$true)
+    }
+    catch {
+        $exceptionMessage = $_.Exception.Message
+    }
+
+    return [pscustomobject]@{
+        Verified = $taskVerified
+        ExceptionMessage = $exceptionMessage
+    }
+}
+
+function Get-OOShutUpInstallOutcome {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [bool]$SettingsVerified,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$RestorePointVerified,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$RestorePointOverrideUsed,
+
+        [Parameter(Mandatory = $true)]
+        [psobject]$TaskSetup
+    )
+
+    $taskVerified = [object]::Equals($TaskSetup.Verified, [bool]$true)
+    $settingsOutcome = if ($SettingsVerified) { 'Verified' } else { 'Not verified' }
+    $restorePointOutcome = if ($RestorePointVerified) {
+        'Verified'
+    }
+    elseif ($RestorePointOverrideUsed) {
+        'Explicitly overridden'
+    }
+    else {
+        'Not verified'
+    }
+    $taskOutcome = if ($taskVerified) { 'Verified' } else { 'Not verified' }
+    $status = 'Complete'
+    $exitCode = 0
+    $summary = 'The approved privacy settings are verified and the update task \myTech.Today\Install-OOShutUp10 is registered and verified.'
+    $recoveryMessage = $null
+
+    if (-not $SettingsVerified) {
+        $status = 'Failed'
+        $exitCode = 1
+        $summary = 'Setup failed because the approved privacy settings were not verified. Review the preceding error and retry after resolving it.'
+    }
+    elseif (-not $taskVerified) {
+        $status = 'Partial'
+        $exitCode = 2
+        $summary = $script:OOShutUpPartialSetupMessage
+        $recoveryMessage = $script:OOShutUpTaskRecoveryMessage
+    }
+    elseif (-not $RestorePointVerified -and -not $RestorePointOverrideUsed) {
+        $status = 'Failed'
+        $exitCode = 1
+        $summary = 'Setup failed because the required restore point was not verified.'
+        $recoveryMessage = $script:OOShutUpRestorePointFailureMessage
+    }
+
+    return [pscustomobject]@{
+        Status = $status
+        ExitCode = $exitCode
+        SettingsOutcome = $settingsOutcome
+        RestorePointOutcome = $restorePointOutcome
+        TaskOutcome = $taskOutcome
+        TaskVerified = $taskVerified
+        TaskExceptionMessage = $TaskSetup.ExceptionMessage
+        Summary = $summary
+        RecoveryMessage = $recoveryMessage
+    }
+}
+
+function Write-OOShutUpInstallSummary {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [psobject]$Outcome
+    )
+
+    if ($Outcome.Status -eq 'Complete') {
+        Write-Log '=== Configuration Complete ===' -Level SUCCESS
+        Write-Log $Outcome.Summary -Level SUCCESS
+    }
+    elseif ($Outcome.Status -eq 'Partial') {
+        Write-Log '=== Setup Partial ===' -Level WARNING
+        Write-Log $Outcome.Summary -Level WARNING
+        Write-Log $Outcome.RecoveryMessage -Level WARNING
+    }
+    else {
+        Write-Log '=== Setup Failed ===' -Level ERROR
+        Write-Log $Outcome.Summary -Level ERROR
+        if (-not [string]::IsNullOrWhiteSpace([string]$Outcome.RecoveryMessage)) {
+            Write-Log $Outcome.RecoveryMessage -Level ERROR
+        }
+    }
+}
 
 #region Main Script
 
@@ -2382,19 +2668,36 @@ try {
     Update-ScriptProgress -PercentComplete 85 -Status "Step 5 of 5: Creating Scheduled Task" -CurrentOperation "Setting up automatic reapplication after Windows updates"
     Write-Log "Step 5: Creating scheduled task for post-Windows Update execution..." -Level INFO
     # Bind the task to the same running package that passed profile validation, including when relocation failed.
-    $taskCreated = New-WindowsUpdateScheduledTask -ScriptPath $currentScriptPath -ApprovedProfileSha256 $approvedProfile.Sha256 -ApprovedProfileManifestSha256 $approvedProfile.ManifestSha256
+    $taskSetup = Invoke-OOShutUpTaskSetup `
+        -ScriptPath $currentScriptPath `
+        -ApprovedProfileSha256 $approvedProfile.Sha256 `
+        -ApprovedProfileManifestSha256 $approvedProfile.ManifestSha256
+    $installerOutcome = Get-OOShutUpInstallOutcome `
+        -SettingsVerified $configSuccess `
+        -RestorePointVerified $restorePointVerified `
+        -RestorePointOverrideUsed $restorePointOverrideUsed `
+        -TaskSetup $taskSetup
+    $taskCreated = $installerOutcome.TaskVerified
     if ($taskCreated) {
         Write-Log "Scheduled task created successfully" -Level SUCCESS
         Write-Log "Privacy settings will be automatically reapplied after Windows updates" -Level INFO
     }
-    else {
-        Write-Log "Warning: Could not create scheduled task. Privacy settings may need manual reapplication after Windows updates." -Level WARNING
+    elseif (-not [string]::IsNullOrWhiteSpace([string]$installerOutcome.TaskExceptionMessage)) {
+        Write-Log ("Unexpected scheduled-task setup exception; the task state is unverified. Details: {0}" -f $installerOutcome.TaskExceptionMessage) -Level ERROR
     }
 
     # Step 6: Completion
-    Update-ScriptProgress -PercentComplete 100 -Status "Complete!" -CurrentOperation "Configuration completed successfully"
     Write-Log " " -Level INFO
-    Write-Log "=== Configuration Complete ===" -Level SUCCESS
+    if ($installerOutcome.Status -eq 'Complete') {
+        Update-ScriptProgress -PercentComplete 100 -Status "Complete!" -CurrentOperation "Settings and scheduled task verified"
+    }
+    elseif ($installerOutcome.Status -eq 'Partial') {
+        Update-ScriptProgress -PercentComplete 100 -Status "Partial setup" -CurrentOperation "Settings applied; update task not verified"
+    }
+    else {
+        Update-ScriptProgress -PercentComplete 100 -Status "Setup failed" -CurrentOperation "A required outcome was not verified"
+    }
+    Write-OOShutUpInstallSummary -Outcome $installerOutcome
     Write-Log " " -Level INFO
     if ($script:OOShutUpLastRunChanged) {
         Write-Log "O&O ShutUp10++ applied the approved privacy settings profile." -Level SUCCESS
@@ -2410,10 +2713,6 @@ try {
     }
     else {
         Write-Log $script:OOShutUpRestorePointFailureMessage -Level ERROR
-        exit 1
-    }
-    if ($taskCreated) {
-        Write-Log "A scheduled task has been created to reapply settings after Windows updates." -Level SUCCESS
     }
     Write-Log " " -Level INFO
 
@@ -2468,24 +2767,12 @@ try {
     if (-not $script:OOShutUpLastRunChanged) {
         Write-Log 'No setting changes were made; a restart is not required.' -Level INFO
     }
-    elseif ($NonInteractive) {
-        Write-Log 'Settings changed. Non-interactive mode skipped the restart prompt; restart manually to activate them.' -Level WARNING
-    }
     else {
-        Write-Log "IMPORTANT: Please restart your computer to activate the changed privacy settings." -Level WARNING
-        $restart = Read-Host "Would you like to restart now? (Y/N)"
-        if ($restart -eq 'Y' -or $restart -eq 'y') {
-            Write-Log "Restarting computer in 10 seconds..." -Level WARNING
-            Start-Sleep -Seconds 10
-            Restart-Computer -Force
-        }
-        else {
-            Write-Log "Please remember to restart your computer manually." -Level WARNING
-        }
+        Invoke-OOShutUpRestart -NonInteractive:$NonInteractive -ForceRestart:$ForceRestart
     }
 
-    # Explicit success exit code
-    exit 0
+    # Exit 0 is reserved for verified settings, an acceptable restore-point outcome, and a verified update task.
+    exit $installerOutcome.ExitCode
 }
 catch {
     Write-Progress -Activity "O&O ShutUp10++ Installation and Configuration" -Completed

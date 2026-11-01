@@ -19,11 +19,20 @@ $script:TaskRegistrationCalls = New-Object System.Collections.ArrayList
 $script:TaskUnregistrationCalls = New-Object System.Collections.ArrayList
 $script:TaskLookupCalls = New-Object System.Collections.ArrayList
 $script:TaskLookupFailure = $null
+$script:TaskRegistrationFailure = $null
 $script:TaskVerificationMissPending = $false
 $script:FailTaskRestoreXml = $null
 $script:FailTaskVerification = $false
 $script:FailStageVerification = $false
+$script:FailStageQueuePolicyVerification = $false
 $script:FailTaskRestore = $false
+$script:MockInstallerTaskScenario = 'Success'
+$script:OOShutUpPartialSetupMessage = 'The privacy settings may be applied, but the update task was not verified. Setup is partial; repair the task before relying on automatic reapplication.'
+$script:OOShutUpTaskRecoveryMessage = 'Recovery: resolve the logged Task Scheduler error, open PowerShell as Administrator, and rerun this installer with the approved profile (or use -NonInteractive -ApprovedProfileSha256 <profile SHA-256> -ApprovedProfileManifestSha256 <manifest SHA-256>). Verify \myTech.Today\Install-OOShutUp10 in Task Scheduler before relying on automatic reapplication. The retry inspects and replaces only this verified task; same-named tasks in other folders are left unchanged.'
+$script:OOShutUpUpdateEventSubscription = '<QueryList><Query Id="0" Path="System"><Select Path="System">*[System[Provider[@Name=''Microsoft-Windows-WindowsUpdateClient''] and (EventID=19)]]</Select></Query></QueryList>'
+$script:OOShutUpUpdateEventDelay = 'PT2M'
+$script:OOShutUpUpdateMultipleInstancesPolicy = 'Queue'
+$script:OOShutUpRestorePointFailureMessage = 'A restore point could not be verified. No privacy settings were applied; free space or enable restore protection, then retry.'
 $script:MockAclByPath = @{}
 $script:MockAclFailurePath = $null
 
@@ -52,6 +61,31 @@ function Assert-Equal {
     }
 
     $script:AssertionCount++
+}
+
+function Test-WindowsUpdateClientProviderMetadata {
+    try {
+        $events = @((Get-WinEvent -ListProvider 'Microsoft-Windows-WindowsUpdateClient' -ErrorAction Stop).Events)
+    }
+    catch {
+        Write-Output ("Skipped host Windows Update provider metadata check: {0}" -f $_.Exception.Message)
+        return
+    }
+
+    $expectedLabels = @{
+        19 = 'Installation Successful'
+        20 = 'Installation Failure'
+        43 = 'Installation Started'
+    }
+    foreach ($eventId in @(19, 20, 43)) {
+        $matches = @($events | Where-Object { [int]$_.Id -eq $eventId -and -not [string]::IsNullOrWhiteSpace([string]$_.Description) })
+        Assert-True ($matches.Count -gt 0) "the host Windows Update provider exposes event $eventId metadata"
+        $description = ([string]$matches[0].Description).Replace([char]0, [char]32).Trim()
+        if ([System.Globalization.CultureInfo]::CurrentUICulture.Name -like 'en*') {
+            Assert-True ($description.Contains($expectedLabels[$eventId])) "the host metadata labels event $eventId as $($expectedLabels[$eventId])"
+        }
+        Write-Output ("Host WindowsUpdateClient event {0}: {1}" -f $eventId, $description.Trim())
+    }
 }
 
 function Write-TestPayload {
@@ -235,7 +269,20 @@ function New-MockScheduledTask {
     $principal = $definition.SelectSingleNode("/*[local-name()='Task']/*[local-name()='Principals']/*[local-name()='Principal']")
     $action = $definition.SelectSingleNode("/*[local-name()='Task']/*[local-name()='Actions']/*[local-name()='Exec']")
     $enabledNode = $definition.SelectSingleNode("/*[local-name()='Task']/*[local-name()='Settings']/*[local-name()='Enabled']")
+    $multipleInstancesNode = $definition.SelectSingleNode("/*[local-name()='Task']/*[local-name()='Settings']/*[local-name()='MultipleInstancesPolicy']")
     $descriptionNode = $definition.SelectSingleNode("/*[local-name()='Task']/*[local-name()='RegistrationInfo']/*[local-name()='Description']")
+    $triggerMocks = @(
+        foreach ($triggerNode in $definition.SelectNodes("/*[local-name()='Task']/*[local-name()='Triggers']/*[local-name()='EventTrigger']")) {
+            $triggerEnabledNode = $triggerNode.SelectSingleNode("*[local-name()='Enabled']")
+            $subscriptionNode = $triggerNode.SelectSingleNode("*[local-name()='Subscription']")
+            $delayNode = $triggerNode.SelectSingleNode("*[local-name()='Delay']")
+            [pscustomobject]@{
+                Enabled = [bool]::Parse([string]$triggerEnabledNode.InnerText)
+                Subscription = [string]$subscriptionNode.InnerText
+                Delay = [string]$delayNode.InnerText
+            }
+        }
+    )
     $arguments = [string]$action.Arguments
     if ($InvalidAction) {
         $arguments = '-InvalidAction'
@@ -247,9 +294,52 @@ function New-MockScheduledTask {
         Description = [string]$descriptionNode.InnerText
         State = if ([string]$enabledNode.InnerText -eq 'false') { 'Disabled' } else { 'Ready' }
         Principal = [pscustomobject]@{ UserId = [string]$principal.UserId; RunLevel = [string]$principal.RunLevel }
+        Settings = [pscustomobject]@{ MultipleInstances = [string]$multipleInstancesNode.InnerText }
+        Triggers = $triggerMocks
         Actions = @([pscustomobject]@{ Execute = [string]$action.Command; Arguments = $arguments; WorkingDirectory = [string]$action.WorkingDirectory })
         Definition = $Xml
     }
+}
+
+function Invoke-MockUpdateTaskSchedule {
+    param(
+        [Parameter(Mandatory = $true)]
+        [xml]$TaskDefinition,
+
+        [int[]]$EventIds = @(),
+
+        [int]$ActiveRunEventId = 0,
+
+        [int]$ActiveRunEndSeconds = 0,
+
+        [int]$EventOccurredAtSeconds = 10
+    )
+
+    $trigger = $TaskDefinition.SelectSingleNode("/*[local-name()='Task']/*[local-name()='Triggers']/*[local-name()='EventTrigger']")
+    $subscription = [string]$trigger.Subscription
+    $configuredEventIds = @([regex]::Matches($subscription, 'EventID=(\d+)') | ForEach-Object { [int]$_.Groups[1].Value })
+    $delaySeconds = [int][System.Xml.XmlConvert]::ToTimeSpan([string]$trigger.Delay).TotalSeconds
+    $policyNode = $TaskDefinition.SelectSingleNode("/*[local-name()='Task']/*[local-name()='Settings']/*[local-name()='MultipleInstancesPolicy']")
+    $policy = [string]$policyNode.InnerText
+    $runs = New-Object System.Collections.ArrayList
+
+    foreach ($eventId in $EventIds) {
+        if ($configuredEventIds -notcontains $eventId) {
+            continue
+        }
+
+        $startSeconds = $EventOccurredAtSeconds + $delaySeconds
+        if ($startSeconds -lt $ActiveRunEndSeconds) {
+            if ($policy -ne 'Queue') {
+                continue
+            }
+            $startSeconds = $ActiveRunEndSeconds
+        }
+
+        [void]$runs.Add([pscustomobject]@{ EventId = $eventId; StartSeconds = $startSeconds; ActiveRunEventId = $ActiveRunEventId })
+    }
+
+    return @($runs.ToArray())
 }
 
 function Get-ScheduledTask {
@@ -265,6 +355,9 @@ function Get-ScheduledTask {
         $script:TaskLookupFailure = $null
         if ($failureMode -eq 'AccessDenied') {
             throw [System.UnauthorizedAccessException]::new('Mock Task Scheduler access denied.')
+        }
+        if ($failureMode -eq 'ModuleMissing') {
+            throw [System.Management.Automation.CommandNotFoundException]::new('Get-ScheduledTask is unavailable because the ScheduledTasks module is not loaded.')
         }
         throw [System.InvalidOperationException]::new('Mock Task Scheduler RPC error.')
     }
@@ -301,11 +394,22 @@ function Register-ScheduledTask {
     )
 
     [void]$script:TaskRegistrationCalls.Add([pscustomobject]@{ TaskName = $TaskName; TaskPath = $TaskPath; Xml = $Xml })
+    if ($null -ne $script:TaskRegistrationFailure) {
+        $failureMode = $script:TaskRegistrationFailure
+        $script:TaskRegistrationFailure = $null
+        if ($failureMode -eq 'AccessDenied') {
+            throw [System.UnauthorizedAccessException]::new('Mock Task Scheduler registration access denied.')
+        }
+        throw [System.InvalidOperationException]::new('Mock Task Scheduler registration failure.')
+    }
     if ($script:FailTaskRestore -and $Xml -eq $script:FailTaskRestoreXml) {
         throw 'Mock previous-task restore failed.'
     }
     $invalidAction = $script:FailStageVerification -and $TaskName -like 'Install-OOShutUp10-validation-*'
     $task = New-MockScheduledTask -TaskName $TaskName -TaskPath $TaskPath -Xml $Xml -InvalidAction:$invalidAction
+    if ($script:FailStageQueuePolicyVerification -and $TaskName -like 'Install-OOShutUp10-validation-*') {
+        $task.Settings.MultipleInstances = 'IgnoreNew'
+    }
     $script:TaskRegistry["$TaskPath|$TaskName"] = $task
     if ($script:FailTaskVerification -and $TaskName -eq 'Install-OOShutUp10' -and $TaskPath -eq '\myTech.Today\') {
         $script:TaskVerificationMissPending = $true
@@ -328,6 +432,7 @@ function Unregister-ScheduledTask {
 
 try {
     [void](New-Item -ItemType Directory -Path $script:FixtureRoot -Force)
+    Test-WindowsUpdateClientProviderMetadata
     $repoRoot = Split-Path -Parent $PSScriptRoot
     $scriptPath = Join-Path $repoRoot 'Install-OOShutUp10.ps1'
     $tokens = $null
@@ -340,6 +445,7 @@ try {
     Assert-Equal 0 @($parseErrors).Count 'the installer parses in the active PowerShell engine'
 
     $source = Get-Content -LiteralPath $scriptPath -Raw
+    $installerBatchSource = Get-Content -LiteralPath (Join-Path $repoRoot 'install.bat') -Raw
     Assert-True ($source.Contains('$DownloadUrl = "https://dl5.oo-software.com/files/ooshutup10/OOSU10.exe"')) 'the official vendor download URL is preserved'
     $versionPolicy = '$MinimumOOShutUpVersion = [version]' + [char]39 + '3.6.1135' + [char]39
     Assert-True ($source.Contains($versionPolicy)) 'the supported version floor is explicit'
@@ -348,6 +454,9 @@ try {
     Assert-True ($source.Contains('The approved settings profile is missing or invalid. No privacy settings were applied; place the reviewed profile in the configured directory.')) 'the required profile fallback is present'
     Assert-True ($source.Contains('The task profile contains settings with unknown user scope. Reapplication was skipped; review the profile scope before retrying.')) 'unknown scope has the required fail-closed status'
     Assert-True ($source.Contains('The SYSTEM task target ACL could not be verified. No task was registered; move the script to a protected path and retry.')) 'the required task ACL fallback is present'
+    Assert-True ($installerBatchSource.Contains('set "INSTALLER_EXIT_CODE=!ERRORLEVEL!"') -and $installerBatchSource.Contains('exit /b !INSTALLER_EXIT_CODE!')) 'the batch wrapper preserves the PowerShell installer exit code'
+    Assert-True ($installerBatchSource.Contains('Setup is partial. Repair the update task before relying on automatic reapplication.')) 'the batch wrapper reports partial setup with the task recovery action'
+    Assert-True ($installerBatchSource -notmatch '\[INFO\] Complete\.') 'the batch wrapper does not print unconditional completion'
     Assert-True ($source.Contains('Task ownership is ambiguous. No task was deleted; inspect the listed path and retry after confirming ownership.')) 'ambiguous task ownership has the required fallback'
     Assert-True ($source.Contains('-RequireMachineScope:$ReapplyOnly')) 'ReapplyOnly validates machine scope before later work'
     Assert-True ($source.Contains("Join-Path `$PSScriptRoot 'profiles'")) 'the profile package path is rooted beside the script'
@@ -373,7 +482,13 @@ try {
         'Test-WindowsUpdateLegacyTaskDefinition',
         'Test-ScheduledTaskAccessDenied',
         'Test-WindowsUpdateTaskMatchesSnapshot',
-        'New-WindowsUpdateScheduledTask'
+        'New-WindowsUpdateScheduledTask',
+        'Invoke-OOShutUpTaskSetup',
+        'Get-OOShutUpInstallOutcome',
+        'Write-OOShutUpInstallSummary',
+        'Read-OOShutUpRestartKey',
+        'Wait-OOShutUpRestartSaveWindow',
+        'Invoke-OOShutUpRestart'
     )
     $functionAsts = $scriptAst.FindAll({
         param($node)
@@ -405,18 +520,29 @@ try {
         'Invoke-ScriptRelocation -CurrentScriptPath',
         'Invoke-OOShutUpConfigurationWithRestorePointGate',
         'Invoke-OOShutUpConfiguration -ExecutablePath',
-        'New-WindowsUpdateScheduledTask -ScriptPath'
+        'Invoke-OOShutUpTaskSetup'
     )) {
         $mutationPosition = $mainSource.IndexOf($mutationMarker, [System.StringComparison]::Ordinal)
         Assert-True ($mutationPosition -gt $profileApprovalGatePosition) "profile approval precedes $mutationMarker"
     }
-    Assert-True ($mainSource.Contains('New-WindowsUpdateScheduledTask -ScriptPath $currentScriptPath -ApprovedProfileSha256 $approvedProfile.Sha256')) 'scheduled task pins the validated profile digest'
-    Assert-True ($mainSource.Contains('-ApprovedProfileManifestSha256 $approvedProfile.ManifestSha256')) 'scheduled task pins the exact scope manifest digest'
+    Assert-True ($mainSource.Contains('-ScriptPath $currentScriptPath') -and $mainSource.Contains('-ApprovedProfileSha256 $approvedProfile.Sha256')) 'scheduled task setup receives the running package and validated profile digest'
+    Assert-True ($mainSource.Contains('-ApprovedProfileManifestSha256 $approvedProfile.ManifestSha256')) 'scheduled task setup receives the exact scope manifest digest'
+    Assert-True ($source.Contains('The privacy settings may be applied, but the update task was not verified. Setup is partial; repair the task before relying on automatic reapplication.')) 'task failure uses the exact partial setup status'
+    Assert-True ($source.Contains('Verify \myTech.Today\Install-OOShutUp10 in Task Scheduler')) 'partial setup includes the exact task identity for recovery'
+    Assert-True ($mainSource.Contains('$taskSetup = Invoke-OOShutUpTaskSetup') -and $mainSource.Contains('$installerOutcome = Get-OOShutUpInstallOutcome')) 'the normal flow consumes explicit task and installer outcomes'
+    Assert-True ($mainSource.Contains('exit $installerOutcome.ExitCode')) 'the normal flow returns the computed complete, partial, or failed exit code'
+    Assert-True ($mainSource.Contains('Write-OOShutUpInstallSummary -Outcome $installerOutcome')) 'the normal flow logs the summary from the installer outcome contract'
+    Assert-True (-not $mainSource.Contains('=== Configuration Complete ===')) 'full-success wording is not unconditional in the normal flow'
+    $summaryFunctionSource = [string](@($functionAsts | Where-Object { $_.Name -eq 'Write-OOShutUpInstallSummary' })[0].Extent.Text)
+    $completeStatusPosition = $summaryFunctionSource.IndexOf('if ($Outcome.Status -eq ''Complete'')', [System.StringComparison]::Ordinal)
+    $completeSummaryPosition = $summaryFunctionSource.IndexOf("Write-Log '=== Configuration Complete ===' -Level SUCCESS", [System.StringComparison]::Ordinal)
+    $partialStatusPosition = $summaryFunctionSource.IndexOf('elseif ($Outcome.Status -eq ''Partial'')', [System.StringComparison]::Ordinal)
+    Assert-True ($completeStatusPosition -ge 0 -and $completeSummaryPosition -gt $completeStatusPosition -and $partialStatusPosition -gt $completeSummaryPosition) 'full-success wording is guarded by the verified complete outcome'
     $noChangeRestartGatePosition = $mainSource.IndexOf('if (-not $script:OOShutUpLastRunChanged)', [System.StringComparison]::Ordinal)
-    $restartPromptPosition = $mainSource.IndexOf('$restart = Read-Host', [System.StringComparison]::Ordinal)
-    $restartWarningPosition = $mainSource.IndexOf('IMPORTANT: Please restart your computer', [System.StringComparison]::Ordinal)
-    $restartCommandPosition = $mainSource.IndexOf('Restart-Computer -Force', [System.StringComparison]::Ordinal)
-    Assert-True ($noChangeRestartGatePosition -ge 0 -and $restartPromptPosition -gt $noChangeRestartGatePosition -and $restartWarningPosition -gt $noChangeRestartGatePosition -and $restartCommandPosition -gt $noChangeRestartGatePosition) 'restart prompt, notice, and command follow the no-change guard'
+    $restartHandlerCallPosition = $mainSource.IndexOf('Invoke-OOShutUpRestart -NonInteractive:', [System.StringComparison]::Ordinal)
+    $restartHandlerSource = [string](@($functionAsts | Where-Object { $_.Name -eq 'Invoke-OOShutUpRestart' })[0].Extent.Text)
+    Assert-True ($noChangeRestartGatePosition -ge 0 -and $restartHandlerCallPosition -gt $noChangeRestartGatePosition) 'the restart handler is called only after the no-change guard'
+    Assert-True ($restartHandlerSource.Contains('Press Y to restart, N or Esc to defer') -and $restartHandlerSource.Contains('Restart-Computer -Force')) 'the guarded restart handler owns the confirmation prompt and explicit force command'
     $taskFunctionSource = ([string](@($functionAsts | Where-Object { $_.Name -eq 'New-WindowsUpdateScheduledTask' })[0].Extent.Text))
     $taskApprovalPosition = $taskFunctionSource.IndexOf('$currentApprovedProfile = Get-OOShutUpApprovedProfile', [System.StringComparison]::Ordinal)
     $pathCanonicalizationPosition = $taskFunctionSource.IndexOf('$ScriptPath = [System.IO.Path]::GetFullPath($ScriptPath)', [System.StringComparison]::Ordinal)
@@ -428,6 +554,64 @@ try {
     Assert-True ($taskFunctionSource.Contains('Register-ScheduledTask -TaskName $stagingTaskName')) 'a disabled validation task is registered before replacing the existing task'
     Assert-True ($taskFunctionSource.Contains('The previous task definition was {1}')) 'failed replacement reports whether rollback preserved or restored the prior task'
     Assert-True ($taskFunctionSource -notmatch 'schtasks\.exe\s+/Delete') 'task replacement does not delete the previous task before validation'
+
+    $savedTaskCreator = (Get-Command -Name New-WindowsUpdateScheduledTask -CommandType Function).ScriptBlock
+    try {
+        Set-Item -Path Function:\New-WindowsUpdateScheduledTask -Value {
+            param(
+                [string]$ScriptPath,
+                [string]$ApprovedProfileSha256,
+                [string]$ApprovedProfileManifestSha256
+            )
+
+            switch ($script:MockInstallerTaskScenario) {
+                'Success' { return $true }
+                'Failure' { return $false }
+                'Exception' { throw 'Mock unexpected scheduler exception.' }
+                default { throw 'Unknown mocked task setup scenario.' }
+            }
+        }
+
+        foreach ($scenario in @('Success', 'Failure', 'Exception')) {
+            $script:MockInstallerTaskScenario = $scenario
+            $taskSetupResult = Invoke-OOShutUpTaskSetup -ScriptPath 'C:\fixture\Install-OOShutUp10.ps1' -ApprovedProfileSha256 ('A' * 64) -ApprovedProfileManifestSha256 ('B' * 64)
+            $installResult = Get-OOShutUpInstallOutcome -SettingsVerified $true -RestorePointVerified $true -RestorePointOverrideUsed $false -TaskSetup $taskSetupResult
+            $script:LogMessages.Clear()
+            Write-OOShutUpInstallSummary -Outcome $installResult
+            $summaryLog = [string]::Join([Environment]::NewLine, [string[]]$script:LogMessages.ToArray())
+            if ($scenario -eq 'Success') {
+                Assert-Equal $true $taskSetupResult.Verified 'a true task creation and verification result is preserved'
+                Assert-Equal 0 $installResult.ExitCode 'verified settings and task return the success exit code'
+                Assert-Equal 'Complete' $installResult.Status 'verified settings and task report complete status'
+                Assert-Equal 'Verified' $installResult.TaskOutcome 'complete status identifies the task as verified'
+                Assert-True ($installResult.Summary.Contains('\myTech.Today\Install-OOShutUp10') -and -not $installResult.Summary.Contains('partial')) 'success summary identifies the verified task'
+                Assert-True ($summaryLog.Contains('=== Configuration Complete ===') -and $summaryLog.Contains($installResult.Summary) -and -not $summaryLog.Contains('=== Setup Partial ===')) 'success logging agrees with the verified task outcome'
+            }
+            else {
+                Assert-Equal $false $taskSetupResult.Verified "$scenario task setup is not treated as verified"
+                Assert-Equal 2 $installResult.ExitCode "$scenario task setup returns the distinct partial exit code"
+                Assert-Equal 'Partial' $installResult.Status "$scenario task setup reports partial status"
+                Assert-Equal 'Not verified' $installResult.TaskOutcome "$scenario task setup reports the task as unverified"
+                Assert-Equal $script:OOShutUpPartialSetupMessage $installResult.Summary "$scenario summary matches the required partial wording"
+                Assert-True ($installResult.RecoveryMessage.Contains('\myTech.Today\Install-OOShutUp10') -and $installResult.RecoveryMessage.Contains('same-named tasks in other folders are left unchanged')) "$scenario recovery identifies the owned task and preserves unrelated tasks"
+                Assert-True (-not $summaryLog.Contains('=== Configuration Complete ===') -and $summaryLog.Contains('=== Setup Partial ===') -and $summaryLog.Contains($installResult.Summary) -and $summaryLog.Contains($installResult.RecoveryMessage)) "$scenario logging and recovery message agree with the partial task outcome"
+            }
+            if ($scenario -eq 'Exception') {
+                Assert-Equal 'Mock unexpected scheduler exception.' $taskSetupResult.ExceptionMessage 'unexpected task exceptions are returned as details instead of escaping the installer'
+            }
+            else {
+                Assert-Equal $null $taskSetupResult.ExceptionMessage "$scenario has no unexpected exception detail"
+            }
+        }
+
+        $overrideSetupResult = [pscustomobject]@{ Verified = $true; ExceptionMessage = $null }
+        $overrideInstallResult = Get-OOShutUpInstallOutcome -SettingsVerified $true -RestorePointVerified $false -RestorePointOverrideUsed $true -TaskSetup $overrideSetupResult
+        Assert-Equal 0 $overrideInstallResult.ExitCode 'an explicit restore point override still permits success when the task is verified'
+        Assert-Equal 'Explicitly overridden' $overrideInstallResult.RestorePointOutcome 'the result retains the separate restore point outcome'
+    }
+    finally {
+        Set-Item -Path Function:\New-WindowsUpdateScheduledTask -Value $savedTaskCreator
+    }
 
     # Replace only the metadata reader after loading production functions so the fixture stays offline.
     function Get-OOShutUpFileVersionInfo {
@@ -828,11 +1012,46 @@ try {
         Assert-True ($taskArguments.Contains([string]$taskProfile.ManifestSha256)) 'scheduled task carries the scope manifest digest'
         $taskLog = [string]::Join("`n", [string[]]$script:LogMessages.ToArray())
         Assert-True ($taskLog.Contains('S-1-5-18') -and $taskLog.Contains($taskProfile.Sha256) -and $taskLog.Contains($taskProfile.ManifestSha256)) 'task logging records principal and digests without setting values'
+        Assert-True ($taskLog.Contains('installation-success event 19') -and $taskLog.Contains('queued sequentially')) 'task logging records the success-only serialized reapply policy'
         $trigger = $taskXml.Task.Triggers.EventTrigger
         $triggerSubscriptionText = [string]$trigger.Subscription
         Assert-Equal 'true' ([string]$trigger.Enabled) 'scheduled task preserves its enabled Windows Update event trigger'
         Assert-Equal 'PT2M' ([string]$trigger.Delay) 'scheduled task preserves its two-minute update delay'
-        Assert-True ($triggerSubscriptionText.Contains('WindowsUpdateClient') -and $triggerSubscriptionText.Contains('EventID=19 or EventID=43')) 'scheduled task preserves the Windows Update event subscription'
+        Assert-True ($triggerSubscriptionText.Contains('WindowsUpdateClient') -and $triggerSubscriptionText.Contains('EventID=19') -and -not $triggerSubscriptionText.Contains('EventID=20') -and -not $triggerSubscriptionText.Contains('EventID=43')) 'scheduled task triggers only on Windows Update installation success'
+        Assert-Equal 'Queue' ([string]$taskXml.Task.Settings.MultipleInstancesPolicy) 'scheduled task queues successful-update triggers behind an active reapply'
+
+        $verifiedCurrentTask = New-MockScheduledTask -TaskName 'Install-OOShutUp10' -TaskPath '\myTech.Today\' -Xml $taskXml.OuterXml
+        Assert-Equal $true (Test-WindowsUpdateTaskDefinition -Task $verifiedCurrentTask -TaskPath '\myTech.Today\' -TaskName 'Install-OOShutUp10' -TaskDescription ([string]$taskXml.Task.RegistrationInfo.Description) -ScriptPath $taskScriptPath -ApprovedProfileSha256 $taskProfile.Sha256 -ApprovedProfileManifestSha256 $taskProfile.ManifestSha256 -ApprovedOOSExecutablePath $script:ManagedExecutablePath) 'task verification checks the success trigger and queue policy'
+
+        $ignoreNewDocument = New-Object System.Xml.XmlDocument
+        $ignoreNewDocument.LoadXml($taskXml.OuterXml)
+        $ignoreNewDocument.SelectSingleNode("/*[local-name()='Task']/*[local-name()='Settings']/*[local-name()='MultipleInstancesPolicy']").InnerText = 'IgnoreNew'
+        $ignoreNewTask = New-MockScheduledTask -TaskName 'Install-OOShutUp10' -TaskPath '\myTech.Today\' -Xml $ignoreNewDocument.OuterXml
+        Assert-Equal $false (Test-WindowsUpdateTaskDefinition -Task $ignoreNewTask -TaskPath '\myTech.Today\' -TaskName 'Install-OOShutUp10' -TaskDescription ([string]$taskXml.Task.RegistrationInfo.Description) -ScriptPath $taskScriptPath -ApprovedProfileSha256 $taskProfile.Sha256 -ApprovedProfileManifestSha256 $taskProfile.ManifestSha256 -ApprovedOOSExecutablePath $script:ManagedExecutablePath) 'IgnoreNew is rejected as an unsafe current task definition'
+
+        $startAndSuccessDocument = New-Object System.Xml.XmlDocument
+        $startAndSuccessDocument.LoadXml($taskXml.OuterXml)
+        $startAndSuccessDocument.SelectSingleNode("/*[local-name()='Task']/*[local-name()='Triggers']/*[local-name()='EventTrigger']/*[local-name()='Subscription']").InnerText = '<QueryList><Query Id="0" Path="System"><Select Path="System">*[System[Provider[@Name=''Microsoft-Windows-WindowsUpdateClient''] and (EventID=19 or EventID=43)]]</Select></Query></QueryList>'
+        $startAndSuccessTask = New-MockScheduledTask -TaskName 'Install-OOShutUp10' -TaskPath '\myTech.Today\' -Xml $startAndSuccessDocument.OuterXml
+        Assert-Equal $false (Test-WindowsUpdateTaskDefinition -Task $startAndSuccessTask -TaskPath '\myTech.Today\' -TaskName 'Install-OOShutUp10' -TaskDescription ([string]$taskXml.Task.RegistrationInfo.Description) -ScriptPath $taskScriptPath -ApprovedProfileSha256 $taskProfile.Sha256 -ApprovedProfileManifestSha256 $taskProfile.ManifestSha256 -ApprovedOOSExecutablePath $script:ManagedExecutablePath) 'the old start-and-success trigger is rejected as a current task definition'
+
+        $noEventRuns = @(Invoke-MockUpdateTaskSchedule -TaskDefinition $taskXml -EventIds @())
+        $failureEventRuns = @(Invoke-MockUpdateTaskSchedule -TaskDefinition $taskXml -EventIds @(20))
+        $startEventRuns = @(Invoke-MockUpdateTaskSchedule -TaskDefinition $taskXml -EventIds @(43))
+        Assert-Equal 0 $noEventRuns.Count 'no Windows Update event leaves the task idle'
+        Assert-Equal 0 $failureEventRuns.Count 'a Windows Update installation failure does not start or report a successful reapply'
+        Assert-Equal 0 $startEventRuns.Count 'an installation-start event does not start an early reapply'
+
+        foreach ($runDurationAfterSuccess in @(119, 120, 121)) {
+            $activeRunEndSeconds = 10 + $runDurationAfterSuccess
+            $completionRuns = @(Invoke-MockUpdateTaskSchedule -TaskDefinition $taskXml -EventIds @(19) -ActiveRunEventId 43 -ActiveRunEndSeconds $activeRunEndSeconds)
+            $expectedCompletionStartSeconds = [Math]::Max(130, $activeRunEndSeconds)
+            Assert-Equal 1 $completionRuns.Count "a success event during an event-43 run at ${runDurationAfterSuccess}s retains one completion reapply"
+            Assert-Equal 19 $completionRuns[0].EventId "the ${runDurationAfterSuccess}s follow-up is caused by the success event"
+            Assert-Equal 43 $completionRuns[0].ActiveRunEventId "the ${runDurationAfterSuccess}s scenario holds the event-43 run open"
+            Assert-Equal $expectedCompletionStartSeconds $completionRuns[0].StartSeconds "the ${runDurationAfterSuccess}s follow-up waits for both the PT2M delay and active run"
+            Assert-True ($completionRuns[0].StartSeconds -ge $activeRunEndSeconds) "the ${runDurationAfterSuccess}s follow-up does not overlap the active O&O reapply"
+        }
 
         $legacyTaskDocument = New-Object System.Xml.XmlDocument
         $legacyTaskDocument.LoadXml($taskXml.OuterXml)
@@ -920,7 +1139,7 @@ try {
         $ambiguousLog = @($script:LogMessages.ToArray()) -join [Environment]::NewLine
         Assert-True ($ambiguousLog.Contains($script:OOShutUpTaskOwnershipFailureMessage) -and $ambiguousLog.Contains('\myTech.Today\Install-OOShutUp10')) 'ambiguous refusal reports the exact listed path and operator instruction'
 
-        foreach ($failureMode in @('AccessDenied', 'SchedulerError')) {
+        foreach ($failureMode in @('AccessDenied', 'SchedulerError', 'ModuleMissing')) {
             $script:TaskRegistry.Clear()
             $script:TaskRegistrationCalls.Clear()
             $script:TaskUnregistrationCalls.Clear()
@@ -937,10 +1156,42 @@ try {
             if ($failureMode -eq 'AccessDenied') {
                 Assert-True ($failureLog.Contains('Access denied while inspecting Task Scheduler')) 'access denied is reported distinctly'
             }
+            elseif ($failureMode -eq 'ModuleMissing') {
+                Assert-True ($failureLog.Contains('Task Scheduler could not inspect') -and $failureLog.Contains('ScheduledTasks module is not loaded')) 'a missing ScheduledTasks module is reported as an unavailable scheduler command'
+            }
             else {
                 Assert-True ($failureLog.Contains('Task Scheduler could not inspect')) 'scheduler errors are reported distinctly from access denied'
             }
         }
+
+        $script:TaskRegistry.Clear()
+        $script:TaskRegistrationCalls.Clear()
+        $script:TaskUnregistrationCalls.Clear()
+        $script:TaskRegistry['\myTech.Today\|Install-OOShutUp10'] = $oldTask
+        $script:TaskRegistry['\Backup\|Install-OOShutUp10'] = $foreignTask
+        $script:TaskRegistry['\Security\|Install-OOShutUp10'] = $securityTask
+        $script:TaskRegistrationFailure = 'AccessDenied'
+        $script:LogMessages.Clear()
+        $deniedRegistrationSetup = Invoke-OOShutUpTaskSetup -ScriptPath $taskScriptPath -ApprovedProfileSha256 $taskProfile.Sha256 -ApprovedProfileManifestSha256 $taskProfile.ManifestSha256
+        $deniedRegistrationOutcome = Get-OOShutUpInstallOutcome -SettingsVerified $true -RestorePointVerified $true -RestorePointOverrideUsed $false -TaskSetup $deniedRegistrationSetup
+        Assert-Equal $false $deniedRegistrationSetup.Verified 'access denied during task registration is returned as unverified'
+        Assert-Equal 2 $deniedRegistrationOutcome.ExitCode 'access denied during task registration yields the partial exit code'
+        Assert-Equal $oldTaskXml ([string]$script:TaskRegistry['\myTech.Today\|Install-OOShutUp10'].Definition) 'denied candidate registration preserves the existing approved task'
+        Assert-Equal $foreignTaskXml ([string]$script:TaskRegistry['\Backup\|Install-OOShutUp10'].Definition) 'denied registration preserves the unrelated backup task'
+        Assert-Equal $securityTaskXml ([string]$script:TaskRegistry['\Security\|Install-OOShutUp10'].Definition) 'denied registration preserves the unrelated security task'
+        Assert-True ((@($script:LogMessages.ToArray()) -join [Environment]::NewLine).Contains('Access denied by Task Scheduler')) 'denied task registration gives the access recovery category'
+
+        $script:TaskRegistrationCalls.Clear()
+        $script:TaskUnregistrationCalls.Clear()
+        $script:LogMessages.Clear()
+        $retrySetup = Invoke-OOShutUpTaskSetup -ScriptPath $taskScriptPath -ApprovedProfileSha256 $taskProfile.Sha256 -ApprovedProfileManifestSha256 $taskProfile.ManifestSha256
+        $retryOutcome = Get-OOShutUpInstallOutcome -SettingsVerified $true -RestorePointVerified $true -RestorePointOverrideUsed $false -TaskSetup $retrySetup
+        Assert-Equal $true $retrySetup.Verified 'retry verifies the exact approved task after scheduler access is restored'
+        Assert-Equal 0 $retryOutcome.ExitCode 'verified task retry returns the success exit code'
+        Assert-True ($script:TaskRegistry['\myTech.Today\|Install-OOShutUp10'].Actions[0].Arguments.Contains($taskProfile.Sha256)) 'retry installs the approved profile digest at the owned path'
+        Assert-Equal $foreignTaskXml ([string]$script:TaskRegistry['\Backup\|Install-OOShutUp10'].Definition) 'successful retry leaves the unrelated backup task unchanged'
+        Assert-Equal $securityTaskXml ([string]$script:TaskRegistry['\Security\|Install-OOShutUp10'].Definition) 'successful retry leaves the unrelated security task unchanged'
+        Assert-Equal 0 @($script:TaskUnregistrationCalls | Where-Object { $_.TaskPath -ne '\myTech.Today\' }).Count 'retry never unregisters a task outside the owned folder'
 
         $script:TaskRegistry.Clear()
         $script:TaskRegistrationCalls.Clear()
@@ -956,6 +1207,19 @@ try {
         Assert-Equal ($unregistrationsBeforeStageFailure + 1) $script:TaskUnregistrationCalls.Count 'failed candidate cleanup removes only the disabled validation task'
         Assert-Equal 0 @(Get-ChildItem -LiteralPath $taskScriptDirectory -Filter '.Install-OOShutUp10-task-rollback-*.xml').Count 'candidate verification failure removes its temporary rollback copy'
         $script:FailStageVerification = $false
+
+        $script:TaskRegistry.Clear()
+        $script:TaskRegistrationCalls.Clear()
+        $script:TaskUnregistrationCalls.Clear()
+        $script:TaskRegistry['\myTech.Today\|Install-OOShutUp10'] = $oldTask
+        $script:LogMessages.Clear()
+        $script:FailStageQueuePolicyVerification = $true
+        Assert-Equal $false (New-WindowsUpdateScheduledTask -ScriptPath $taskScriptPath -ApprovedProfileSha256 $taskProfile.Sha256 -ApprovedProfileManifestSha256 $taskProfile.ManifestSha256) 'a candidate with IgnoreNew fails the queue-policy verification'
+        Assert-Equal $oldTaskXml ([string]$script:TaskRegistry['\myTech.Today\|Install-OOShutUp10'].Definition) 'queue-policy verification failure preserves the prior task definition'
+        Assert-Equal 1 $script:TaskRegistrationCalls.Count 'queue-policy verification failure registers only a disabled candidate'
+        Assert-Equal 1 $script:TaskUnregistrationCalls.Count 'queue-policy verification failure removes only the rejected candidate'
+        Assert-True ((@($script:LogMessages.ToArray()) -join [Environment]::NewLine).Contains('trigger, and queue settings')) 'queue-policy verification failure reports the exact rejected task criteria'
+        $script:FailStageQueuePolicyVerification = $false
 
         $script:TaskRegistry.Clear()
         $script:TaskRegistry['\myTech.Today\|Install-OOShutUp10'] = $oldTask
