@@ -153,7 +153,10 @@ $script:OOShutUpUnknownScopeFailureMessage = 'The task profile contains settings
 $script:OOShutUpCurrentUserScopeFailureMessage = 'The SYSTEM task profile contains current-user settings. Reapplication was skipped; run them for the intended signed-in user or remove them from the SYSTEM task profile.'
 $script:OOShutUpApprovalFailureMessage = 'The selected settings profile has no matching approval. No settings were changed; review both file digests in the interactive installer and recreate the task.'
 $script:OOShutUpRestorePointFailureMessage = 'A restore point could not be verified. No privacy settings were applied; free space or enable restore protection, then retry.'
+$script:OOShutUpRestorePointPreparationFailureMessage = 'Restore-point preparation failed on the detected Windows volume. No settings were applied; restore the prior registry value and fix the provider error.'
 $script:OOShutUpRestorePointOverrideMessage = 'A restore point could not be verified. System Restore recovery is unavailable; continuing only because -AllowWithoutRestorePoint was supplied. The approved O&O profile export remains separate.'
+$script:OOShutUpRestorePointFrequencyRegistryPath = 'SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore'
+$script:OOShutUpRestorePointFrequencyRegistryName = 'SystemRestorePointCreationFrequency'
 $script:OOShutUpTaskAclFailureMessage = 'The SYSTEM task target ACL could not be verified. No task was registered; move the script to a protected path and retry.'
 $script:OOShutUpTaskOwnershipFailureMessage = 'Task ownership is ambiguous. No task was deleted; inspect the listed path and retry after confirming ownership.'
 $script:OOShutUpManagedPathFailureMessage = 'The approved O&O executable path is unavailable to the scheduled task. Reapplication was skipped; restore the verified machine copy.'
@@ -369,34 +372,247 @@ function Invoke-ScriptRelocation {
     }
 }
 
-function Set-RestorePointFrequency {
-    <#
-    .SYNOPSIS
-        Modifies registry to allow restore points to be created anytime
-    #>
+function Get-RestorePointFrequencyState {
     [CmdletBinding()]
     param()
 
+    $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($script:OOShutUpRestorePointFrequencyRegistryPath, $false)
+    if ($null -eq $key) {
+        return [pscustomobject]@{
+            KeyExists = $false
+            ValueExists = $false
+            Value = $null
+            Kind = $null
+        }
+    }
+
     try {
-        Write-Log "Configuring registry to allow frequent restore points..." -Level INFO
-
-        $regPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore"
-        $regName = "SystemRestorePointCreationFrequency"
-
-        # Check if registry key exists
-        if (-not (Test-Path $regPath)) {
-            New-Item -Path $regPath -Force | Out-Null
+        $valueExists = $key.GetValueNames() -contains $script:OOShutUpRestorePointFrequencyRegistryName
+        if (-not $valueExists) {
+            return [pscustomobject]@{
+                KeyExists = $true
+                ValueExists = $false
+                Value = $null
+                Kind = $null
+            }
         }
 
-        # Set to 0 to allow restore points anytime (default is 1440 minutes = 24 hours)
-        Set-ItemProperty -Path $regPath -Name $regName -Value 0 -Type DWord -Force
+        return [pscustomobject]@{
+            KeyExists = $true
+            ValueExists = $true
+            Value = $key.GetValue(
+                $script:OOShutUpRestorePointFrequencyRegistryName,
+                $null,
+                [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames
+            )
+            Kind = $key.GetValueKind($script:OOShutUpRestorePointFrequencyRegistryName)
+        }
+    }
+    finally {
+        $key.Dispose()
+    }
+}
 
-        Write-Log "Registry configured: Restore points can now be created anytime" -Level SUCCESS
+function Set-RestorePointFrequencyRawValue {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Value,
+
+        [Parameter(Mandatory = $true)]
+        [Microsoft.Win32.RegistryValueKind]$Kind
+    )
+
+    $key = [Microsoft.Win32.Registry]::LocalMachine.CreateSubKey($script:OOShutUpRestorePointFrequencyRegistryPath)
+    if ($null -eq $key) {
+        throw 'The System Restore registry key could not be opened for writing.'
+    }
+
+    try {
+        $key.SetValue($script:OOShutUpRestorePointFrequencyRegistryName, $Value, $Kind)
+        $key.Flush()
+    }
+    finally {
+        $key.Dispose()
+    }
+}
+
+function Set-RestorePointFrequencyValue {
+    [CmdletBinding()]
+    param()
+
+    Set-RestorePointFrequencyRawValue -Value 0 -Kind ([Microsoft.Win32.RegistryValueKind]::DWord)
+}
+
+function Remove-RestorePointFrequencyValue {
+    [CmdletBinding()]
+    param()
+
+    $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($script:OOShutUpRestorePointFrequencyRegistryPath, $true)
+    if ($null -eq $key) {
+        return
+    }
+
+    try {
+        if ($key.GetValueNames() -contains $script:OOShutUpRestorePointFrequencyRegistryName) {
+            $key.DeleteValue($script:OOShutUpRestorePointFrequencyRegistryName, $false)
+            $key.Flush()
+        }
+    }
+    finally {
+        $key.Dispose()
+    }
+}
+
+function Remove-EmptyRestorePointFrequencyKey {
+    [CmdletBinding()]
+    param()
+
+    $separator = $script:OOShutUpRestorePointFrequencyRegistryPath.LastIndexOf('\')
+    if ($separator -le 0) {
+        throw 'The System Restore registry path is invalid.'
+    }
+
+    $parentPath = $script:OOShutUpRestorePointFrequencyRegistryPath.Substring(0, $separator)
+    $leafName = $script:OOShutUpRestorePointFrequencyRegistryPath.Substring($separator + 1)
+    $parentKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($parentPath, $true)
+    if ($null -eq $parentKey) {
+        return
+    }
+
+    try {
+        $key = $parentKey.OpenSubKey($leafName, $false)
+        if ($null -eq $key) {
+            return
+        }
+
+        try {
+            if ($key.GetValueNames().Count -gt 0 -or $key.GetSubKeyNames().Count -gt 0) {
+                throw 'The System Restore registry key contains data beyond the temporary frequency value.'
+            }
+        }
+        finally {
+            $key.Dispose()
+        }
+
+        $parentKey.DeleteSubKey($leafName, $false)
+        $parentKey.Flush()
+    }
+    finally {
+        $parentKey.Dispose()
+    }
+}
+
+function Test-RestorePointFrequencyStateEqual {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [psobject]$Expected,
+
+        [Parameter(Mandatory = $true)]
+        [psobject]$Actual
+    )
+
+    if ([bool]$Expected.KeyExists -ne [bool]$Actual.KeyExists -or
+        [bool]$Expected.ValueExists -ne [bool]$Actual.ValueExists) {
+        return $false
+    }
+    if (-not $Expected.ValueExists) {
+        return $true
+    }
+    if ($Expected.Kind -ne $Actual.Kind) {
+        return $false
+    }
+
+    if ($Expected.Value -is [Array] -or $Actual.Value -is [Array]) {
+        return [System.Collections.StructuralComparisons]::StructuralEqualityComparer.Equals($Expected.Value, $Actual.Value)
+    }
+    return [object]::Equals($Expected.Value, $Actual.Value)
+}
+
+function Restore-RestorePointFrequencyState {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [psobject]$State
+    )
+
+    try {
+        if ([bool]$State.KeyExists) {
+            if ([bool]$State.ValueExists) {
+                Set-RestorePointFrequencyRawValue -Value $State.Value -Kind $State.Kind
+            }
+            else {
+                Remove-RestorePointFrequencyValue
+            }
+        }
+        else {
+            Remove-RestorePointFrequencyValue
+            Remove-EmptyRestorePointFrequencyKey
+        }
+
+        $actualState = Get-RestorePointFrequencyState
+        if (-not (Test-RestorePointFrequencyStateEqual -Expected $State -Actual $actualState)) {
+            throw 'The prior System Restore registry state did not match after rollback.'
+        }
+
         return $true
     }
     catch {
-        Write-Log "Warning: Could not modify registry: $($_.Exception.Message)" -Level WARNING
+        Write-Log "Warning: Could not restore the prior System Restore registry state: $($_.Exception.Message)" -Level ERROR
         return $false
+    }
+}
+
+function Set-RestorePointFrequency {
+    <#
+    .SYNOPSIS
+        Temporarily permits another restore point and returns the prior registry state.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param()
+
+    $previousState = $null
+    try {
+        Write-Log 'Configuring registry to allow frequent restore points...' -Level INFO
+        $previousState = Get-RestorePointFrequencyState
+
+        Set-RestorePointFrequencyValue
+
+        $expectedState = [pscustomobject]@{
+            KeyExists = $true
+            ValueExists = $true
+            Value = 0
+            Kind = [Microsoft.Win32.RegistryValueKind]::DWord
+        }
+        $actualState = Get-RestorePointFrequencyState
+        if (-not (Test-RestorePointFrequencyStateEqual -Expected $expectedState -Actual $actualState)) {
+            throw 'The System Restore frequency registry write could not be verified.'
+        }
+
+        Write-Log 'Registry configured and verified: restore points can be created temporarily' -Level SUCCESS
+        return [pscustomobject]@{
+            Succeeded = $true
+            PreviousState = $previousState
+            RollbackSucceeded = $null
+            ErrorMessage = $null
+        }
+    }
+    catch {
+        $errorMessage = $_.Exception.Message
+        $rollbackSucceeded = $false
+        if ($null -ne $previousState) {
+            $rollbackSucceeded = Restore-RestorePointFrequencyState -State $previousState
+        }
+
+        Write-Log "Warning: Could not configure restore-point frequency: $errorMessage" -Level WARNING
+        return [pscustomobject]@{
+            Succeeded = $false
+            PreviousState = $previousState
+            RollbackSucceeded = $rollbackSucceeded
+            ErrorMessage = $errorMessage
+        }
     }
 }
 
@@ -1020,98 +1236,155 @@ function Invoke-OOShutUpConfiguration {
     }
 }
 
+function Get-WindowsSystemVolume {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param()
+
+    $windowsPath = $env:SystemRoot
+    if ([string]::IsNullOrWhiteSpace($windowsPath)) {
+        throw 'The Windows system directory could not be detected.'
+    }
+
+    $windowsPath = [System.IO.Path]::GetFullPath($windowsPath)
+    $volume = [System.IO.Path]::GetPathRoot($windowsPath)
+    if ([string]::IsNullOrWhiteSpace($volume) -or $volume -notmatch '^[A-Za-z]:\\$') {
+        throw 'The Windows system volume is not a supported local drive.'
+    }
+
+    return $volume
+}
+
 function New-SystemRestorePoint {
     <#
     .SYNOPSIS
-        Creates a system restore point with progress indication
+        Creates and verifies a system restore point, restoring the prior frequency registry state afterward.
     #>
     [CmdletBinding()]
+    [OutputType([pscustomobject])]
     param()
 
+    $preparationSucceeded = $false
+    $restorePointVerified = $false
+    $failureDetail = $null
+    $systemVolume = $null
+    $frequencyPreparation = $null
+    $registryRollbackSucceeded = $true
+
     try {
-        Write-Log "Creating system restore point..." -Level INFO
-        Write-Log "This may take a few minutes. Please wait..." -Level INFO
+        Write-Log 'Creating system restore point...' -Level INFO
+        Write-Log 'This may take a few minutes. Please wait...' -Level INFO
 
-        # Enable System Restore on C: drive if not already enabled
-        Enable-ComputerRestore -Drive "C:\" -ErrorAction SilentlyContinue
-
-        # Create restore point with progress indication
-        $description = "Before O&O ShutUp10++ Privacy Settings - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [$([guid]::NewGuid().ToString('N'))]"
-
-        # Start a background job to create the restore point
-        $job = Start-Job -ScriptBlock {
-            param($desc)
-            try {
-                Checkpoint-Computer -Description $desc -RestorePointType "MODIFY_SETTINGS" -ErrorAction Stop
-                return @{ Success = $true; Message = "Restore point created successfully" }
-            }
-            catch {
-                return @{ Success = $false; Message = $_.Exception.Message }
-            }
-        } -ArgumentList $description
-
-        # Show progress while waiting for the job to complete
-        $elapsed = 0
-        $maxWait = 300 # 5 minutes max
-
-        while ($job.State -eq 'Running' -and $elapsed -lt $maxWait) {
-            $seconds = $elapsed % 60
-            $minutes = [Math]::Floor($elapsed / 60)
-
-            if ($minutes -gt 0) {
-                $timeStr = "$minutes min $seconds sec"
-            } else {
-                $timeStr = "$seconds seconds"
-            }
-
-            Write-Progress -Activity "Creating System Restore Point" `
-                          -Status "Elapsed time: $timeStr" `
-                          -PercentComplete (($elapsed / $maxWait) * 100) `
-                          -CurrentOperation "Please wait while Windows creates a restore point..."
-
-            Start-Sleep -Seconds 1
-            $elapsed++
-        }
-
-        # Check if job completed or timed out
-        if ($job.State -eq 'Running') {
-            # Job timed out
-            Write-Log "Restore point creation timed out after $maxWait seconds" -Level WARNING
-            Stop-Job -Job $job
-            Remove-Job -Job $job -Force
-            Write-Progress -Activity "Creating System Restore Point" -Completed
-            return $false
-        }
-
-        # Job completed - get the result
-        $result = Receive-Job -Job $job -Wait -AutoRemoveJob
-
-        # Clear the progress bar
-        Write-Progress -Activity "Creating System Restore Point" -Completed
-
-        if ($result -and $result.Success) {
-            # A successful provider response is not proof that Windows retained the point.
-            $matchingRestorePoint = @(Get-ComputerRestorePoint -ErrorAction Stop |
-                Where-Object { [string]$_.Description -ceq $description } |
-                Select-Object -First 1)
-            if ($matchingRestorePoint.Count -gt 0) {
-                Write-Log "System restore point created and verified successfully" -Level SUCCESS
-                return $true
-            }
-
-            Write-Log 'The restore provider reported success, but Windows did not list the requested restore point; it could not be verified.' -Level WARNING
-            return $false
+        $systemVolume = Get-WindowsSystemVolume
+        $frequencyPreparation = Set-RestorePointFrequency
+        if (-not $frequencyPreparation.Succeeded) {
+            $failureDetail = $frequencyPreparation.ErrorMessage
         }
         else {
-            $errorMsg = if ($result.Message) { $result.Message } else { "Unknown error" }
-            Write-Log "Warning: Could not create restore point: $errorMsg" -Level WARNING
-            return $false
+            Enable-ComputerRestore -Drive $systemVolume -ErrorAction Stop
+            $preparationSucceeded = $true
+
+            $description = "Before O&O ShutUp10++ Privacy Settings - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [$([guid]::NewGuid().ToString('N'))]"
+            $job = Start-Job -ScriptBlock {
+                param($desc)
+                try {
+                    Checkpoint-Computer -Description $desc -RestorePointType 'MODIFY_SETTINGS' -ErrorAction Stop
+                    return @{ Success = $true; Message = 'Restore point created successfully' }
+                }
+                catch {
+                    return @{ Success = $false; Message = $_.Exception.Message }
+                }
+            } -ArgumentList $description
+
+            $elapsed = 0
+            $maxWait = 300
+            while ($job.State -eq 'Running' -and $elapsed -lt $maxWait) {
+                $seconds = $elapsed % 60
+                $minutes = [Math]::Floor($elapsed / 60)
+                $timeString = if ($minutes -gt 0) { "$minutes min $seconds sec" } else { "$seconds seconds" }
+
+                Write-Progress -Activity 'Creating System Restore Point' `
+                    -Status "Elapsed time: $timeString" `
+                    -PercentComplete (($elapsed / $maxWait) * 100) `
+                    -CurrentOperation 'Please wait while Windows creates a restore point...'
+
+                Start-Sleep -Seconds 1
+                $elapsed++
+            }
+
+            if ($job.State -eq 'Running') {
+                $failureDetail = "Restore point creation timed out after $maxWait seconds."
+                Write-Log $failureDetail -Level WARNING
+                Stop-Job -Job $job
+                Remove-Job -Job $job -Force
+            }
+            else {
+                $result = Receive-Job -Job $job -Wait -AutoRemoveJob
+                if ($result -and $result.Success) {
+                    $matchingRestorePoint = @(Get-ComputerRestorePoint -ErrorAction Stop |
+                        Where-Object { [string]$_.Description -ceq $description } |
+                        Select-Object -First 1)
+                    if ($matchingRestorePoint.Count -gt 0) {
+                        $restorePointVerified = $true
+                    }
+                    else {
+                        $failureDetail = 'The restore provider reported success, but Windows did not list the requested restore point.'
+                    }
+                }
+                else {
+                    $errorMessage = if ($result.Message) { [string]$result.Message } else { 'Unknown provider error.' }
+                    $failureDetail = "Could not create the restore point: $errorMessage"
+                }
+            }
         }
     }
     catch {
-        Write-Progress -Activity "Creating System Restore Point" -Completed
-        Write-Log "Warning: Could not create restore point: $($_.Exception.Message)" -Level WARNING
-        return $false
+        $failureDetail = $_.Exception.Message
+    }
+    finally {
+        if ($null -ne $frequencyPreparation -and $null -ne $frequencyPreparation.PreviousState) {
+            try {
+                $registryRollbackSucceeded = Restore-RestorePointFrequencyState -State $frequencyPreparation.PreviousState
+            }
+            catch {
+                $registryRollbackSucceeded = $false
+                $failureDetail = "The prior System Restore registry value could not be restored: $($_.Exception.Message)"
+            }
+            if (-not $registryRollbackSucceeded) {
+                $preparationSucceeded = $false
+                $restorePointVerified = $false
+                if ([string]::IsNullOrWhiteSpace($failureDetail)) {
+                    $failureDetail = 'The prior System Restore registry value could not be restored.'
+                }
+            }
+        }
+
+        try {
+            Write-Progress -Activity 'Creating System Restore Point' -Completed
+        }
+        catch {
+            Write-Log "Warning: Could not clear restore-point progress display: $($_.Exception.Message)" -Level WARNING
+        }
+    }
+
+    if (-not $preparationSucceeded) {
+        if (-not [string]::IsNullOrWhiteSpace($failureDetail)) {
+            Write-Log "Restore-point preparation detail: $failureDetail" -Level ERROR
+        }
+    }
+    elseif ($restorePointVerified) {
+        Write-Log 'System restore point created and verified successfully' -Level SUCCESS
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($failureDetail)) {
+        Write-Log "Warning: Could not create restore point: $failureDetail" -Level WARNING
+    }
+
+    return [pscustomobject]@{
+        PreparationSucceeded = [bool]$preparationSucceeded
+        RestorePointVerified = [bool]$restorePointVerified
+        RegistryRollbackSucceeded = [bool]$registryRollbackSucceeded
+        SystemVolume = $systemVolume
+        FailureDetail = $failureDetail
     }
 }
 
@@ -1126,10 +1399,23 @@ function Invoke-OOShutUpConfigurationWithRestorePointGate {
         [switch]$AllowWithoutRestorePoint
     )
 
-    $restorePointVerified = New-SystemRestorePoint
+    $restorePointResult = New-SystemRestorePoint
+    $restorePointVerified = [bool]$restorePointResult.RestorePointVerified
+    if (-not $restorePointResult.PreparationSucceeded) {
+        Write-Log $script:OOShutUpRestorePointPreparationFailureMessage -Level ERROR
+        return [pscustomobject]@{
+            PreparationSucceeded = $false
+            RestorePointVerified = $false
+            OverrideUsed = $false
+            ConfigurationStarted = $false
+            ConfigurationSucceeded = $false
+        }
+    }
+
     if (-not $restorePointVerified -and -not $AllowWithoutRestorePoint) {
         Write-Log $script:OOShutUpRestorePointFailureMessage -Level ERROR
         return [pscustomobject]@{
+            PreparationSucceeded = $true
             RestorePointVerified = $false
             OverrideUsed = $false
             ConfigurationStarted = $false
@@ -1146,6 +1432,7 @@ function Invoke-OOShutUpConfigurationWithRestorePointGate {
     $configurationSucceeded = Invoke-OOShutUpConfiguration -ExecutablePath $ExecutablePath
 
     return [pscustomobject]@{
+        PreparationSucceeded = $true
         RestorePointVerified = [bool]$restorePointVerified
         OverrideUsed = [bool](-not $restorePointVerified -and $AllowWithoutRestorePoint)
         ConfigurationStarted = $true
@@ -2065,10 +2352,9 @@ try {
 
     Write-Log "Using O&O ShutUp10++ at: $exePath" -Level INFO
 
-    # Step 2: Configure registry to allow frequent restore points
-    Update-ScriptProgress -PercentComplete 30 -Status "Step 2 of 5: Configuring System" -CurrentOperation "Configuring registry for frequent restore points"
-    Write-Log "Step 2: Configuring system for frequent restore points..." -Level INFO
-    Set-RestorePointFrequency | Out-Null
+    # Step 2: Prepare System Restore. The temporary frequency value is applied and restored inside New-SystemRestorePoint.
+    Update-ScriptProgress -PercentComplete 30 -Status "Step 2 of 5: Preparing System Restore" -CurrentOperation "Detecting the Windows volume and checking restore-point readiness"
+    Write-Log "Step 2: Preparing Windows System Restore..." -Level INFO
 
     # Step 3: Create restore point BEFORE applying settings
     Update-ScriptProgress -PercentComplete 40 -Status "Step 3 of 5: Creating Restore Point" -CurrentOperation "Creating system restore point (this may take a few minutes)"

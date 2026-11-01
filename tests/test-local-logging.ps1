@@ -157,7 +157,7 @@ $firstOperationalStage = $source.IndexOf('# Step 0: Ensure script is running fro
 Assert-True ($guardStart -ge 0 -and $firstOperationalStage -gt $guardStart) 'the local logger gate precedes relocation'
 $guardText = $source.Substring($guardStart, $firstOperationalStage - $guardStart)
 Assert-True ($guardText.Contains('exit 1')) 'logger initialization failure exits before operational work'
-foreach ($operation in @('Install-OOShutUp', 'Set-RestorePointFrequency', 'Invoke-OOShutUpConfigurationWithRestorePointGate', 'Invoke-OOShutUpConfiguration', 'New-WindowsUpdateScheduledTask')) {
+foreach ($operation in @('Install-OOShutUp', 'Invoke-OOShutUpConfigurationWithRestorePointGate', 'Invoke-OOShutUpConfiguration', 'New-WindowsUpdateScheduledTask')) {
     $operationPosition = $source.IndexOf($operation, $firstOperationalStage)
     Assert-True ($operationPosition -gt $firstOperationalStage) "$operation remains after the logger gate"
 }

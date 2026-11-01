@@ -403,7 +403,6 @@ try {
     Assert-True ($source.Contains('The approved O&O executable path is unavailable to the scheduled task. Reapplication was skipped; restore the verified machine copy.') -and $mainSource.Contains('$script:OOShutUpManagedPathFailureMessage')) 'SYSTEM ReapplyOnly reports the exact managed-copy recovery instruction'
     foreach ($mutationMarker in @(
         'Invoke-ScriptRelocation -CurrentScriptPath',
-        'Set-RestorePointFrequency | Out-Null',
         'Invoke-OOShutUpConfigurationWithRestorePointGate',
         'Invoke-OOShutUpConfiguration -ExecutablePath',
         'New-WindowsUpdateScheduledTask -ScriptPath'
