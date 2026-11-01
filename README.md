@@ -93,23 +93,25 @@ This PowerShell automation script is developed and maintained by **myTech.Today*
 
 ## Overview
 
-This PowerShell script automates the installation and configuration of **O&O ShutUp10++**, a privacy tool that helps protect Windows users from Microsoft telemetry and spyware by applying recommended privacy settings.
+This PowerShell script automates the installation and configuration of **O&O ShutUp10++** using a reviewed settings profile supplied with the script package.
 
 ## Features
 
 ### ✅ **Automated Installation**
 - Scans for existing O&O ShutUp10++ installation
 - Downloads from official O&O Software website if not found
-- Silent installation with no user interaction required
+- Silent installation after the profile approval gate
 
 ### ✅ **Privacy Settings Application**
-- Applies recommended privacy settings automatically
-- Uses O&O ShutUp10++'s default configuration for optimal privacy
-- Runs completely silently without opening the GUI
+- Applies only the settings in the approved, digest-verified profile
+- Stops before system or privacy changes when the approved profile is missing or invalid
+- Shows a keyboard-readable impact summary before interactive approval
+- Allows unattended application only when the exact profile SHA-256 digest is supplied and matches
+- Runs O&O in quiet mode after the approval gate
 
 ### ✅ **System Protection**
-- Creates a system restore point before applying settings
-- Allows easy rollback if needed
+- Attempts a system restore point before applying settings and reports the outcome
+- Documents O&O's per-session undo history as the primary settings rollback path
 
 ### ✅ **Post-Windows Update Protection** 🆕
 - **Automatically creates a scheduled task** that runs after Windows updates
@@ -156,12 +158,12 @@ cd "<drive>:\path\to\script\" & .\Install-OOShutUp10.ps1
 
 ### What Happens During Installation
 
-1. ✅ Checks if O&O ShutUp10++ is already installed
-2. ✅ Downloads the application if not found
-3. ✅ Creates a system restore point
-4. ✅ Applies recommended privacy settings silently
+1. ✅ Validates the selected profile and confirms the impact summary
+2. ✅ Checks if O&O ShutUp10++ is already installed and downloads it if needed
+3. ✅ Attempts a system restore point
+4. ✅ Applies the approved profile quietly
 5. ✅ **Creates a scheduled task** to reapply settings after Windows updates
-6. ✅ Prompts to restart the computer
+6. ✅ Prompts for restart only when O&O reports that settings changed
 
 ### Reapply Settings Only (Used by Scheduled Task)
 
@@ -176,7 +178,7 @@ This mode is automatically used by the scheduled task after Windows updates.
 ## Scheduled Task Details
 
 ### Task Name
-`OOShutUp10-PostWindowsUpdate`
+`\myTech.Today\Install-OOShutUp10`
 
 ### Task Description
 Reapplies O&O ShutUp10++ privacy settings after Windows updates to prevent Microsoft from resetting privacy configurations
@@ -191,7 +193,8 @@ The task triggers on the following Windows Update events:
 - **Privileges**: Highest available
 - **Delay**: 2 minutes after Windows Update completion
 - **Execution**: Hidden PowerShell window (no user interaction)
-- **Command**: `PowerShell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "<ScriptPath>" -ReapplyOnly`
+- **Command**: `PowerShell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "<ScriptPath>" -ReapplyOnly -SkipRelocate -NonInteractive -ApprovedProfileSha256 "<PinnedProfileSHA256>" -ApprovedProfileManifestSha256 "<PinnedManifestSHA256>"`
+- **Working directory**: the directory containing `<ScriptPath>`
 
 ### Viewing the Scheduled Task
 
@@ -199,12 +202,12 @@ You can view the scheduled task in Task Scheduler:
 
 1. Open **Task Scheduler** (`taskschd.msc`)
 2. Navigate to **Task Scheduler Library**
-3. Look for **OOShutUp10-PostWindowsUpdate**
+3. Open the **myTech.Today** folder and look for **Install-OOShutUp10**
 
 Or use PowerShell:
 
 ```powershell
-Get-ScheduledTask -TaskName "OOShutUp10-PostWindowsUpdate"
+Get-ScheduledTask -TaskName "Install-OOShutUp10" -TaskPath "\myTech.Today\"
 ```
 
 ### Manually Running the Scheduled Task
@@ -212,7 +215,7 @@ Get-ScheduledTask -TaskName "OOShutUp10-PostWindowsUpdate"
 To test the scheduled task manually:
 
 ```powershell
-Start-ScheduledTask -TaskName "OOShutUp10-PostWindowsUpdate"
+Start-ScheduledTask -TaskName "Install-OOShutUp10" -TaskPath "\myTech.Today\"
 ```
 
 ### Removing the Scheduled Task
@@ -220,72 +223,26 @@ Start-ScheduledTask -TaskName "OOShutUp10-PostWindowsUpdate"
 If you want to remove the scheduled task:
 
 ```powershell
-Unregister-ScheduledTask -TaskName "OOShutUp10-PostWindowsUpdate" -Confirm:$false
+Unregister-ScheduledTask -TaskName "Install-OOShutUp10" -TaskPath "\myTech.Today\" -Confirm:$false
 ```
 
 ## How It Works
 
 ### Initial Installation Flow
 
-```
-┌─────────────────────────────────────┐
-│  Check if O&O ShutUp10++ installed  │
-└──────────────┬──────────────────────┘
-               │
-               ├─ Not Installed ──> Download from official source
-               │
-               └─ Already Installed ──> Skip download
-               │
-               ▼
-┌─────────────────────────────────────┐
-│   Create System Restore Point       │
-└──────────────┬──────────────────────┘
-               │
-               ▼
-┌─────────────────────────────────────┐
-│  Apply Recommended Privacy Settings │
-└──────────────┬──────────────────────┘
-               │
-               ▼
-┌─────────────────────────────────────┐
-│  Create Scheduled Task for Updates  │
-└──────────────┬──────────────────────┘
-               │
-               ▼
-┌─────────────────────────────────────┐
-│      Prompt for Restart              │
-└─────────────────────────────────────┘
-```
+1. Validate the profile and show its impact summary. A rejection or cancellation stops before relocation or system changes.
+2. Check for O&O ShutUp10++ and download it from the official source if needed.
+3. Attempt a system restore point.
+4. Apply the approved profile quietly.
+5. Create the SYSTEM task only when every profile entry is reviewed as machine-scoped; pin both profile and manifest digests.
+6. Prompt for a restart only when O&O reports that settings changed.
 
 ### Post-Windows Update Flow
 
-```
-┌─────────────────────────────────────┐
-│    Windows Update Completes         │
-│  (Event ID 19 or 43 triggered)      │
-└──────────────┬──────────────────────┘
-               │
-               ▼ (2 minute delay)
-┌─────────────────────────────────────┐
-│  Scheduled Task Executes Script     │
-│  with -ReapplyOnly parameter        │
-└──────────────┬──────────────────────┘
-               │
-               ▼
-┌─────────────────────────────────────┐
-│  Locate O&O ShutUp10++ Executable   │
-└──────────────┬──────────────────────┘
-               │
-               ▼
-┌─────────────────────────────────────┐
-│  Reapply Privacy Settings Silently  │
-└──────────────┬──────────────────────┘
-               │
-               ▼
-┌─────────────────────────────────────┐
-│  Privacy Settings Restored!         │
-└─────────────────────────────────────┘
-```
+1. Windows Update event 19 or 43 starts the task after a two-minute delay.
+2. The task runs `-ReapplyOnly -NonInteractive` with its pinned profile and manifest digests.
+3. A digest mismatch, unknown scope, or current-user entry stops execution before O&O launches.
+4. Only an entirely machine-scoped, digest-matched profile can be reapplied by LocalSystem; the script reports whether settings changed.
 
 ## Command Line Arguments
 
@@ -293,7 +250,46 @@ O&O ShutUp10++ is executed with the following arguments:
 
 - `/quiet` - Silent mode (no UI interaction)
 - `/nosrp` - Don't create restore point (we create our own)
-- `ooshutup10.cfg` - Apply recommended privacy settings
+- The absolute path to the approved `ooshutup10.cfg` profile
+
+Before relocation, registry changes, restore-point creation, scheduled-task changes, or O&O launch, interactive runs display the profile and manifest SHA-256 digests, setting IDs and states, reviewer-provided categories and impact descriptions, and each setting's scope and scope evidence. Type `YES` to accept, `NO` to reject, or `CANCEL` to stop. The summary uses the reviewed manifest text and does not infer setting names, categories, or scope from IDs.
+
+For an approved unattended deployment, pass the exact `.cfg` and manifest digests explicitly:
+
+```powershell
+.\Install-OOShutUp10.ps1 -NonInteractive -ApprovedProfileSha256 'REPLACE_WITH_REVIEWED_CFG_SHA256' -ApprovedProfileManifestSha256 'REPLACE_WITH_REVIEWED_MANIFEST_SHA256'
+```
+
+Omitting either digest or using a stale digest fails closed with:
+
+> The selected settings profile has no matching approval. No settings were changed; review both file digests in the interactive installer and recreate the task.
+
+Unknown scope fails closed with:
+
+> The task profile contains settings with unknown user scope. Reapplication was skipped; review the profile scope before retrying.
+
+The scheduled task pins both exact file digests. If either file changes after approval, the task stops without launching O&O until its approval is reviewed and updated.
+
+### Required reviewed settings profile
+
+Place these two versioned files in the script package's `profiles` directory:
+
+- `profiles/ooshutup10.cfg` - O&O ShutUp10 Free Edition settings export
+- `profiles/ooshutup10.approval.json` - Reviewed profile version, SHA-256 digest, exact setting IDs, impact metadata, and scope evidence
+
+The schema version 3 manifest must be JSON with exactly these properties: `schemaVersion` set to `3`, a non-empty `profileVersion`, the lowercase or uppercase 64-character `sha256` digest of the `.cfg` file bytes, a `settingIds` array listing every profile ID exactly once, and a `settingDetails` array with one entry per ID. Each detail has exactly `id`, `state`, `category`, `impact`, `scope`, and `scopeEvidence` properties. `state` must match the profile's `+` or `-`; `category`, `impact`, and `scopeEvidence` must contain reviewed plain text; `scope` must be `machine` or `current-user`. Do not guess setting names, categories, impacts, or scope from an ID. The validator requires the IDs and states to match exactly and rejects absent, empty, malformed, duplicate, unknown, or digest-mismatched data.
+
+Export the `.cfg` from O&O ShutUp10, review every setting ID and state, and check each setting's current description, availability, and scope in O&O. O&O documents Current User settings as HKCU and Local Machine settings as HKLM; some IDs have separate variants in both scopes. Verify each entry in a disposable Windows VM with two accounts and assertions that only the intended hive changes. A SYSTEM task is created only if every entry is machine-scoped; current-user entries block that task and must be applied under their intended user or removed from the SYSTEM profile. The manifest is not a digital signature; interactive approval is bound to the displayed `.cfg` and manifest digests, and unattended approval must supply both exact digests separately. A `-` state is an explicit setting choice; it does not restore the value that existed before the setting was changed. See [O&O's profile file structure documentation](https://manuals.oo-software.com/ooshutup10/en/docs/common-features/profile-structure/), [O&O's scope documentation](https://manuals.oo-software.com/ooshutup10/en/docs/features/overview/), and [the package notes](profiles/README.md).
+
+This checkout currently contains no approved profile, so it exits with this message until both reviewed files are supplied:
+
+> The approved settings profile is missing or invalid. No privacy settings were applied; place the reviewed profile in the configured directory.
+
+The profile is resolved beneath the script's package directory regardless of the caller's current directory. Relocation copies the reviewed profile package beside the relocated script and preserves both accepted digests. O&O receives the absolute profile path and starts with the profile directory as its working directory. The scheduled task runs PowerShell with the script directory as its working directory, retains `-ReapplyOnly`, and supplies the exact absolute managed O&O executable path and both pinned profile digests. O&O exit code `0` is reported as no setting changes and does not prompt for a restart; exit code `30` is treated as settings changed.
+
+### Rollback
+
+Before applying the profile, the script attempts to create a Windows restore point and reports whether that attempt succeeded. In O&O ShutUp10, use **Actions → Undo → History** to review and undo the session that applied the profile. O&O keeps a stack of recent sessions, so undoing an older entry also rolls back newer entries above it. See [O&O's undo-history instructions](https://manuals.oo-software.com/ooshutup10/en/docs/common-features/undo-history/). A restore point is a broader recovery option when available; neither recovery path is guaranteed by this script.
 
 ## Troubleshooting
 
@@ -332,13 +328,9 @@ If you get an ampersand error, use the call operator:
 
 ### O&O ShutUp10++ Not Found After Installation
 
-The script checks multiple installation paths:
-- `%ProgramFiles%\OO Software\O&O ShutUp10\OOSU10.exe`
-- `%ProgramFiles%\OOShutUp10\OOSU10.exe`
-- `%LOCALAPPDATA%\Programs\OOShutUp10\OOSU10.exe`
-- `%TEMP%\OOSU10.exe`
+The installer stores the portable executable at one machine-managed path: `%ProgramW6432%\OO Software\O&O ShutUp10\OOSU10.exe`. If `%ProgramW6432%` is unavailable, it uses `%ProgramFiles%` as the machine root. The installer and LocalSystem reapply task resolve this same absolute path; they do not search a user's TEMP, profile, LOCALAPPDATA, or PATH.
 
-If the executable is in a different location, the script will attempt to find it in the PATH.
+If the managed copy is missing or fails signature and version validation, reapplication is skipped with: “The approved O&O executable path is unavailable to the scheduled task. Reapplication was skipped; restore the verified machine copy.” Run the installer again with administrator privileges to restore the verified portable copy.
 
 ## Security Considerations
 
@@ -357,10 +349,10 @@ If the executable is in a different location, the script will attempt to find it
 ### Why This Script is Useful
 
 1. **Saves Time**: Automates the entire installation and configuration process
-2. **Consistency**: Ensures recommended privacy settings are always applied
-3. **Protection**: Creates restore points before making changes
+2. **Consistency**: Reapplies the reviewed, digest-verified settings profile
+3. **Recovery**: Attempts a restore point and documents O&O's undo history
 4. **Persistence**: Automatically reapplies settings after Windows updates
-5. **No User Interaction**: Runs completely silently in the background
+5. **Reviewed Operation**: Interactive runs show the profile's reviewed categories and impact descriptions before applying settings
 6. **Peace of Mind**: Privacy settings are maintained even after major Windows updates
 
 ### Why Reapply After Windows Updates?
@@ -389,7 +381,9 @@ This script was developed based on requirements for automated O&O ShutUp10++ ins
 - **v1.0** - Initial release with basic installation and configuration
 - **v2.0** - Added scheduled task for post-Windows Update reapplication
 - **v3.0** - Added script relocation, file-based logging, and registry modification for restore points
-- **v2.1.0** - Added `-NonInteractive` switch for GUI/automated contexts (suppresses `Read-Host` prompts)
+- **v2.1.0** - Added `-NonInteractive` switch for GUI/automated contexts
+- **v2.2.0** - Requires an interactive profile review or an exact approved digest for unattended runs
+- **v2.3.0** - Adds reviewed per-setting scope, machine-only SYSTEM reapplication, and a pinned manifest digest
 
 ---
 
