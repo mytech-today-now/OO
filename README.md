@@ -106,7 +106,7 @@ This PowerShell script automates the installation and configuration of **O&O Shu
 - Applies only the settings in the approved, digest-verified profile
 - Stops before system or privacy changes when the approved profile is missing or invalid
 - Shows a keyboard-readable impact summary before interactive approval
-- Allows unattended application only when the exact profile SHA-256 digest is supplied and matches
+- Allows unattended application only when both exact profile and manifest SHA-256 digests are supplied and match
 - Runs O&O in quiet mode after the approval gate
 
 ### ✅ **System Protection**
@@ -138,6 +138,10 @@ Do not change the stored `CurrentUser` or `LocalMachine` execution policy to run
 On Windows, `MachinePolicy` and `UserPolicy` Group Policy settings take precedence. When neither is set, precedence is `Process`, then `CurrentUser`, then `LocalMachine`. A process-scoped launch cannot override Group Policy. Execution policy is a safety feature, not a security boundary. See [Microsoft's execution policy documentation](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_execution_policies).
 
 ## Usage
+
+### PowerShell Setup on Linux and macOS
+
+`install.sh` installs PowerShell 7 only; O&O ShutUp10 remains Windows-only. For Debian or Ubuntu systems, the script runs both `apt-get update` and `apt-get install -y powershell` as root or through `sudo` when run by a non-root user. It stops when either command fails and returns that command's exit status. A non-root run requires `sudo` to be available.
 
 ### Initial Installation and Setup
 
@@ -182,6 +186,8 @@ pwsh.exe -NoProfile -ExecutionPolicy Bypass -File "<drive>:\path\to\script\Insta
 
 The restart prompt is shown after the settings and scheduled-task outcome is reported. Press **Y** to request a graceful restart, or **N** / **Esc** to defer. No response within 60 seconds defers the restart. After **Y**, a 60-second save window begins; press any key during that window to cancel. If restart is deferred, the reported setup status remains unchanged; save your work and restart later.
 
+If the restart prompt cannot read console input, the installer logs that manual restart is needed and keeps the reported setup status unchanged.
+
 The default restart does not use `Restart-Computer -Force`, so Windows and applications can block or cancel shutdown while handling unsaved work. Force-closing applications requires the separate `-ForceRestart` option and may lose unsaved changes:
 
 ```powershell
@@ -204,6 +210,18 @@ This mode is automatically used by the scheduled task after Windows updates.
 
 ### Task Name
 `\myTech.Today\Install-OOShutUp10`
+
+### Safe Task Discovery
+
+If the exact task lookup below returns nothing, use this read-only command to list current or legacy candidates and their paths:
+
+```powershell
+Get-ScheduledTask |
+    Where-Object { $_.TaskName -like '*OOShutUp*' } |
+    Select-Object TaskPath, TaskName, State
+```
+
+Review both `TaskPath` and `TaskName` before retrying. This command only lists candidates; it does not start or remove tasks. Do not remove a legacy or same-named task based on a wildcard match.
 
 ### Task Description
 Reapplies the approved O&O ShutUp10++ profile after successful Windows Update installation events, when executable and profile checks pass.
@@ -236,21 +254,60 @@ Or use PowerShell:
 Get-ScheduledTask -TaskName "Install-OOShutUp10" -TaskPath "\myTech.Today\"
 ```
 
+The exact registered identity is `TaskPath = \myTech.Today\` and `TaskName = Install-OOShutUp10`.
+
 ### Manually Running the Scheduled Task
 
-To test the scheduled task manually:
+Running this task manually reapplies the approved settings as SYSTEM. Do this only when that reapplication is intended:
 
 ```powershell
 Start-ScheduledTask -TaskName "Install-OOShutUp10" -TaskPath "\myTech.Today\"
 ```
 
-### Removing the Scheduled Task
+### Task History
 
-If you want to remove the scheduled task:
+To check the task's last-run time and result with PowerShell:
 
 ```powershell
-Unregister-ScheduledTask -TaskName "Install-OOShutUp10" -TaskPath "\myTech.Today\" -Confirm:$false
+Get-ScheduledTaskInfo -TaskName "Install-OOShutUp10" -TaskPath "\myTech.Today\"
 ```
+
+For the full Task Scheduler history, open `\myTech.Today\Install-OOShutUp10` in Task Scheduler and select its **History** tab.
+
+### Removing the Scheduled Task
+
+This removes only the registration at `\myTech.Today\Install-OOShutUp10` after confirmation. It does not delete the installer, approved profile, O&O executable, or logs. The exact-path lookup must return one task before removal is attempted:
+
+```powershell
+$taskName = 'Install-OOShutUp10'
+$taskPath = '\myTech.Today\'
+
+try {
+    $matches = @(Get-ScheduledTask -ErrorAction Stop | Where-Object {
+        $_.TaskName -eq $taskName -and $_.TaskPath -eq $taskPath
+    })
+}
+catch {
+    throw 'Task lookup failed. No removal was attempted; verify Task Scheduler access and retry.'
+}
+
+if ($matches.Count -eq 0) {
+    Write-Warning 'The documented task was not found. No removal was attempted; discover the exact task path before retrying.'
+}
+elseif ($matches.Count -ne 1) {
+    throw 'Multiple tasks matched the exact identity. No removal was attempted; inspect Task Scheduler before retrying.'
+}
+else {
+    try {
+        Unregister-ScheduledTask -TaskName $taskName -TaskPath $taskPath -Confirm -ErrorAction Stop
+    }
+    catch {
+        throw 'Task removal could not be confirmed. Inspect the exact task path in Task Scheduler before retrying.'
+    }
+}
+```
+
+If the lookup fails, the task is absent, or multiple matches are returned, the command does not unregister anything. If unregistering reports an error, inspect the exact path in Task Scheduler before retrying.
 
 ## How It Works
 
@@ -279,6 +336,8 @@ O&O ShutUp10++ is executed with the following arguments:
 - The absolute path to the approved `ooshutup10.cfg` profile
 
 Before relocation, registry changes, restore-point creation, scheduled-task changes, or O&O launch, interactive runs display the profile and manifest SHA-256 digests, setting IDs and states, reviewer-provided categories and impact descriptions, and each setting's scope and scope evidence. Type `YES` to accept, `NO` to reject, or `CANCEL` to stop. The summary uses the reviewed manifest text and does not infer setting names, categories, or scope from IDs.
+
+Redirected or unavailable console input uses the non-interactive path and requires both exact approved digests before configuration changes.
 
 For an approved unattended deployment, pass the exact `.cfg` and manifest digests explicitly:
 
@@ -344,7 +403,7 @@ If you get an ampersand error, use the call operator:
 
 2. Check task history in Task Scheduler:
    - Open Task Scheduler
-   - Find the task
+   - Open `\myTech.Today\Install-OOShutUp10`
    - Click on the "History" tab
 
 3. Manually test the task:

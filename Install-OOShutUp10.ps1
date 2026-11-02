@@ -19,7 +19,8 @@
     This is used by the scheduled task after Windows updates.
 
 .PARAMETER NonInteractive
-    Suppresses prompts only when both approved profile and manifest SHA-256 digests match.
+    Suppresses prompts only when both approved profile and manifest SHA-256 digests match. Redirected or unavailable
+    console input automatically selects this exact-digest approval path before any configuration changes.
 
 .PARAMETER ForceRestart
     Explicitly permits Restart-Computer to force-close applications when a restart is confirmed.
@@ -186,6 +187,7 @@ $script:OOShutUpApprovedDigest = $null
 $script:OOShutUpApprovedManifestDigest = $null
 $script:OOShutUpLastRunChanged = $false
 $script:OOShutUpRestartDeferredMessage = 'Restart was deferred. Setup status remains unchanged; save your work and restart when ready.'
+$script:OOShutUpRestartPromptUnavailableMessage = 'No interactive restart prompt is available. Configuration status is retained; restart manually when convenient.'
 $script:OOShutUpRestartPromptTimeoutSeconds = 60
 $script:OOShutUpRestartSaveWindowSeconds = 60
 # Accept only Authenticode-valid O&O Software GmbH signatures for O&O ShutUp10 at the current supported release floor.
@@ -215,6 +217,19 @@ function Write-Log {
 
 #region Restart Handling
 
+function Test-OOShutUpInteractiveInput {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param()
+
+    try {
+        return (-not [System.Console]::IsInputRedirected)
+    }
+    catch {
+        return $false
+    }
+}
+
 function Read-OOShutUpRestartKey {
     [CmdletBinding()]
     param(
@@ -228,17 +243,12 @@ function Read-OOShutUpRestartKey {
 
     $timer = [System.Diagnostics.Stopwatch]::StartNew()
     while ($timer.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
-        try {
-            if ([System.Console]::KeyAvailable) {
-                $key = [System.Console]::ReadKey($true)
-                return [string]$key.Key
-            }
+        if ([System.Console]::KeyAvailable) {
+            $key = [System.Console]::ReadKey($true)
+            return [string]$key.Key
+        }
 
-            Start-Sleep -Milliseconds 100
-        }
-        catch {
-            return $null
-        }
+        Start-Sleep -Milliseconds 100
     }
 
     return $null
@@ -284,7 +294,7 @@ function Invoke-OOShutUpRestart {
     )
 
     if ($NonInteractive) {
-        Write-Log 'Settings changed. Non-interactive mode skipped the restart prompt.' -Level WARNING
+        Write-Log $script:OOShutUpRestartPromptUnavailableMessage -Level WARNING
         Write-Log $script:OOShutUpRestartDeferredMessage -Level WARNING
         return
     }
@@ -296,11 +306,22 @@ function Invoke-OOShutUpRestart {
     Write-Host 'Configuration status is shown above. Save your work before restarting.'
     Write-Host ('Press Y to restart, N or Esc to defer. No key within {0} seconds defers the restart.' -f $script:OOShutUpRestartPromptTimeoutSeconds)
 
+    $restartPromptUnavailable = $false
     try {
         $restartKey = Read-OOShutUpRestartKey -TimeoutSeconds $script:OOShutUpRestartPromptTimeoutSeconds
     }
     catch {
         $restartKey = $null
+        $restartPromptUnavailable = $true
+    }
+
+    if ($restartPromptUnavailable) {
+        Write-Log $script:OOShutUpRestartPromptUnavailableMessage -Level WARNING
+    }
+
+    if ($null -eq $restartKey) {
+        Write-Log $script:OOShutUpRestartDeferredMessage -Level WARNING
+        return
     }
 
     if ($restartKey -ne 'Y') {
@@ -2508,6 +2529,12 @@ try {
     # Logging must be usable before relocation or any configuration work begins.
     if (-not (Initialize-LogFile)) {
         exit 1
+    }
+
+    # Treat redirected or unavailable console input as unattended before profile approval can prompt.
+    if (-not $NonInteractive -and -not (Test-OOShutUpInteractiveInput)) {
+        $NonInteractive = $true
+        Write-Log 'Console input is redirected or unavailable. Using the non-interactive approval path; exact approved profile and manifest SHA-256 digests are required.' -Level WARNING
     }
 
     # Validate the reviewed profile before relocation, registry changes, restore points, task changes, or O&O launch.

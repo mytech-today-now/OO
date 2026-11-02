@@ -10,3 +10,7 @@
 - Keep execution-policy examples process-scoped and require explicit WinGet agreement consent when PowerShell 7 must be installed without an interactive console.
 - Preserve WinGet and installer exit codes through the batch launcher instead of reporting unconditional completion.
 - Add the dated pre-mortem report and its originating prompt under `ai-prompts/`.
+- Treat redirected or unavailable console input as non-interactive before profile approval, require exact profile and manifest digests, and defer restart when no prompt can be used.
+- Run apt update and install with root privileges, require `sudo` for non-root apt setup, and preserve the failing command's exit status without an unprivileged retry.
+- Document exact scheduled-task identity, read-only candidate discovery, task history, and confirmation before exact-path removal.
+- Add the November 1 repository pre-mortem report under `ai-prompts/`.

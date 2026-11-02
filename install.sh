@@ -28,7 +28,33 @@ else
         command_exists brew && brew install --cask powershell || { echo "[ERROR] Install Homebrew first: https://brew.sh"; exit 1; }
     elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
         if command_exists apt-get; then
-            [ "$EUID" -ne 0 ] && sudo apt-get update && sudo apt-get install -y powershell || apt-get update && apt-get install -y powershell
+            if [ "$(id -u)" -eq 0 ]; then
+                apt_prefix=()
+            else
+                if ! command_exists sudo; then
+                    echo "[ERROR] sudo is required for both apt-get update and apt-get install when not running as root." >&2
+                    exit 127
+                fi
+                apt_prefix=(sudo)
+            fi
+
+            if "${apt_prefix[@]}" apt-get update; then
+                :
+            else
+                status=$?
+                echo "[ERROR] apt-get update failed (exit ${status})." >&2
+                echo "The apt-get operation failed at the recorded stage. Verify package state and run the next required command with sudo." >&2
+                exit "$status"
+            fi
+
+            if "${apt_prefix[@]}" apt-get install -y powershell; then
+                :
+            else
+                status=$?
+                echo "[ERROR] apt-get install failed (exit ${status})." >&2
+                echo "The apt-get operation failed at the recorded stage. Verify package state and run the next required command with sudo." >&2
+                exit "$status"
+            fi
         elif command_exists dnf; then
             [ "$EUID" -ne 0 ] && sudo dnf install -y powershell || dnf install -y powershell
         elif command_exists pacman; then

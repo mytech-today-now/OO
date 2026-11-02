@@ -7,6 +7,7 @@ $script:LogMessages = New-Object System.Collections.ArrayList
 $script:PromptLines = New-Object System.Collections.ArrayList
 $script:RestartInvocations = New-Object System.Collections.ArrayList
 $script:OOShutUpRestartDeferredMessage = 'Restart was deferred. Setup status remains unchanged; save your work and restart when ready.'
+$script:OOShutUpRestartPromptUnavailableMessage = 'No interactive restart prompt is available. Configuration status is retained; restart manually when convenient.'
 $script:OOShutUpRestartPromptTimeoutSeconds = 60
 $script:OOShutUpRestartSaveWindowSeconds = 60
 
@@ -87,6 +88,7 @@ try {
     $source = Get-Content -LiteralPath $scriptPath -Raw
     Assert-True ($source.Contains('[switch]$ForceRestart')) 'force restart is a separate explicit script option'
     Assert-True ($source.Contains($script:OOShutUpRestartDeferredMessage)) 'the exact defer wording preserves completed configuration status'
+    Assert-True ($source.Contains($script:OOShutUpRestartPromptUnavailableMessage)) 'unavailable restart input has the required recovery wording'
     Assert-True ($source.Contains("if (`$ForceRestart) { `$relocateParams += '-ForceRestart' }")) 'force opt-in survives script relocation'
     Assert-True ($source.Contains('Restart-Computer -Force')) 'the force flag is used only in the explicit force branch'
     Assert-True ($source.Contains('Configuration status is shown above. Save your work before restarting.')) 'the prompt explains the action and save opportunity'
@@ -94,6 +96,7 @@ try {
     Assert-True ($source.Contains('The restart begins in {0} seconds; press any key to cancel.')) 'the save window offers a keyboard cancellation path'
 
     $requiredFunctions = @(
+        'Test-OOShutUpInteractiveInput',
         'Read-OOShutUpRestartKey',
         'Wait-OOShutUpRestartSaveWindow',
         'Invoke-OOShutUpRestart'
@@ -109,8 +112,12 @@ try {
         . ([scriptblock]::Create($functionAst.Extent.Text))
     }
 
+    $interactiveInputSource = [string](@($functionAsts | Where-Object { $_.Name -eq 'Test-OOShutUpInteractiveInput' })[0].Extent.Text)
     $readFunctionSource = [string](@($functionAsts | Where-Object { $_.Name -eq 'Read-OOShutUpRestartKey' })[0].Extent.Text)
+    $restartHandlerSource = [string](@($functionAsts | Where-Object { $_.Name -eq 'Invoke-OOShutUpRestart' })[0].Extent.Text)
     $waitFunctionSource = [string](@($functionAsts | Where-Object { $_.Name -eq 'Wait-OOShutUpRestartSaveWindow' })[0].Extent.Text)
+    Assert-True ($interactiveInputSource.Contains('[System.Console]::IsInputRedirected')) 'redirected input is detected before profile approval'
+    Assert-True (-not $restartHandlerSource.Contains('Read-Host')) 'restart handling does not use a potentially unbounded Read-Host call'
     Assert-True ($readFunctionSource.Contains('[System.Console]::KeyAvailable') -and $readFunctionSource.Contains('[System.Console]::ReadKey($true)')) 'the prompt reads keyboard input without requiring a GUI'
     Assert-True ($waitFunctionSource.Contains('[System.Console]::KeyAvailable') -and $waitFunctionSource.Contains('return $false')) 'the save window can be canceled from the keyboard'
 
@@ -129,13 +136,30 @@ try {
     Assert-Equal 1 $forceCalls.Count 'only one restart call supplies -Force'
 
     $taskSetupIndex = $source.IndexOf('$taskSetup = Invoke-OOShutUpTaskSetup', [System.StringComparison]::Ordinal)
+    $nonInteractiveDetectionIndex = $source.IndexOf('Test-OOShutUpInteractiveInput)', [System.StringComparison]::Ordinal)
+    $profileApprovalIndex = $source.IndexOf('$profileApprovalAccepted = Confirm-OOShutUpProfile', [System.StringComparison]::Ordinal)
     $outcomeIndex = $source.IndexOf('$installerOutcome = Get-OOShutUpInstallOutcome', [System.StringComparison]::Ordinal)
     $summaryIndex = $source.IndexOf('Write-OOShutUpInstallSummary -Outcome $installerOutcome', [System.StringComparison]::Ordinal)
     $restartIndex = $source.IndexOf('Invoke-OOShutUpRestart -NonInteractive:', [System.StringComparison]::Ordinal)
+    Assert-True ($nonInteractiveDetectionIndex -ge 0 -and $profileApprovalIndex -gt $nonInteractiveDetectionIndex) 'redirected input selects non-interactive approval before any profile prompt'
     Assert-True ($taskSetupIndex -ge 0 -and $outcomeIndex -gt $taskSetupIndex -and $summaryIndex -gt $outcomeIndex -and $restartIndex -gt $summaryIndex) 'settings and task outcomes are recorded before the restart offer'
 
     Assert-Equal $null (Read-OOShutUpRestartKey -TimeoutSeconds 0) 'a zero-length confirmation timeout returns no input without restarting'
     Assert-Equal $true (Wait-OOShutUpRestartSaveWindow -Seconds 0) 'an elapsed save window permits the already-confirmed restart'
+    Assert-Equal ([bool](-not [System.Console]::IsInputRedirected)) ([bool](Test-OOShutUpInteractiveInput)) 'interactive capability follows redirected standard input and fails closed'
+    if ([System.Console]::IsInputRedirected) {
+        $redirectedInputRejected = $false
+        try {
+            Read-OOShutUpRestartKey -TimeoutSeconds 1 | Out-Null
+        }
+        catch {
+            $redirectedInputRejected = $true
+        }
+        Assert-True $redirectedInputRejected 'redirected input or EOF exits the keyboard prompt immediately for the recovery fallback'
+    }
+    else {
+        [Console]::Out.WriteLine('SKIP: Direct redirected-input prompt check requires a process with redirected standard input.')
+    }
 
     Set-Item -Path Function:Read-OOShutUpRestartKey -Value {
         param([int]$TimeoutSeconds)
@@ -199,10 +223,24 @@ try {
     Assert-Equal 0 $script:LastSaveWindowCallCount 'missing input never starts the save window'
     Assert-True ($script:LogMessages -contains "[WARNING] $script:OOShutUpRestartDeferredMessage") 'timeout reports the exact deferred status'
 
+    Reset-RestartScenario -Choice ''
+    Invoke-OOShutUpRestart
+    Assert-Equal 0 $script:RestartInvocations.Count 'empty input never restarts'
+    Assert-True ($script:LogMessages -contains "[WARNING] $script:OOShutUpRestartDeferredMessage") 'empty input reports that restart was deferred'
+
     Reset-RestartScenario -Choice $null -ReadShouldThrow $true
+    $script:InstallerOutcome = [pscustomobject]@{
+        Status = 'Partial'
+        ExitCode = 2
+        Summary = 'Settings were verified; the update task was not verified.'
+    }
     Invoke-OOShutUpRestart
     Assert-Equal 0 $script:RestartInvocations.Count 'unavailable keyboard input never restarts'
+    Assert-True ($script:LogMessages -contains "[WARNING] $script:OOShutUpRestartPromptUnavailableMessage") 'a thrown prompt reports the exact restart fallback'
     Assert-True ($script:LogMessages -contains "[WARNING] $script:OOShutUpRestartDeferredMessage") 'unavailable keyboard input reports the exact deferred status'
+    Assert-Equal 'Partial' $script:InstallerOutcome.Status 'a prompt failure retains the previously reported partial setup status'
+    Assert-Equal 2 $script:InstallerOutcome.ExitCode 'a prompt failure retains the setup recovery exit code'
+    Assert-Equal 'Settings were verified; the update task was not verified.' $script:InstallerOutcome.Summary 'a prompt failure retains the setup summary'
 
     Reset-RestartScenario -Choice 'Y'
     Invoke-OOShutUpRestart -ForceRestart
@@ -215,6 +253,8 @@ try {
     Invoke-OOShutUpRestart -NonInteractive -ForceRestart
     Assert-Equal 0 $script:RestartInvocations.Count 'non-interactive mode never restarts'
     Assert-Equal $null $script:LastPromptTimeoutSeconds 'non-interactive mode does not request input'
+    Assert-Equal 0 $script:PromptLines.Count 'non-interactive mode does not display a restart prompt'
+    Assert-True ($script:LogMessages -contains "[WARNING] $script:OOShutUpRestartPromptUnavailableMessage") 'non-interactive mode reports the exact restart fallback'
     Assert-True ($script:LogMessages -contains "[WARNING] $script:OOShutUpRestartDeferredMessage") 'non-interactive mode reports the exact deferred status'
 
     Reset-RestartScenario -Choice 'Y' -RestartShouldThrow $true
