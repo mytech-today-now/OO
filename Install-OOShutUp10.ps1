@@ -167,6 +167,7 @@ $script:OOShutUpProfileDirectory = Join-Path $PSScriptRoot 'profiles'
 $script:OOShutUpProfilePath = Join-Path $script:OOShutUpProfileDirectory 'ooshutup10.cfg'
 $script:OOShutUpProfileManifestPath = Join-Path $script:OOShutUpProfileDirectory 'ooshutup10.approval.json'
 $script:OOShutUpProfileFailureMessage = 'The approved settings profile is missing or invalid. No privacy settings were applied; place the reviewed profile in the configured directory.'
+$script:OOShutUpProfileSnapshotFailureMessage = 'The approved profile changed after validation. No O&O process was started; restore the reviewed profile and retry.'
 $script:OOShutUpUnknownScopeFailureMessage = 'The task profile contains settings with unknown user scope. Reapplication was skipped; review the profile scope before retrying.'
 $script:OOShutUpCurrentUserScopeFailureMessage = 'The SYSTEM task profile contains current-user settings. Reapplication was skipped; run them for the intended signed-in user or remove them from the SYSTEM task profile.'
 $script:OOShutUpApprovalFailureMessage = 'The selected settings profile has no matching approval. No settings were changed; review both file digests in the interactive installer and recreate the task.'
@@ -176,6 +177,9 @@ $script:OOShutUpRestorePointOverrideMessage = 'A restore point could not be veri
 $script:OOShutUpRestorePointFrequencyRegistryPath = 'SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore'
 $script:OOShutUpRestorePointFrequencyRegistryName = 'SystemRestorePointCreationFrequency'
 $script:OOShutUpTaskAclFailureMessage = 'The SYSTEM task target ACL could not be verified. No task was registered; move the script to a protected path and retry.'
+$script:OOShutUpTaskSecurityDescriptorSddl = 'O:BAG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)'
+$script:OOShutUpTaskSecurityDescriptorFailureMessage = 'The task security descriptor could not be verified. No new task was enabled; inspect task permissions before retrying.'
+$script:OOShutUpTrustedPowerShellFailureMessage = 'A trusted Windows PowerShell executable could not be resolved. No scheduled task was registered or changed.'
 $script:OOShutUpTaskOwnershipFailureMessage = 'Task ownership is ambiguous. No task was deleted; inspect the listed path and retry after confirming ownership.'
 $script:OOShutUpPartialSetupMessage = 'The privacy settings may be applied, but the update task was not verified. Setup is partial; repair the task before relying on automatic reapplication.'
 $script:OOShutUpTaskRecoveryMessage = 'Recovery: resolve the logged Task Scheduler error, open PowerShell as Administrator, and rerun this installer with the approved profile (or use -NonInteractive -ApprovedProfileSha256 <profile SHA-256> -ApprovedProfileManifestSha256 <manifest SHA-256>). Verify \myTech.Today\Install-OOShutUp10 in Task Scheduler before relying on automatic reapplication. The retry inspects and replaces only this verified task; same-named tasks in other folders are left unchanged.'
@@ -1336,6 +1340,171 @@ function Install-OOShutUp {
     }
 }
 
+function Get-OOShutUpProfileDigest {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [byte[]]$Bytes
+    )
+
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return ([System.BitConverter]::ToString($sha256.ComputeHash($Bytes))).Replace('-', '').ToLowerInvariant()
+    }
+    finally {
+        $sha256.Dispose()
+    }
+}
+
+function Write-OOShutUpProfileSnapshotFile {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true)]
+        [byte[]]$Bytes
+    )
+
+    $stream = $null
+    try {
+        $stream = [System.IO.File]::Open(
+            $Path,
+            [System.IO.FileMode]::CreateNew,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::None
+        )
+        $stream.Write($Bytes, 0, $Bytes.Length)
+        $stream.Flush()
+    }
+    finally {
+        if ($null -ne $stream) {
+            $stream.Dispose()
+        }
+    }
+}
+
+function Remove-OOShutUpProfileSnapshot {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Directory
+    )
+
+    $installDirectory = [System.IO.Path]::GetFullPath($script:InstallPath)
+    $snapshotDirectory = [System.IO.Path]::GetFullPath($Directory)
+    $expectedNamePattern = '^ProfileSnapshot-[A-Fa-f0-9]{32}$'
+    if (-not [string]::Equals(
+        [System.IO.Path]::GetDirectoryName($snapshotDirectory),
+        $installDirectory,
+        [System.StringComparison]::OrdinalIgnoreCase
+    ) -or [System.IO.Path]::GetFileName($snapshotDirectory) -notmatch $expectedNamePattern) {
+        throw 'The snapshot path is outside the managed O&O directory or is not a per-run snapshot.'
+    }
+
+    if (-not [System.IO.Directory]::Exists($snapshotDirectory)) {
+        return
+    }
+    $snapshotItem = Get-Item -LiteralPath $snapshotDirectory -Force -ErrorAction Stop
+    if (-not $snapshotItem.PSIsContainer -or
+        (([int]$snapshotItem.Attributes -band [int][System.IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        throw 'The profile snapshot directory is not a regular directory.'
+    }
+
+    foreach ($fileName in @('ooshutup10.cfg', 'ooshutup10.approval.json')) {
+        $filePath = Join-Path $snapshotDirectory $fileName
+        if ([System.IO.File]::Exists($filePath)) {
+            [System.IO.File]::Delete($filePath)
+        }
+    }
+    [System.IO.Directory]::Delete($snapshotDirectory, $false)
+}
+
+function New-OOShutUpProfileSnapshot {
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [pscustomobject]$Profile
+    )
+
+    $snapshotDirectory = $null
+    $stage = 'checking the managed O&O directory ACL'
+    try {
+        if ([string]$Profile.Sha256 -notmatch '^[A-Fa-f0-9]{64}$' -or
+            [string]$Profile.ManifestSha256 -notmatch '^[A-Fa-f0-9]{64}$') {
+            throw 'The approved profile digests are missing or malformed.'
+        }
+        if (-not (Test-SystemTaskTargetAcl -ScriptPath $script:InstallPath -AllowDirectory)) {
+            throw 'The managed O&O directory ACL could not be verified for the profile snapshot.'
+        }
+
+        $snapshotDirectory = Join-Path $script:InstallPath ('ProfileSnapshot-{0}' -f [guid]::NewGuid().ToString('N'))
+        $stage = 'creating the per-run snapshot directory'
+        [System.IO.Directory]::CreateDirectory($snapshotDirectory) | Out-Null
+        if (-not (Test-SystemTaskTargetAcl -ScriptPath $snapshotDirectory -AllowDirectory)) {
+            throw 'The profile snapshot directory ACL could not be verified.'
+        }
+
+        $stage = 'reading the approved source files'
+        $profileBytes = [System.IO.File]::ReadAllBytes($script:OOShutUpProfilePath)
+        $manifestBytes = [System.IO.File]::ReadAllBytes($script:OOShutUpProfileManifestPath)
+        if (-not [string]::Equals(
+            (Get-OOShutUpProfileDigest -Bytes $profileBytes),
+            [string]$Profile.Sha256,
+            [System.StringComparison]::OrdinalIgnoreCase
+        ) -or -not [string]::Equals(
+            (Get-OOShutUpProfileDigest -Bytes $manifestBytes),
+            [string]$Profile.ManifestSha256,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )) {
+            throw 'The source profile package no longer matches both reviewed digests.'
+        }
+
+        $snapshotProfilePath = Join-Path $snapshotDirectory 'ooshutup10.cfg'
+        $snapshotManifestPath = Join-Path $snapshotDirectory 'ooshutup10.approval.json'
+        $stage = 'writing the exclusive profile snapshot'
+        Write-OOShutUpProfileSnapshotFile -Path $snapshotProfilePath -Bytes $profileBytes
+        Write-OOShutUpProfileSnapshotFile -Path $snapshotManifestPath -Bytes $manifestBytes
+
+        $stage = 'verifying the snapshot ACL and copied digests'
+        if (-not (Test-SystemTaskTargetAcl -ScriptPath $snapshotProfilePath) -or
+            -not (Test-SystemTaskTargetAcl -ScriptPath $snapshotManifestPath)) {
+            throw 'The copied profile package ACL could not be verified.'
+        }
+        if (-not [string]::Equals(
+            (Get-OOShutUpProfileDigest -Bytes ([System.IO.File]::ReadAllBytes($snapshotProfilePath))),
+            [string]$Profile.Sha256,
+            [System.StringComparison]::OrdinalIgnoreCase
+        ) -or -not [string]::Equals(
+            (Get-OOShutUpProfileDigest -Bytes ([System.IO.File]::ReadAllBytes($snapshotManifestPath))),
+            [string]$Profile.ManifestSha256,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )) {
+            throw 'The copied profile package does not match both reviewed digests.'
+        }
+
+        return [pscustomobject]@{
+            Directory    = [System.IO.Path]::GetFullPath($snapshotDirectory)
+            Path          = [System.IO.Path]::GetFullPath($snapshotProfilePath)
+            ManifestPath  = [System.IO.Path]::GetFullPath($snapshotManifestPath)
+        }
+    }
+    catch {
+        $failure = $_.Exception.Message
+        if ($snapshotDirectory -and [System.IO.Directory]::Exists($snapshotDirectory)) {
+            try {
+                Remove-OOShutUpProfileSnapshot -Directory $snapshotDirectory
+            }
+            catch {
+                throw ("Snapshot stage '{0}' failed: {1} Cleanup also failed for '{2}': {3}" -f $stage, $failure, $snapshotDirectory, $_.Exception.Message)
+            }
+        }
+        throw ("Snapshot stage '{0}' failed: {1}" -f $stage, $failure)
+    }
+}
+
 function Invoke-OOShutUpConfiguration {
     <#
     .SYNOPSIS
@@ -1351,6 +1520,9 @@ function Invoke-OOShutUpConfiguration {
     )
 
     $script:OOShutUpLastRunChanged = $false
+    $snapshot = $null
+    $stage = 'profile validation'
+    $launchAttempted = $false
 
     try {
         $approvedProfile = Get-OOShutUpApprovedProfile -RequireMachineScope:$SystemReapply
@@ -1369,40 +1541,72 @@ function Invoke-OOShutUpConfiguration {
             return $false
         }
 
+        $stage = 'protected profile snapshot'
+        $snapshot = New-OOShutUpProfileSnapshot -Profile $approvedProfile
+
         # O&O ShutUp10++ command line arguments:
         # /quiet - Silent mode
         # /nosrp - Don't create restore point (we'll create our own)
-        # Absolute profile path - independent of the caller's working directory
+        # Protected per-run profile snapshot - independent of the caller's working directory
         Write-Log ("Applying approved settings profile version {0} (SHA-256 {1}; {2} settings). Setting values are omitted from logs." -f $approvedProfile.Version, $approvedProfile.Sha256, $approvedProfile.SettingCount) -Level INFO
 
-        $arguments = '/quiet /nosrp "{0}"' -f $approvedProfile.Path
-        $profileWorkingDirectory = Split-Path -Parent $approvedProfile.Path
+        $arguments = '/quiet /nosrp "{0}"' -f $snapshot.Path
+        $profileWorkingDirectory = $snapshot.Directory
+        $stage = 'O&O process launch'
+        $launchAttempted = $true
         $processInfo = Start-Process -FilePath $ExecutablePath -ArgumentList $arguments -WorkingDirectory $profileWorkingDirectory -Wait -PassThru -NoNewWindow
-
-        # O&O ShutUp10++ exit codes:
-        # 0 = Success (no changes needed)
-        # 30 = Success (settings applied successfully) - This is the NORMAL success code
-        # Other codes may indicate issues
-
-        if ($processInfo.ExitCode -eq 0 -or $processInfo.ExitCode -eq 30) {
-            if ($processInfo.ExitCode -eq 30) {
-                $script:OOShutUpLastRunChanged = $true
-                Write-Log "Successfully applied the approved privacy settings profile" -Level SUCCESS
-                Write-Log "Settings were applied and changes were made (exit code 30 is normal)" -Level INFO
-            }
-            else {
-                Write-Log 'O&O reported that no setting changes were needed for the approved profile.' -Level INFO
-            }
-            return $true
-        }
-        else {
-            Write-Log "O&O ShutUp10++ exited with unexpected code: $($processInfo.ExitCode)" -Level WARNING
-            Write-Log "Settings may not have been applied correctly. Please check manually." -Level WARNING
-            return $false
+        if ($null -eq $processInfo -or $null -eq $processInfo.PSObject.Properties['ExitCode']) {
+            throw 'Start-Process did not return a completed O&O process result.'
         }
     }
     catch {
-        Write-Log "Error applying settings: $($_.Exception.Message)" -Level ERROR
+        Write-Log ("Error during {0}: {1}" -f $stage, $_.Exception.Message) -Level ERROR
+        if ($snapshot) {
+            if ($launchAttempted) {
+                Write-Log ("The O&O launch outcome could not be verified. The protected profile snapshot was retained at '{0}'; check for a running OOSU10.exe process before removing it." -f $snapshot.Directory) -Level ERROR
+            }
+            else {
+                try {
+                    Remove-OOShutUpProfileSnapshot -Directory $snapshot.Directory
+                }
+                catch {
+                    Write-Log ("The protected profile snapshot could not be removed at '{0}'. Check for OOSU10.exe before removing it manually: {1}" -f $snapshot.Directory, $_.Exception.Message) -Level ERROR
+                }
+            }
+        }
+        if ($stage -eq 'protected profile snapshot') {
+            Write-Log $script:OOShutUpProfileSnapshotFailureMessage -Level ERROR
+        }
+        return $false
+    }
+
+    $processExitCode = [int]$processInfo.ExitCode
+    if ($processExitCode -eq 30) {
+        $script:OOShutUpLastRunChanged = $true
+    }
+
+    try {
+        Remove-OOShutUpProfileSnapshot -Directory $snapshot.Directory
+    }
+    catch {
+        Write-Log ("The protected profile snapshot could not be removed after O&O exited. Verify O&O's applied settings, then remove '{0}' manually after confirming no OOSU10.exe process still uses it: {1}" -f $snapshot.Directory, $_.Exception.Message) -Level ERROR
+        return $false
+    }
+
+    # O&O ShutUp10++ exit codes: 0 = no changes, 30 = settings applied, other codes are failures.
+    if ($processExitCode -eq 0 -or $processExitCode -eq 30) {
+        if ($processExitCode -eq 30) {
+            Write-Log "Successfully applied the approved privacy settings profile" -Level SUCCESS
+            Write-Log "Settings were applied and changes were made (exit code 30 is normal)" -Level INFO
+        }
+        else {
+            Write-Log 'O&O reported that no setting changes were needed for the approved profile.' -Level INFO
+        }
+        return $true
+    }
+    else {
+        Write-Log "O&O ShutUp10++ exited with unexpected code: $processExitCode" -Level WARNING
+        Write-Log "Settings may not have been applied correctly. Please check manually." -Level WARNING
         return $false
     }
 }
@@ -1648,12 +1852,15 @@ function Test-SystemTaskTargetAcl {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
-        [string]$ScriptPath
+        [string]$ScriptPath,
+
+        [Parameter(Mandatory = $false)]
+        [switch]$AllowDirectory
     )
 
     try {
         $scriptItem = Get-Item -LiteralPath $ScriptPath -Force -ErrorAction Stop
-        if ($scriptItem.PSIsContainer) {
+        if ($scriptItem.PSIsContainer -and -not $AllowDirectory) {
             return $false
         }
 
@@ -1720,10 +1927,20 @@ function Test-SystemTaskTargetAcl {
             }
 
             foreach ($rule in @($acl.Access)) {
+                if (([int]$rule.PropagationFlags -band [int][System.Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0) {
+                    # Inherit-only entries apply to descendants, which are checked separately as the path walk continues.
+                    continue
+                }
                 $ruleSid = ConvertTo-SystemTaskSid -Identity $rule.IdentityReference
                 $rights = [int]$rule.FileSystemRights
                 $ruleType = [string]$rule.AccessControlType
                 $writeMask = if ($item.PSIsContainer) { $directoryWriteMask } else { $fileWriteMask }
+                if ($AllowDirectory -and $item.PSIsContainer -and
+                    [string]::Equals($pathToInspect, $canonicalScriptPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+                    # A protected snapshot directory must not permit an untrusted identity to create entries in it.
+                    $writeMask = $writeMask -bor [int][System.Security.AccessControl.FileSystemRights]::CreateFiles -bor
+                        [int][System.Security.AccessControl.FileSystemRights]::CreateDirectories -bor 0x40000000
+                }
                 if ($item.PSIsContainer -and [string]::Equals(
                     [System.IO.Path]::GetFullPath($item.FullName),
                     [System.IO.Path]::GetPathRoot($item.FullName),
@@ -1761,6 +1978,129 @@ function Test-SystemTaskTargetAcl {
     }
 }
 
+function Get-WindowsPowerShellExecutablePaths {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $false)]
+        [string]$WindowsDirectory = [System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::Windows),
+
+        [Parameter(Mandatory = $false)]
+        [bool]$Is64BitOperatingSystem = [System.Environment]::Is64BitOperatingSystem,
+
+        [Parameter(Mandatory = $false)]
+        [bool]$Is64BitProcess = [System.Environment]::Is64BitProcess
+    )
+
+    try {
+        if ([string]::IsNullOrWhiteSpace($WindowsDirectory) -or
+            -not [System.IO.Path]::IsPathRooted($WindowsDirectory)) {
+            return $null
+        }
+
+        $canonicalWindowsDirectory = [System.IO.Path]::GetFullPath($WindowsDirectory)
+        if ($canonicalWindowsDirectory.StartsWith('\\', [System.StringComparison]::Ordinal) -or
+            -not (Test-Path -LiteralPath $canonicalWindowsDirectory -PathType Container)) {
+            return $null
+        }
+
+        $relativeInterpreterPath = 'WindowsPowerShell\v1.0\powershell.exe'
+        $taskPath = [System.IO.Path]::GetFullPath((Join-Path $canonicalWindowsDirectory ("System32\{0}" -f $relativeInterpreterPath)))
+        $inspectionPath = $taskPath
+        if ($Is64BitOperatingSystem -and -not $Is64BitProcess) {
+            $inspectionPath = [System.IO.Path]::GetFullPath((Join-Path $canonicalWindowsDirectory ("Sysnative\{0}" -f $relativeInterpreterPath)))
+        }
+
+        return [pscustomobject]@{
+            TaskPath = $taskPath
+            InspectionPath = $inspectionPath
+        }
+    }
+    catch {
+        return $null
+    }
+}
+
+function Test-WindowsPowerShellPathIdentity {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Candidate,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ResolvedPath
+    )
+
+    try {
+        $canonicalResolvedPath = [System.IO.Path]::GetFullPath($ResolvedPath)
+        foreach ($allowedPath in @([string]$Candidate.TaskPath, [string]$Candidate.InspectionPath)) {
+            if ([string]::Equals(
+                $canonicalResolvedPath,
+                [System.IO.Path]::GetFullPath($allowedPath),
+                [System.StringComparison]::OrdinalIgnoreCase
+            )) {
+                return $true
+            }
+        }
+        return $false
+    }
+    catch {
+        return $false
+    }
+}
+
+function Get-TrustedWindowsPowerShellExecutable {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $false)]
+        [string]$WindowsDirectory = [System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::Windows),
+
+        [Parameter(Mandatory = $false)]
+        [bool]$Is64BitOperatingSystem = [System.Environment]::Is64BitOperatingSystem,
+
+        [Parameter(Mandatory = $false)]
+        [bool]$Is64BitProcess = [System.Environment]::Is64BitProcess
+    )
+
+    try {
+        $candidate = Get-WindowsPowerShellExecutablePaths -WindowsDirectory $WindowsDirectory -Is64BitOperatingSystem $Is64BitOperatingSystem -Is64BitProcess $Is64BitProcess
+        if ($null -eq $candidate) {
+            return $null
+        }
+
+        $interpreter = Get-Item -LiteralPath $candidate.InspectionPath -Force -ErrorAction Stop
+        if ($interpreter.PSIsContainer -or
+            (([int]$interpreter.Attributes -band [int][System.IO.FileAttributes]::ReparsePoint) -ne 0) -or
+            -not (Test-WindowsPowerShellPathIdentity -Candidate $candidate -ResolvedPath ([string]$interpreter.FullName)) -or
+            -not (Test-SystemTaskTargetAcl -ScriptPath $candidate.InspectionPath)) {
+            return $null
+        }
+
+        $versionInfo = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($candidate.InspectionPath)
+        if ([string]$versionInfo.CompanyName -cne 'Microsoft Corporation' -or
+            [string]$versionInfo.FileDescription -notmatch '^(?i:Windows PowerShell)(?:\s|$)' -or
+            [string]$versionInfo.ProductName -notmatch '(?i)Windows.*Operating System') {
+            return $null
+        }
+
+        $signature = Get-AuthenticodeSignature -FilePath $candidate.InspectionPath -ErrorAction Stop
+        if ($signature.Status -ne 'Valid' -or $null -eq $signature.SignerCertificate) {
+            return $null
+        }
+        $publisher = $signature.SignerCertificate.GetNameInfo(
+            [System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName,
+            $false
+        )
+        if ([string]$publisher -notmatch '^(?i:Microsoft Windows|Microsoft Windows Publisher)$') {
+            return $null
+        }
+
+        return [string]$candidate.TaskPath
+    }
+    catch {
+        return $null
+    }
+}
+
 function Test-WindowsUpdateTaskDefinition {
     [CmdletBinding()]
     param(
@@ -1786,7 +2126,10 @@ function Test-WindowsUpdateTaskDefinition {
         [string]$ApprovedProfileManifestSha256,
 
         [Parameter(Mandatory = $true)]
-        [string]$ApprovedOOSExecutablePath
+        [string]$ApprovedOOSExecutablePath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$TrustedPowerShellPath
     )
 
     try {
@@ -1802,7 +2145,17 @@ function Test-WindowsUpdateTaskDefinition {
         }
 
         $actions = @($Task.Actions)
-        if ($actions.Count -ne 1 -or [System.IO.Path]::GetFileName([string]$actions[0].Execute) -notmatch '^(?i:powershell\.exe)$') {
+        if ($actions.Count -ne 1) {
+            return $false
+        }
+
+        $expectedPowerShellPaths = Get-WindowsPowerShellExecutablePaths
+        $currentTrustedPowerShellPath = Get-TrustedWindowsPowerShellExecutable
+        if ($null -eq $expectedPowerShellPaths -or
+            [string]::IsNullOrWhiteSpace($currentTrustedPowerShellPath) -or
+            -not [string]::Equals([string]$currentTrustedPowerShellPath, [string]$expectedPowerShellPaths.TaskPath, [System.StringComparison]::OrdinalIgnoreCase) -or
+            -not [string]::Equals([string]$TrustedPowerShellPath, [string]$currentTrustedPowerShellPath, [System.StringComparison]::OrdinalIgnoreCase) -or
+            -not [string]::Equals([string]$actions[0].Execute, [string]$currentTrustedPowerShellPath, [System.StringComparison]::OrdinalIgnoreCase)) {
             return $false
         }
 
@@ -1875,7 +2228,8 @@ function Test-WindowsUpdateLegacyTaskDefinition {
         }
 
         $actions = @($Task.Actions)
-        if ($actions.Count -ne 1 -or [System.IO.Path]::GetFileName([string]$actions[0].Execute) -notmatch '^(?i:powershell\.exe)$') {
+        if ($actions.Count -ne 1 -or
+            -not [string]::Equals([string]$actions[0].Execute, 'PowerShell.exe', [System.StringComparison]::OrdinalIgnoreCase)) {
             return $false
         }
 
@@ -1919,6 +2273,229 @@ function Test-ScheduledTaskAccessDenied {
     }
 
     return $false
+}
+
+function Invoke-WindowsUpdateTaskSchedulerOperation {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$TaskPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$TaskName,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('GetSecurityDescriptor', 'SetSecurityDescriptor', 'SetEnabled')]
+        [string]$Operation,
+
+        [Parameter(Mandatory = $false)]
+        [string]$SecurityDescriptor,
+
+        [Parameter(Mandatory = $false)]
+        [bool]$Enabled
+    )
+
+    $service = $null
+    $folder = $null
+    $registeredTask = $null
+    try {
+        $service = New-Object -ComObject 'Schedule.Service'
+        $service.Connect()
+        $folder = $service.GetFolder($TaskPath)
+        $registeredTask = $folder.GetTask($TaskName)
+
+        switch ($Operation) {
+            'GetSecurityDescriptor' {
+                # OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION.
+                return [string]$registeredTask.GetSecurityDescriptor(0x7)
+            }
+            'SetSecurityDescriptor' {
+                # TASK_DONT_ADD_PRINCIPAL_ACE; SYSTEM is already in the explicit allowlist below.
+                $registeredTask.SetSecurityDescriptor($SecurityDescriptor, 0x10)
+                return $true
+            }
+            'SetEnabled' {
+                $registeredTask.Enabled = $Enabled
+                return $true
+            }
+        }
+    }
+    finally {
+        foreach ($comObject in @($registeredTask, $folder, $service)) {
+            if ($null -ne $comObject -and [System.Runtime.InteropServices.Marshal]::IsComObject($comObject)) {
+                [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($comObject)
+            }
+        }
+    }
+}
+
+function Get-WindowsUpdateTaskSecurityDescriptor {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$TaskPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$TaskName
+    )
+
+    try {
+        $descriptor = Invoke-WindowsUpdateTaskSchedulerOperation -TaskPath $TaskPath -TaskName $TaskName -Operation GetSecurityDescriptor
+        if ([string]::IsNullOrWhiteSpace([string]$descriptor)) {
+            throw 'Task Scheduler returned an empty security descriptor.'
+        }
+        return [string]$descriptor
+    }
+    catch {
+        throw ('{0} Details: {1}' -f $script:OOShutUpTaskSecurityDescriptorFailureMessage, $_.Exception.Message)
+    }
+}
+
+function Set-WindowsUpdateTaskSecurityDescriptor {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$TaskPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$TaskName,
+
+        [Parameter(Mandatory = $true)]
+        [string]$SecurityDescriptor
+    )
+
+    try {
+        [void](Invoke-WindowsUpdateTaskSchedulerOperation -TaskPath $TaskPath -TaskName $TaskName -Operation SetSecurityDescriptor -SecurityDescriptor $SecurityDescriptor)
+    }
+    catch {
+        throw ('{0} Details: {1}' -f $script:OOShutUpTaskSecurityDescriptorFailureMessage, $_.Exception.Message)
+    }
+}
+
+function Set-WindowsUpdateTaskEnabled {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$TaskPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$TaskName,
+
+        [Parameter(Mandatory = $true)]
+        [bool]$Enabled
+    )
+
+    [void](Invoke-WindowsUpdateTaskSchedulerOperation -TaskPath $TaskPath -TaskName $TaskName -Operation SetEnabled -Enabled $Enabled)
+}
+
+function Test-WindowsUpdateTaskSecurityDescriptor {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$SecurityDescriptor
+    )
+
+    try {
+        $expected = [System.Security.AccessControl.RawSecurityDescriptor]::new($script:OOShutUpTaskSecurityDescriptorSddl)
+        $actual = [System.Security.AccessControl.RawSecurityDescriptor]::new($SecurityDescriptor)
+        if ($null -eq $actual.Owner -or $actual.Owner.Value -ne 'S-1-5-32-544' -or
+            $null -eq $actual.Group -or $actual.Group.Value -ne 'S-1-5-18' -or
+            $null -eq $actual.DiscretionaryAcl -or
+            ($actual.ControlFlags -band [System.Security.AccessControl.ControlFlags]::DiscretionaryAclProtected) -eq 0 -or
+            $actual.DiscretionaryAcl.Count -ne $expected.DiscretionaryAcl.Count) {
+            return $false
+        }
+
+        $actualAces = @()
+        foreach ($actualAce in $actual.DiscretionaryAcl) {
+            if ($actualAce -isnot [System.Security.AccessControl.CommonAce] -or
+                $actualAce.IsCallback -or
+                $actualAce.AceType -ne [System.Security.AccessControl.AceType]::AccessAllowed -or
+                $actualAce.AceFlags -ne [System.Security.AccessControl.AceFlags]::None) {
+                return $false
+            }
+            $actualAces += $actualAce
+        }
+
+        foreach ($expectedAce in $expected.DiscretionaryAcl) {
+            $matchingAces = @($actualAces | Where-Object {
+                $_.AccessMask -eq $expectedAce.AccessMask -and
+                $_.SecurityIdentifier.Value -eq $expectedAce.SecurityIdentifier.Value
+            })
+            if ($matchingAces.Count -ne 1) {
+                return $false
+            }
+        }
+
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+function Test-WindowsUpdateTaskSecurityDescriptorEqual {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ActualSecurityDescriptor,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ExpectedSecurityDescriptor
+    )
+
+    try {
+        $actual = [System.Security.AccessControl.RawSecurityDescriptor]::new($ActualSecurityDescriptor)
+        $expected = [System.Security.AccessControl.RawSecurityDescriptor]::new($ExpectedSecurityDescriptor)
+        if ($actual.BinaryLength -ne $expected.BinaryLength) {
+            return $false
+        }
+
+        $actualBytes = [byte[]]::new($actual.BinaryLength)
+        $expectedBytes = [byte[]]::new($expected.BinaryLength)
+        $actual.GetBinaryForm($actualBytes, 0)
+        $expected.GetBinaryForm($expectedBytes, 0)
+        for ($index = 0; $index -lt $actualBytes.Length; $index++) {
+            if ($actualBytes[$index] -ne $expectedBytes[$index]) {
+                return $false
+            }
+        }
+
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+function Assert-WindowsUpdateTaskSecurityDescriptor {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$TaskPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$TaskName,
+
+        [Parameter(Mandatory = $false)]
+        [string]$ExpectedSecurityDescriptor
+    )
+
+    $descriptor = Get-WindowsUpdateTaskSecurityDescriptor -TaskPath $TaskPath -TaskName $TaskName
+    if (-not (Test-WindowsUpdateTaskSecurityDescriptor -SecurityDescriptor $descriptor)) {
+        throw $script:OOShutUpTaskSecurityDescriptorFailureMessage
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedSecurityDescriptor)) {
+        if (-not (Test-WindowsUpdateTaskSecurityDescriptor -SecurityDescriptor $ExpectedSecurityDescriptor) -or
+            -not (Test-WindowsUpdateTaskSecurityDescriptorEqual -ActualSecurityDescriptor $descriptor -ExpectedSecurityDescriptor $ExpectedSecurityDescriptor)) {
+            throw $script:OOShutUpTaskSecurityDescriptorFailureMessage
+        }
+    }
+
+    return $descriptor
 }
 
 function Test-WindowsUpdateTaskMatchesSnapshot {
@@ -2020,6 +2597,15 @@ function New-WindowsUpdateScheduledTask {
             return $false
         }
 
+        $expectedPowerShellPaths = Get-WindowsPowerShellExecutablePaths
+        $trustedPowerShellPath = Get-TrustedWindowsPowerShellExecutable
+        if ($null -eq $expectedPowerShellPaths -or
+            [string]::IsNullOrWhiteSpace($trustedPowerShellPath) -or
+            -not [string]::Equals([string]$trustedPowerShellPath, [string]$expectedPowerShellPaths.TaskPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+            Write-Log $script:OOShutUpTrustedPowerShellFailureMessage -Level ERROR
+            return $false
+        }
+
         Write-Log ("Scheduled task principal SID S-1-5-18 passed the machine-scope gate for {0} settings (profile SHA-256 {1}; manifest SHA-256 {2}); setting values are omitted." -f $currentApprovedProfile.SettingCount, $currentApprovedProfile.Sha256, $currentApprovedProfile.ManifestSha256) -Level INFO
 
         Write-Log "Creating scheduled task for post-Windows Update execution..." -Level INFO
@@ -2118,7 +2704,7 @@ function New-WindowsUpdateScheduledTask {
         $exec = $xml.CreateElement("Exec")
 
         $command = $xml.CreateElement("Command")
-        $command.InnerText = "PowerShell.exe"
+        $command.InnerText = $trustedPowerShellPath
         $exec.AppendChild($command) | Out-Null
 
         $arguments = $xml.CreateElement("Arguments")
@@ -2133,6 +2719,17 @@ function New-WindowsUpdateScheduledTask {
         $task.AppendChild($actions) | Out-Null
 
         $taskXml = $xml.OuterXml
+
+        $currentPowerShellPaths = Get-WindowsPowerShellExecutablePaths
+        $currentTrustedPowerShellPath = Get-TrustedWindowsPowerShellExecutable
+        if ($null -eq $currentPowerShellPaths -or
+            [string]::IsNullOrWhiteSpace($currentTrustedPowerShellPath) -or
+            -not [string]::Equals([string]$currentTrustedPowerShellPath, [string]$currentPowerShellPaths.TaskPath, [System.StringComparison]::OrdinalIgnoreCase) -or
+            -not [string]::Equals([string]$currentTrustedPowerShellPath, [string]$trustedPowerShellPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+            Write-Log $script:OOShutUpTrustedPowerShellFailureMessage -Level ERROR
+            return $false
+        }
+
         $stageDocument = New-Object System.Xml.XmlDocument
         $stageDocument.LoadXml($taskXml)
         $stageEnabled = $stageDocument.SelectSingleNode("/*[local-name()='Task']/*[local-name()='Settings']/*[local-name()='Enabled']")
@@ -2141,6 +2738,15 @@ function New-WindowsUpdateScheduledTask {
         }
         $stageEnabled.InnerText = 'false'
         $stagingTaskXml = $stageDocument.OuterXml
+
+        $finalDocument = New-Object System.Xml.XmlDocument
+        $finalDocument.LoadXml($taskXml)
+        $finalEnabled = $finalDocument.SelectSingleNode("/*[local-name()='Task']/*[local-name()='Settings']/*[local-name()='Enabled']")
+        if ($null -eq $finalEnabled) {
+            throw 'The replacement task XML has no Settings/Enabled element.'
+        }
+        $finalEnabled.InnerText = 'false'
+        $finalTaskXml = $finalDocument.OuterXml
 
         # Keep the diagnostic copy for local troubleshooting. Registration uses the in-memory XML.
         $debugXmlPath = Join-Path $env:TEMP 'OOShutUp10Task_Debug.xml'
@@ -2181,7 +2787,7 @@ function New-WindowsUpdateScheduledTask {
         }
 
         foreach ($existingTask in $existingTasks) {
-            $isCurrentDefinition = Test-WindowsUpdateTaskDefinition -Task $existingTask -TaskPath $taskPath -TaskName $taskName -TaskDescription $taskDescription -ScriptPath $ScriptPath -ApprovedProfileSha256 $ApprovedProfileSha256 -ApprovedProfileManifestSha256 $ApprovedProfileManifestSha256 -ApprovedOOSExecutablePath $approvedOOSExecutablePath
+            $isCurrentDefinition = Test-WindowsUpdateTaskDefinition -Task $existingTask -TaskPath $taskPath -TaskName $taskName -TaskDescription $taskDescription -ScriptPath $ScriptPath -ApprovedProfileSha256 $ApprovedProfileSha256 -ApprovedProfileManifestSha256 $ApprovedProfileManifestSha256 -ApprovedOOSExecutablePath $approvedOOSExecutablePath -TrustedPowerShellPath $trustedPowerShellPath
             $isApprovedLegacyDefinition = Test-WindowsUpdateLegacyTaskDefinition -Task $existingTask -TaskPath $taskPath -TaskName $taskName -TaskDescription $taskDescription -ScriptPath $ScriptPath -ApprovedProfileSha256 $ApprovedProfileSha256 -ApprovedProfileManifestSha256 $ApprovedProfileManifestSha256
             if (-not $isCurrentDefinition -and -not $isApprovedLegacyDefinition) {
                 Write-Log ("{0} Listed path: {1}. The action or description does not match an approved definition." -f $script:OOShutUpTaskOwnershipFailureMessage, $taskFullPath) -Level ERROR
@@ -2193,6 +2799,17 @@ function New-WindowsUpdateScheduledTask {
             }
             else {
                 Write-Log ("Verified existing owned scheduled task '{0}' before replacement." -f $taskFullPath) -Level INFO
+            }
+
+            try {
+                $previousSecurityDescriptor = Get-WindowsUpdateTaskSecurityDescriptor -TaskPath $existingTask.TaskPath -TaskName $existingTask.TaskName
+                if (-not (Test-WindowsUpdateTaskSecurityDescriptor -SecurityDescriptor $previousSecurityDescriptor)) {
+                    throw $script:OOShutUpTaskSecurityDescriptorFailureMessage
+                }
+            }
+            catch {
+                Write-Log ("{0} Existing task '{1}' was left unchanged. Details: {2}" -f $script:OOShutUpTaskSecurityDescriptorFailureMessage, $taskFullPath, $_.Exception.Message) -Level ERROR
+                return $false
             }
 
             try {
@@ -2215,14 +2832,20 @@ function New-WindowsUpdateScheduledTask {
             $backupIndex = $previousDefinitions.Count + 1
             $backupFileName = '.Install-OOShutUp10-task-rollback-{0}-{1}.xml' -f [guid]::NewGuid().ToString('N'), $backupIndex
             $backupPath = Join-Path ([System.IO.Path]::GetDirectoryName([System.IO.Path]::GetFullPath($ScriptPath))) $backupFileName
+            $descriptorBackupPath = [System.IO.Path]::ChangeExtension($backupPath, '.sddl')
             try {
                 [System.IO.File]::WriteAllText($backupPath, [string]$previousXml, [System.Text.Encoding]::UTF8)
                 if (-not (Test-SystemTaskTargetAcl -ScriptPath $backupPath)) {
                     throw 'The exported task rollback file did not inherit a verifiable protected ACL.'
                 }
+                [System.IO.File]::WriteAllText($descriptorBackupPath, [string]$previousSecurityDescriptor, [System.Text.Encoding]::ASCII)
+                if (-not (Test-SystemTaskTargetAcl -ScriptPath $descriptorBackupPath)) {
+                    throw 'The task security-descriptor rollback file did not inherit a verifiable protected ACL.'
+                }
             }
             catch {
                 Remove-Item -LiteralPath $backupPath -Force -ErrorAction SilentlyContinue
+                Remove-Item -LiteralPath $descriptorBackupPath -Force -ErrorAction SilentlyContinue
                 throw
             }
 
@@ -2240,7 +2863,9 @@ function New-WindowsUpdateScheduledTask {
                     }
                 })
                 Xml = [string]$previousXml
+                SecurityDescriptor = [string]$previousSecurityDescriptor
                 BackupPath = $backupPath
+                DescriptorBackupPath = $descriptorBackupPath
             })
         }
 
@@ -2249,11 +2874,13 @@ function New-WindowsUpdateScheduledTask {
         $stagingTaskAttempted = $true
         $taskSchedulerOperationStarted = $true
         Register-ScheduledTask -TaskName $stagingTaskName -TaskPath $taskPath -Xml $stagingTaskXml -Force -ErrorAction Stop | Out-Null
+        Set-WindowsUpdateTaskSecurityDescriptor -TaskPath $taskPath -TaskName $stagingTaskName -SecurityDescriptor $script:OOShutUpTaskSecurityDescriptorSddl
+        [void](Assert-WindowsUpdateTaskSecurityDescriptor -TaskPath $taskPath -TaskName $stagingTaskName)
         $stagedTask = Get-ScheduledTask -TaskName $stagingTaskName -TaskPath $taskPath -ErrorAction SilentlyContinue |
             Where-Object { $_.TaskPath -eq $taskPath -and $_.TaskName -eq $stagingTaskName } |
             Select-Object -First 1
         if ($null -eq $stagedTask -or [string]$stagedTask.State -ne 'Disabled' -or
-            -not (Test-WindowsUpdateTaskDefinition -Task $stagedTask -TaskPath $taskPath -TaskName $stagingTaskName -TaskDescription $taskDescription -ScriptPath $ScriptPath -ApprovedProfileSha256 $ApprovedProfileSha256 -ApprovedProfileManifestSha256 $ApprovedProfileManifestSha256 -ApprovedOOSExecutablePath $approvedOOSExecutablePath)) {
+            -not (Test-WindowsUpdateTaskDefinition -Task $stagedTask -TaskPath $taskPath -TaskName $stagingTaskName -TaskDescription $taskDescription -ScriptPath $ScriptPath -ApprovedProfileSha256 $ApprovedProfileSha256 -ApprovedProfileManifestSha256 $ApprovedProfileManifestSha256 -ApprovedOOSExecutablePath $approvedOOSExecutablePath -TrustedPowerShellPath $trustedPowerShellPath)) {
             throw 'The disabled candidate task did not match the approved SYSTEM action, trigger, and queue settings; the existing task was left unchanged.'
         }
 
@@ -2264,14 +2891,26 @@ function New-WindowsUpdateScheduledTask {
             Unregister-ScheduledTask -TaskName $previous.TaskName -TaskPath $previous.TaskPath -Confirm:$false -ErrorAction Stop | Out-Null
         }
 
-        Register-ScheduledTask -TaskName $taskName -TaskPath $taskPath -Xml $taskXml -Force -ErrorAction Stop | Out-Null
+        Register-ScheduledTask -TaskName $taskName -TaskPath $taskPath -Xml $finalTaskXml -Force -ErrorAction Stop | Out-Null
+        Set-WindowsUpdateTaskSecurityDescriptor -TaskPath $taskPath -TaskName $taskName -SecurityDescriptor $script:OOShutUpTaskSecurityDescriptorSddl
+        [void](Assert-WindowsUpdateTaskSecurityDescriptor -TaskPath $taskPath -TaskName $taskName)
         $verifiedTask = Get-ScheduledTask -TaskName $taskName -TaskPath $taskPath -ErrorAction SilentlyContinue |
             Where-Object { $_.TaskPath -eq $taskPath -and $_.TaskName -eq $taskName } |
             Select-Object -First 1
-        if ($null -eq $verifiedTask -or
-            -not (Test-WindowsUpdateTaskDefinition -Task $verifiedTask -TaskPath $taskPath -TaskName $taskName -TaskDescription $taskDescription -ScriptPath $ScriptPath -ApprovedProfileSha256 $ApprovedProfileSha256 -ApprovedProfileManifestSha256 $ApprovedProfileManifestSha256 -ApprovedOOSExecutablePath $approvedOOSExecutablePath)) {
-            throw 'The replacement task did not match the approved SYSTEM action, success trigger, and queue settings after registration.'
+        if ($null -eq $verifiedTask -or [string]$verifiedTask.State -ne 'Disabled' -or
+            -not (Test-WindowsUpdateTaskDefinition -Task $verifiedTask -TaskPath $taskPath -TaskName $taskName -TaskDescription $taskDescription -ScriptPath $ScriptPath -ApprovedProfileSha256 $ApprovedProfileSha256 -ApprovedProfileManifestSha256 $ApprovedProfileManifestSha256 -ApprovedOOSExecutablePath $approvedOOSExecutablePath -TrustedPowerShellPath $trustedPowerShellPath)) {
+            throw 'The disabled replacement task did not match the approved SYSTEM action, success trigger, and queue settings after registration.'
         }
+
+        Set-WindowsUpdateTaskEnabled -TaskPath $taskPath -TaskName $taskName -Enabled $true
+        $verifiedTask = Get-ScheduledTask -TaskName $taskName -TaskPath $taskPath -ErrorAction SilentlyContinue |
+            Where-Object { $_.TaskPath -eq $taskPath -and $_.TaskName -eq $taskName } |
+            Select-Object -First 1
+        if ($null -eq $verifiedTask -or [string]$verifiedTask.State -eq 'Disabled' -or
+            -not (Test-WindowsUpdateTaskDefinition -Task $verifiedTask -TaskPath $taskPath -TaskName $taskName -TaskDescription $taskDescription -ScriptPath $ScriptPath -ApprovedProfileSha256 $ApprovedProfileSha256 -ApprovedProfileManifestSha256 $ApprovedProfileManifestSha256 -ApprovedOOSExecutablePath $approvedOOSExecutablePath -TrustedPowerShellPath $trustedPowerShellPath)) {
+            throw 'The replacement task was not enabled with the approved SYSTEM action, success trigger, and queue settings.'
+        }
+        [void](Assert-WindowsUpdateTaskSecurityDescriptor -TaskPath $taskPath -TaskName $taskName)
 
         try {
             Unregister-ScheduledTask -TaskName $stagingTaskName -TaskPath $taskPath -Confirm:$false -ErrorAction Stop | Out-Null
@@ -2284,9 +2923,10 @@ function New-WindowsUpdateScheduledTask {
         foreach ($previous in $previousDefinitions) {
             try {
                 Remove-Item -LiteralPath $previous.BackupPath -Force -ErrorAction Stop
+                Remove-Item -LiteralPath $previous.DescriptorBackupPath -Force -ErrorAction Stop
             }
             catch {
-                Write-Log "The replacement task was verified, but its protected rollback file remains at $($previous.BackupPath). Remove it after confirming the task is healthy." -Level WARNING
+                Write-Log "The replacement task was verified, but its protected rollback files remain at $($previous.BackupPath) and $($previous.DescriptorBackupPath). Remove them after confirming the task is healthy." -Level WARNING
             }
         }
 
@@ -2310,13 +2950,23 @@ function New-WindowsUpdateScheduledTask {
                     $matchesPreviousSnapshot = $false
                     foreach ($previous in $previousDefinitions) {
                         if (Test-WindowsUpdateTaskMatchesSnapshot -Task $currentTargetTask -Snapshot $previous) {
-                            $matchesPreviousSnapshot = $true
-                            break
+                            try {
+                                $currentDescriptor = Get-WindowsUpdateTaskSecurityDescriptor -TaskPath $previous.TaskPath -TaskName $previous.TaskName
+                                $matchesPreviousSnapshot = (Test-WindowsUpdateTaskSecurityDescriptor -SecurityDescriptor $currentDescriptor) -and
+                                    (Test-WindowsUpdateTaskSecurityDescriptor -SecurityDescriptor $previous.SecurityDescriptor) -and
+                                    (Test-WindowsUpdateTaskSecurityDescriptorEqual -ActualSecurityDescriptor $currentDescriptor -ExpectedSecurityDescriptor $previous.SecurityDescriptor)
+                            }
+                            catch {
+                                $matchesPreviousSnapshot = $false
+                            }
+                            if ($matchesPreviousSnapshot) {
+                                break
+                            }
                         }
                     }
 
                     if (-not $matchesPreviousSnapshot) {
-                        if (-not (Test-WindowsUpdateTaskDefinition -Task $currentTargetTask -TaskPath $taskPath -TaskName $taskName -TaskDescription $taskDescription -ScriptPath $ScriptPath -ApprovedProfileSha256 $ApprovedProfileSha256 -ApprovedProfileManifestSha256 $ApprovedProfileManifestSha256 -ApprovedOOSExecutablePath $approvedOOSExecutablePath)) {
+                        if (-not (Test-WindowsUpdateTaskDefinition -Task $currentTargetTask -TaskPath $taskPath -TaskName $taskName -TaskDescription $taskDescription -ScriptPath $ScriptPath -ApprovedProfileSha256 $ApprovedProfileSha256 -ApprovedProfileManifestSha256 $ApprovedProfileManifestSha256 -ApprovedOOSExecutablePath $approvedOOSExecutablePath -TrustedPowerShellPath $trustedPowerShellPath)) {
                             throw "The task at '$taskFullPath' no longer matches a verified previous or replacement definition; rollback stopped without deleting it."
                         }
 
@@ -2327,13 +2977,33 @@ function New-WindowsUpdateScheduledTask {
 
                 if ($null -eq $currentTargetTask) {
                     foreach ($previous in $previousDefinitions) {
-                        Register-ScheduledTask -TaskName $previous.TaskName -TaskPath $previous.TaskPath -Xml $previous.Xml -Force -ErrorAction Stop | Out-Null
+                        $restoreDocument = New-Object System.Xml.XmlDocument
+                        $restoreDocument.LoadXml($previous.Xml)
+                        $restoreEnabledNode = $restoreDocument.SelectSingleNode("/*[local-name()='Task']/*[local-name()='Settings']/*[local-name()='Enabled']")
+                        if ($null -eq $restoreEnabledNode) {
+                            throw "The previous task definition at '$($previous.TaskPath)$($previous.TaskName)' has no Settings/Enabled element."
+                        }
+                        $restoreEnabled = [bool]::Parse([string]$restoreEnabledNode.InnerText)
+                        $restoreEnabledNode.InnerText = 'false'
+                        Register-ScheduledTask -TaskName $previous.TaskName -TaskPath $previous.TaskPath -Xml $restoreDocument.OuterXml -Force -ErrorAction Stop | Out-Null
+                        Set-WindowsUpdateTaskSecurityDescriptor -TaskPath $previous.TaskPath -TaskName $previous.TaskName -SecurityDescriptor $previous.SecurityDescriptor
+                        [void](Assert-WindowsUpdateTaskSecurityDescriptor -TaskPath $previous.TaskPath -TaskName $previous.TaskName -ExpectedSecurityDescriptor $previous.SecurityDescriptor)
                         $restoredTask = Get-ScheduledTask -TaskName $previous.TaskName -TaskPath $previous.TaskPath -ErrorAction Stop |
                             Where-Object { $_.TaskPath -eq $previous.TaskPath -and $_.TaskName -eq $previous.TaskName } |
                             Select-Object -First 1
-                        if ($null -eq $restoredTask -or -not (Test-WindowsUpdateTaskMatchesSnapshot -Task $restoredTask -Snapshot $previous)) {
+                        if ($null -eq $restoredTask -or [string]$restoredTask.State -ne 'Disabled' -or -not (Test-WindowsUpdateTaskMatchesSnapshot -Task $restoredTask -Snapshot $previous)) {
                             throw "The previous task definition at '$($previous.TaskPath)$($previous.TaskName)' could not be verified after rollback."
                         }
+                        if ($restoreEnabled) {
+                            Set-WindowsUpdateTaskEnabled -TaskPath $previous.TaskPath -TaskName $previous.TaskName -Enabled $true
+                            $restoredTask = Get-ScheduledTask -TaskName $previous.TaskName -TaskPath $previous.TaskPath -ErrorAction Stop |
+                                Where-Object { $_.TaskPath -eq $previous.TaskPath -and $_.TaskName -eq $previous.TaskName } |
+                                Select-Object -First 1
+                            if ($null -eq $restoredTask -or [string]$restoredTask.State -eq 'Disabled' -or -not (Test-WindowsUpdateTaskMatchesSnapshot -Task $restoredTask -Snapshot $previous)) {
+                                throw "The previous task at '$($previous.TaskPath)$($previous.TaskName)' did not return to its prior enabled state after rollback."
+                            }
+                        }
+                        [void](Assert-WindowsUpdateTaskSecurityDescriptor -TaskPath $previous.TaskPath -TaskName $previous.TaskName -ExpectedSecurityDescriptor $previous.SecurityDescriptor)
                     }
                     if ($previousDefinitions.Count -gt 0) {
                         $rollbackOutcome = 'restored'
@@ -2361,9 +3031,10 @@ function New-WindowsUpdateScheduledTask {
             foreach ($previous in $previousDefinitions) {
                 try {
                     Remove-Item -LiteralPath $previous.BackupPath -Force -ErrorAction Stop
+                    Remove-Item -LiteralPath $previous.DescriptorBackupPath -Force -ErrorAction Stop
                 }
                 catch {
-                    Write-Log "A temporary task rollback file remains at $($previous.BackupPath); remove it after confirming the previous task state." -Level WARNING
+                    Write-Log "Temporary task rollback files remain at $($previous.BackupPath) and $($previous.DescriptorBackupPath); remove them after confirming the previous task state." -Level WARNING
                 }
             }
         }
@@ -2383,8 +3054,8 @@ function New-WindowsUpdateScheduledTask {
         }
         elseif ($replacementStarted -and -not $rollbackSucceeded) {
             if ($previousDefinitions.Count -gt 0) {
-                $rollbackFiles = [string]::Join('; ', [string[]]@($previousDefinitions | ForEach-Object { '{0}{1} => {2}' -f $_.TaskPath, $_.TaskName, $_.BackupPath }))
-                Write-Log ("{0} and automatic rollback could not be verified. Restore the previous task definition from its protected rollback file using Register-ScheduledTask -TaskName <name> -TaskPath <path> -Xml (Get-Content -LiteralPath <file> -Raw) -Force. Backups: {1}. Details: {2}" -f $failureKind, $rollbackFiles, $_.Exception.Message) -Level ERROR
+                $rollbackFiles = [string]::Join('; ', [string[]]@($previousDefinitions | ForEach-Object { '{0}{1} => XML {2}; SDDL {3}' -f $_.TaskPath, $_.TaskName, $_.BackupPath, $_.DescriptorBackupPath }))
+                Write-Log ("{0} and automatic rollback could not be verified. Restore the previous task from its protected XML and SDDL rollback files; register it disabled, apply the saved descriptor with RegisteredTask.SetSecurityDescriptor, verify it, then restore its prior enabled state. Backups: {1}. Details: {2}" -f $failureKind, $rollbackFiles, $_.Exception.Message) -Level ERROR
             }
             else {
                 Write-Log ("{0} and cleanup of a partial task could not be verified. Inspect Task Scheduler before retrying. Details: {1}" -f $failureKind, $_.Exception.Message) -Level ERROR
@@ -2729,8 +3400,11 @@ try {
     if ($script:OOShutUpLastRunChanged) {
         Write-Log "O&O ShutUp10++ applied the approved privacy settings profile." -Level SUCCESS
     }
-    else {
+    elseif ($configSuccess) {
         Write-Log 'O&O reported that no setting changes were needed for the approved profile.' -Level INFO
+    }
+    else {
+        Write-Log 'The O&O configuration did not complete successfully. Review the preceding error and O&O Undo History before retrying.' -Level WARNING
     }
     if ($restorePointVerified) {
         Write-Log "A system restore point was verified before applying settings; it is separate from the exported O&O profile." -Level SUCCESS

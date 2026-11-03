@@ -235,10 +235,48 @@ The task triggers only on Windows Update Client **event ID 19** (installation su
 - **Delay**: 2 minutes after the successful installation event
 - **Overlapping runs**: Queued and run sequentially
 - **Execution**: Hidden PowerShell window (no user interaction)
-- **Command**: `PowerShell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "<ScriptPath>" -ReapplyOnly -SkipRelocate -NonInteractive -ApprovedProfileSha256 "<PinnedProfileSHA256>" -ApprovedProfileManifestSha256 "<PinnedManifestSHA256>"`
+- **Command**: the canonical absolute Windows PowerShell 5.1 executable under `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`, followed by `-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "<ScriptPath>" -ReapplyOnly -SkipRelocate -NonInteractive -ApprovedOOSExecutablePath "<ManagedOOSPath>" -ApprovedProfileSha256 "<PinnedProfileSHA256>" -ApprovedProfileManifestSha256 "<PinnedManifestSHA256>"`
 - **Working directory**: the directory containing `<ScriptPath>`
 
+Before creating or replacing the task, the installer confirms the Windows PowerShell file is in the expected system directory, has Microsoft Windows PowerShell product metadata, a valid Microsoft Windows Authenticode signature, and protected system ACLs. A 32-bit caller on 64-bit Windows checks the native binary through `Sysnative`, then stores its canonical `System32` path in the task. The verifier repeats these checks and requires the task action to match that exact path.
+
+If the trusted interpreter is absent, redirected, or changes before candidate staging, the installer logs: `A trusted Windows PowerShell executable could not be resolved. No scheduled task was registered or changed.` The previous task is left as found. Repair or restore the Windows PowerShell 5.1 system executable and its protected ACLs, then rerun the installer with the approved profile. Do not create a replacement task using a bare `PowerShell.exe` command.
+
+If a later verification detects an interpreter change after a disabled validation task is staged, the candidate is rejected before replacing the existing task. If candidate cleanup cannot be confirmed, inspect the exact validation-task path named in the installer log and remove it only after confirming that it is disabled.
+
 If the approved settings are applied but the update task cannot be verified, setup is reported as partial and the installer exits with code `2`. The installer prints recovery instructions for repairing `\myTech.Today\Install-OOShutUp10`. Exit code `0` requires verified settings, an acceptable restore-point outcome, and a verified task.
+
+### Task Security Descriptor
+
+The registered task's owner, group, and DACL are read through Task Scheduler's `RegisteredTask.GetSecurityDescriptor(7)` API. The allowlist is `O:BAG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)`: Builtin Administrators own the task, LocalSystem is the group, the DACL is protected from inherited entries, and only LocalSystem and Builtin Administrators receive full task access. The installer applies this descriptor to the disabled validation task and disabled replacement task, reads each back, and enables the replacement only after its action and descriptor verify. It reads the descriptor again after enabling. An existing task with a descriptor outside this allowlist is left unchanged for review.
+
+Descriptor read, write, or verification failures use this fallback and leave the new task disabled: `The task security descriptor could not be verified. No new task was enabled; inspect task permissions before retrying.`
+
+When a replacement fails after the prior task is removed, the installer retains protected `.xml` and `.sddl` rollback files until it verifies both the restored task and descriptor. If automatic rollback is uncertain, do not enable the partial task. Run the following as an administrator after reviewing the exact task identity and both backup paths. The sequence restores the definition disabled, restores and reads back its saved owner/group/DACL, then returns the task to its prior enabled state only when that readback matches the saved descriptor:
+
+```powershell
+$taskPath = '\myTech.Today\'
+$taskName = 'Install-OOShutUp10'
+$xmlPath = '<protected rollback XML path>'
+$sddlPath = '<matching protected rollback SDDL path>'
+$document = New-Object System.Xml.XmlDocument
+$document.Load($xmlPath)
+$enabledNode = $document.SelectSingleNode("/*[local-name()='Task']/*[local-name()='Settings']/*[local-name()='Enabled']")
+if ($null -eq $enabledNode) { throw 'Rollback XML has no Settings/Enabled element.' }
+$wasEnabled = [bool]::Parse($enabledNode.InnerText)
+$enabledNode.InnerText = 'false'
+Register-ScheduledTask -TaskName $taskName -TaskPath $taskPath -Xml $document.OuterXml -Force
+$service = New-Object -ComObject 'Schedule.Service'
+$service.Connect()
+$registeredTask = $service.GetFolder($taskPath).GetTask($taskName)
+$savedSddl = [System.IO.File]::ReadAllText($sddlPath)
+$registeredTask.SetSecurityDescriptor($savedSddl, 0x10)
+$readBackSddl = $registeredTask.GetSecurityDescriptor(7)
+if ($readBackSddl -ne $savedSddl) { throw 'Task descriptor readback differs from the saved descriptor; leave the task disabled and inspect it.' }
+if ($wasEnabled) { $registeredTask.Enabled = $true }
+```
+
+If the readback differs or any command fails, leave the task disabled and inspect the exact task in Task Scheduler before retrying. The descriptor backup covers owner, group, and DACL; it does not request the audit SACL.
 
 ### Viewing the Scheduled Task
 
@@ -370,7 +408,11 @@ This checkout currently contains no approved profile, so it exits with this mess
 
 > The approved settings profile is missing or invalid. No privacy settings were applied; place the reviewed profile in the configured directory.
 
-The profile is resolved beneath the script's package directory regardless of the caller's current directory. Relocation copies the reviewed profile package beside the relocated script and preserves both accepted digests. O&O receives the absolute profile path and starts with the profile directory as its working directory. The scheduled task runs PowerShell with the script directory as its working directory, retains `-ReapplyOnly`, and supplies the exact absolute managed O&O executable path and both pinned profile digests. O&O exit code `0` is reported as no setting changes and does not prompt for a restart; exit code `30` is treated as settings changed.
+The profile is resolved beneath the script's package directory regardless of the caller's current directory. Relocation copies the reviewed profile package beside the relocated script and preserves both accepted digests. Before O&O starts, the installer copies both files with exclusive creation into a per-run directory beneath the managed O&O directory, verifies its ACL for SYSTEM and Administrators, and rechecks both reviewed digests on the snapshot. O&O receives only the snapshot `.cfg` path and runs with that directory as its working directory; the snapshot remains in place until O&O exits. The scheduled task runs PowerShell with the script directory as its working directory, retains `-ReapplyOnly`, and supplies the exact absolute managed O&O executable path and both pinned profile digests. O&O exit code `0` is reported as no setting changes and does not prompt for a restart; exit code `30` is treated as settings changed.
+
+If snapshot creation, ACL verification, or digest verification fails, O&O is not started and the installer reports: `The approved profile changed after validation. No O&O process was started; restore the reviewed profile and retry.` If O&O exits but snapshot cleanup fails, verify O&O's applied settings and manually remove the reported `ProfileSnapshot-<guid>` directory beneath the managed O&O directory after confirming no `OOSU10.exe` process still uses it. If the process start outcome cannot be verified, the installer retains the snapshot and reports its path; check for a running O&O process before removing it manually.
+
+The offline harness uses mocked ACL records and does not establish effective Windows permissions. Before release, record a disposable VM run with two test accounts that inspects the snapshot directory and both files during a harmless reviewed fixture run, confirms SYSTEM and Administrators access, and verifies the lower-privilege account cannot create, modify, replace, or delete the snapshot files.
 
 ### Rollback
 

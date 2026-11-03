@@ -8,6 +8,13 @@ $script:PromptMessages = New-Object System.Collections.ArrayList
 $script:StartedPaths = New-Object System.Collections.ArrayList
 $script:StartedArguments = New-Object System.Collections.ArrayList
 $script:StartedWorkingDirectories = New-Object System.Collections.ArrayList
+$script:OpenedProfilePaths = New-Object System.Collections.ArrayList
+$script:OpenedProfileBytes = New-Object System.Collections.ArrayList
+$script:OpenedManifestBytes = New-Object System.Collections.ArrayList
+$script:SwapProfileBeforeMockOpen = $false
+$script:MockReplacementProfileContent = ''
+$script:MockReplacementManifestContent = ''
+$script:SnapshotAclDenied = $false
 $script:DownloadScenario = 'valid'
 $script:DownloadCount = 0
 $script:SignatureCallCount = 0
@@ -15,9 +22,16 @@ $script:MockExitCode = 0
 $script:PromptDecision = 'YES'
 $script:FixtureRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('oosu10-trust-tests-' + [guid]::NewGuid().ToString('N'))
 $script:TaskRegistry = @{}
+$script:TaskSecurityDescriptorByIdentity = @{}
 $script:TaskRegistrationCalls = New-Object System.Collections.ArrayList
 $script:TaskUnregistrationCalls = New-Object System.Collections.ArrayList
 $script:TaskLookupCalls = New-Object System.Collections.ArrayList
+$script:TaskSecurityDescriptorReadCalls = New-Object System.Collections.ArrayList
+$script:TaskSecurityDescriptorSetCalls = New-Object System.Collections.ArrayList
+$script:TaskEnabledCalls = New-Object System.Collections.ArrayList
+$script:MockTaskSecurityDescriptorScenario = 'Normal'
+$script:MockTaskSecurityDescriptorReplacementInjected = $false
+$script:MockTaskSecurityDescriptorSetFailureTaskName = $null
 $script:TaskLookupFailure = $null
 $script:TaskRegistrationFailure = $null
 $script:TaskVerificationMissPending = $false
@@ -28,6 +42,8 @@ $script:FailStageQueuePolicyVerification = $false
 $script:FailTaskRestore = $false
 $script:MockInstallerTaskScenario = 'Success'
 $script:OOShutUpPartialSetupMessage = 'The privacy settings may be applied, but the update task was not verified. Setup is partial; repair the task before relying on automatic reapplication.'
+$script:OOShutUpTaskSecurityDescriptorSddl = 'O:BAG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)'
+$script:OOShutUpTaskSecurityDescriptorFailureMessage = 'The task security descriptor could not be verified. No new task was enabled; inspect task permissions before retrying.'
 $script:OOShutUpTaskRecoveryMessage = 'Recovery: resolve the logged Task Scheduler error, open PowerShell as Administrator, and rerun this installer with the approved profile (or use -NonInteractive -ApprovedProfileSha256 <profile SHA-256> -ApprovedProfileManifestSha256 <manifest SHA-256>). Verify \myTech.Today\Install-OOShutUp10 in Task Scheduler before relying on automatic reapplication. The retry inspects and replaces only this verified task; same-named tasks in other folders are left unchanged.'
 $script:OOShutUpUpdateEventSubscription = '<QueryList><Query Id="0" Path="System"><Select Path="System">*[System[Provider[@Name=''Microsoft-Windows-WindowsUpdateClient''] and (EventID=19)]]</Select></Query></QueryList>'
 $script:OOShutUpUpdateEventDelay = 'PT2M'
@@ -35,6 +51,14 @@ $script:OOShutUpUpdateMultipleInstancesPolicy = 'Queue'
 $script:OOShutUpRestorePointFailureMessage = 'A restore point could not be verified. No privacy settings were applied; free space or enable restore protection, then retry.'
 $script:MockAclByPath = @{}
 $script:MockAclFailurePath = $null
+$script:MockWindowsPowerShellSignatureMode = 'Valid'
+$script:MockWindowsPowerShellDirectory = $null
+$script:MockPowerShellContextIs64BitOperatingSystem = $true
+$script:MockPowerShellContextIs64BitProcess = $true
+$script:MockPowerShellResolverMode = 'Valid'
+$script:MockPowerShellResolverCallCount = 0
+$script:MockPowerShellResolverChangedPath = $null
+$script:MockLastPowerShellInspectionPath = $null
 
 function Assert-True {
     param(
@@ -138,6 +162,16 @@ function Get-AuthenticodeSignature {
     param([string]$FilePath)
 
     $script:SignatureCallCount++
+    if ([string]$FilePath -match '(?i)\\WindowsPowerShell\\v1\.0\\powershell\.exe$') {
+        if ($script:MockWindowsPowerShellSignatureMode -eq 'WrongPublisher') {
+            return [pscustomobject]@{ Status = 'Valid'; SignerCertificate = (New-MockSigner 'Other Publisher') }
+        }
+        if ($script:MockWindowsPowerShellSignatureMode -eq 'Unsigned') {
+            return [pscustomobject]@{ Status = 'NotSigned'; SignerCertificate = $null }
+        }
+        return [pscustomobject]@{ Status = 'Valid'; SignerCertificate = (New-MockSigner 'Microsoft Windows') }
+    }
+
     $content = [System.IO.File]::ReadAllText($FilePath)
 
     switch -Exact ($content) {
@@ -170,6 +204,18 @@ function Start-Process {
     [void]$script:StartedPaths.Add($FilePath)
     [void]$script:StartedArguments.Add($ArgumentList)
     [void]$script:StartedWorkingDirectories.Add($WorkingDirectory)
+    $profileArgument = [System.Text.RegularExpressions.Regex]::Match($ArgumentList, '^/quiet /nosrp "([^"]+)"$')
+    if ($profileArgument.Success) {
+        if ($script:SwapProfileBeforeMockOpen) {
+            [System.IO.File]::WriteAllText($script:OOShutUpProfilePath, $script:MockReplacementProfileContent, [System.Text.Encoding]::UTF8)
+            [System.IO.File]::WriteAllText($script:OOShutUpProfileManifestPath, $script:MockReplacementManifestContent, [System.Text.Encoding]::UTF8)
+        }
+        $openedProfilePath = [System.IO.Path]::GetFullPath($profileArgument.Groups[1].Value)
+        [void]$script:OpenedProfilePaths.Add($openedProfilePath)
+        [void]$script:OpenedProfileBytes.Add([System.IO.File]::ReadAllBytes($openedProfilePath))
+        $openedManifestPath = Join-Path (Split-Path -Parent $openedProfilePath) 'ooshutup10.approval.json'
+        [void]$script:OpenedManifestBytes.Add([System.IO.File]::ReadAllBytes($openedManifestPath))
+    }
     return [pscustomobject]@{ ExitCode = $script:MockExitCode }
 }
 
@@ -223,13 +269,15 @@ function New-MockAclRule {
     param(
         [string]$Sid,
         [System.Security.AccessControl.FileSystemRights]$Rights,
-        [System.Security.AccessControl.AccessControlType]$Type = [System.Security.AccessControl.AccessControlType]::Allow
+        [System.Security.AccessControl.AccessControlType]$Type = [System.Security.AccessControl.AccessControlType]::Allow,
+        [System.Security.AccessControl.PropagationFlags]$PropagationFlags = [System.Security.AccessControl.PropagationFlags]::None
     )
 
     return [pscustomobject]@{
         IdentityReference = [System.Security.Principal.SecurityIdentifier]::new($Sid)
         FileSystemRights = $Rights
         AccessControlType = $Type
+        PropagationFlags = $PropagationFlags
     }
 }
 
@@ -249,6 +297,15 @@ function Get-Acl {
     $resolvedPath = [System.IO.Path]::GetFullPath($LiteralPath)
     if ($script:MockAclFailurePath -and [string]::Equals($resolvedPath, $script:MockAclFailurePath, [System.StringComparison]::OrdinalIgnoreCase)) {
         throw 'Mock ACL access denied.'
+    }
+    if ($script:SnapshotAclDenied -and
+        $script:InstallPath -and
+        $resolvedPath.StartsWith((Join-Path ([System.IO.Path]::GetFullPath($script:InstallPath)) 'ProfileSnapshot-'), [System.StringComparison]::OrdinalIgnoreCase)) {
+        return New-MockAcl -Rules @(
+            (New-MockAclRule -Sid 'S-1-5-18' -Rights ([System.Security.AccessControl.FileSystemRights]::FullControl)),
+            (New-MockAclRule -Sid 'S-1-5-32-544' -Rights ([System.Security.AccessControl.FileSystemRights]::FullControl)),
+            (New-MockAclRule -Sid 'S-1-5-11' -Rights ([System.Security.AccessControl.FileSystemRights]::CreateFiles))
+        )
     }
     if ($script:MockAclByPath.ContainsKey($resolvedPath)) {
         return $script:MockAclByPath[$resolvedPath]
@@ -411,6 +468,7 @@ function Register-ScheduledTask {
         $task.Settings.MultipleInstances = 'IgnoreNew'
     }
     $script:TaskRegistry["$TaskPath|$TaskName"] = $task
+    $script:TaskSecurityDescriptorByIdentity["$TaskPath|$TaskName"] = [string]$script:OOShutUpTaskSecurityDescriptorSddl
     if ($script:FailTaskVerification -and $TaskName -eq 'Install-OOShutUp10' -and $TaskPath -eq '\myTech.Today\') {
         $script:TaskVerificationMissPending = $true
         $script:FailTaskVerification = $false
@@ -428,6 +486,7 @@ function Unregister-ScheduledTask {
 
     [void]$script:TaskUnregistrationCalls.Add([pscustomobject]@{ TaskName = $TaskName; TaskPath = $TaskPath })
     $script:TaskRegistry.Remove("$TaskPath|$TaskName") | Out-Null
+    $script:TaskSecurityDescriptorByIdentity.Remove("$TaskPath|$TaskName") | Out-Null
 }
 
 try {
@@ -458,6 +517,8 @@ try {
     Assert-True ($installerBatchSource.Contains('Setup is partial. Repair the update task before relying on automatic reapplication.')) 'the batch wrapper reports partial setup with the task recovery action'
     Assert-True ($installerBatchSource -notmatch '\[INFO\] Complete\.') 'the batch wrapper does not print unconditional completion'
     Assert-True ($source.Contains('Task ownership is ambiguous. No task was deleted; inspect the listed path and retry after confirming ownership.')) 'ambiguous task ownership has the required fallback'
+    Assert-True ($source.Contains('The task security descriptor could not be verified. No new task was enabled; inspect task permissions before retrying.')) 'task descriptor failures use the exact required fallback'
+    Assert-True ($source.Contains("O:BAG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)")) 'the task descriptor allowlist is explicit for SYSTEM and Administrators'
     Assert-True ($source.Contains('-RequireMachineScope:$ReapplyOnly')) 'ReapplyOnly validates machine scope before later work'
     Assert-True ($source.Contains("Join-Path `$PSScriptRoot 'profiles'")) 'the profile package path is rooted beside the script'
     Assert-True ($source -notmatch 'Start-Process[^\r\n]*ooshutup10\.cfg') 'the O&O invocation does not pass a bare profile filename'
@@ -470,6 +531,10 @@ try {
         'Test-OOShutUpInstalled',
         'Get-OOShutUpPath',
         'Get-OOShutUpApprovedProfile',
+        'Get-OOShutUpProfileDigest',
+        'Write-OOShutUpProfileSnapshotFile',
+        'Remove-OOShutUpProfileSnapshot',
+        'New-OOShutUpProfileSnapshot',
         'Show-OOShutUpProfileImpactSummary',
         'Confirm-OOShutUpProfile',
         'New-OOShutUpWebClient',
@@ -478,9 +543,19 @@ try {
         'Invoke-OOShutUpConfiguration',
         'ConvertTo-SystemTaskSid',
         'Test-SystemTaskTargetAcl',
+        'Get-WindowsPowerShellExecutablePaths',
+        'Test-WindowsPowerShellPathIdentity',
+        'Get-TrustedWindowsPowerShellExecutable',
         'Test-WindowsUpdateTaskDefinition',
         'Test-WindowsUpdateLegacyTaskDefinition',
         'Test-ScheduledTaskAccessDenied',
+        'Invoke-WindowsUpdateTaskSchedulerOperation',
+        'Get-WindowsUpdateTaskSecurityDescriptor',
+        'Set-WindowsUpdateTaskSecurityDescriptor',
+        'Set-WindowsUpdateTaskEnabled',
+        'Test-WindowsUpdateTaskSecurityDescriptor',
+        'Test-WindowsUpdateTaskSecurityDescriptorEqual',
+        'Assert-WindowsUpdateTaskSecurityDescriptor',
         'Test-WindowsUpdateTaskMatchesSnapshot',
         'New-WindowsUpdateScheduledTask',
         'Invoke-OOShutUpTaskSetup',
@@ -499,6 +574,87 @@ try {
         $functionAst = @($functionAsts | Where-Object { $_.Name -eq $name })[0]
         Assert-True ($null -ne $functionAst) "the $name function exists"
         . ([scriptblock]::Create($functionAst.Extent.Text))
+    }
+
+    Assert-Equal $true (Test-WindowsUpdateTaskSecurityDescriptor -SecurityDescriptor $script:OOShutUpTaskSecurityDescriptorSddl) 'the documented SYSTEM and Administrators task descriptor passes verification'
+    Assert-Equal $false (Test-WindowsUpdateTaskSecurityDescriptor -SecurityDescriptor ($script:OOShutUpTaskSecurityDescriptorSddl + '(A;;FA;;;AU)')) 'an unexpected Authenticated Users write ACE fails descriptor verification'
+    Assert-Equal $false (Test-WindowsUpdateTaskSecurityDescriptor -SecurityDescriptor ($script:OOShutUpTaskSecurityDescriptorSddl + '(A;;FA;;;BU)')) 'an unexpected BUILTIN Users write ACE fails descriptor verification'
+    Assert-Equal $false (Test-WindowsUpdateTaskSecurityDescriptor -SecurityDescriptor 'not-an-sddl-descriptor') 'malformed task descriptor data fails verification'
+    $reorderedAllowedDescriptor = 'O:BAG:SYD:P(A;;FA;;;BA)(A;;FA;;;SY)'
+    Assert-Equal $true (Test-WindowsUpdateTaskSecurityDescriptor -SecurityDescriptor $reorderedAllowedDescriptor) 'the allowlist check is independent of ACE ordering'
+    Assert-Equal $false (Test-WindowsUpdateTaskSecurityDescriptorEqual -ActualSecurityDescriptor $script:OOShutUpTaskSecurityDescriptorSddl -ExpectedSecurityDescriptor $reorderedAllowedDescriptor) 'rollback comparison detects a descriptor that differs from the exact saved descriptor'
+
+    function Get-WindowsUpdateTaskSecurityDescriptor {
+        [CmdletBinding()]
+        param([string]$TaskPath, [string]$TaskName)
+
+        $key = "$TaskPath|$TaskName"
+        [void]$script:TaskSecurityDescriptorReadCalls.Add([pscustomobject]@{ TaskPath = $TaskPath; TaskName = $TaskName })
+        if ($script:MockTaskSecurityDescriptorScenario -eq 'ReadDeniedOnOwnedTask' -and $TaskName -eq 'Install-OOShutUp10') {
+            throw [System.UnauthorizedAccessException]::new(("{0} Details: Mock task descriptor access denied." -f $script:OOShutUpTaskSecurityDescriptorFailureMessage))
+        }
+        if ($script:MockTaskSecurityDescriptorScenario -eq 'ReadDeniedOnStage' -and $TaskName -like 'Install-OOShutUp10-validation-*') {
+            throw [System.UnauthorizedAccessException]::new(("{0} Details: Mock staged-task descriptor access denied." -f $script:OOShutUpTaskSecurityDescriptorFailureMessage))
+        }
+        if ($script:MockTaskSecurityDescriptorScenario -eq 'MalformedOnOwnedTask' -and $TaskName -eq 'Install-OOShutUp10') {
+            return 'not-an-sddl-descriptor'
+        }
+        if ($script:MockTaskSecurityDescriptorScenario -eq 'MalformedOnStage' -and $TaskName -like 'Install-OOShutUp10-validation-*') {
+            return 'not-an-sddl-descriptor'
+        }
+        if ($script:TaskSecurityDescriptorByIdentity.ContainsKey($key)) {
+            return [string]$script:TaskSecurityDescriptorByIdentity[$key]
+        }
+        return [string]$script:OOShutUpTaskSecurityDescriptorSddl
+    }
+
+    function Set-WindowsUpdateTaskSecurityDescriptor {
+        [CmdletBinding()]
+        param([string]$TaskPath, [string]$TaskName, [string]$SecurityDescriptor)
+
+        [void]$script:TaskSecurityDescriptorSetCalls.Add([pscustomobject]@{ TaskPath = $TaskPath; TaskName = $TaskName; SecurityDescriptor = $SecurityDescriptor })
+        if ($script:MockTaskSecurityDescriptorSetFailureTaskName -and $TaskName -like $script:MockTaskSecurityDescriptorSetFailureTaskName) {
+            throw [System.InvalidOperationException]::new('Mock task descriptor update failed.')
+        }
+
+        $descriptorToStore = $SecurityDescriptor
+        $injectReplacementDescriptor = $TaskName -eq 'Install-OOShutUp10' -and
+            -not $script:MockTaskSecurityDescriptorReplacementInjected -and
+            $script:MockTaskSecurityDescriptorScenario -in @('UnexpectedOnFinal', 'UnprovenOnFinal')
+        if ($injectReplacementDescriptor) {
+            $script:MockTaskSecurityDescriptorReplacementInjected = $true
+            $descriptorToStore = $script:OOShutUpTaskSecurityDescriptorSddl + '(A;;FA;;;AU)'
+        }
+        $key = "$TaskPath|$TaskName"
+        $script:TaskSecurityDescriptorByIdentity[$key] = $descriptorToStore
+
+        if ($injectReplacementDescriptor -and $script:MockTaskSecurityDescriptorScenario -eq 'UnprovenOnFinal') {
+            $task = $script:TaskRegistry[$key]
+            $document = New-Object System.Xml.XmlDocument
+            $document.LoadXml([string]$task.Definition)
+            $document.SelectSingleNode("/*[local-name()='Task']/*[local-name()='Actions']/*[local-name()='Exec']/*[local-name()='Arguments']").InnerText = '-UnrecognizedAction'
+            $script:TaskRegistry[$key] = New-MockScheduledTask -TaskName $TaskName -TaskPath $TaskPath -Xml $document.OuterXml
+        }
+    }
+
+    function Set-WindowsUpdateTaskEnabled {
+        [CmdletBinding()]
+        param([string]$TaskPath, [string]$TaskName, [bool]$Enabled)
+
+        [void]$script:TaskEnabledCalls.Add([pscustomobject]@{ TaskPath = $TaskPath; TaskName = $TaskName; Enabled = $Enabled })
+        $key = "$TaskPath|$TaskName"
+        if (-not $script:TaskRegistry.ContainsKey($key)) {
+            throw "Mock task was not found: $key"
+        }
+        $task = $script:TaskRegistry[$key]
+        $document = New-Object System.Xml.XmlDocument
+        $document.LoadXml([string]$task.Definition)
+        $enabledNode = $document.SelectSingleNode("/*[local-name()='Task']/*[local-name()='Settings']/*[local-name()='Enabled']")
+        if ($null -eq $enabledNode) {
+            throw 'Mock task definition has no Settings/Enabled element.'
+        }
+        $enabledNode.InnerText = $Enabled.ToString().ToLowerInvariant()
+        $script:TaskRegistry[$key] = New-MockScheduledTask -TaskName $TaskName -TaskPath $TaskPath -Xml $document.OuterXml
     }
 
     $managedPathFunctionSource = [string](@($functionAsts | Where-Object { $_.Name -eq 'Get-OOShutUpPath' })[0].Extent.Text)
@@ -663,14 +819,57 @@ try {
     $script:OOShutUpProfilePath = Join-Path $script:OOShutUpProfileDirectory 'ooshutup10.cfg'
     $script:OOShutUpProfileManifestPath = Join-Path $script:OOShutUpProfileDirectory 'ooshutup10.approval.json'
     $script:OOShutUpProfileFailureMessage = 'The approved settings profile is missing or invalid. No privacy settings were applied; place the reviewed profile in the configured directory.'
+    $script:OOShutUpProfileSnapshotFailureMessage = 'The approved profile changed after validation. No O&O process was started; restore the reviewed profile and retry.'
     $script:OOShutUpUnknownScopeFailureMessage = 'The task profile contains settings with unknown user scope. Reapplication was skipped; review the profile scope before retrying.'
     $script:OOShutUpCurrentUserScopeFailureMessage = 'The SYSTEM task profile contains current-user settings. Reapplication was skipped; run them for the intended signed-in user or remove them from the SYSTEM task profile.'
     $script:OOShutUpApprovalFailureMessage = 'The selected settings profile has no matching approval. No settings were changed; review both file digests in the interactive installer and recreate the task.'
     $script:OOShutUpTaskAclFailureMessage = 'The SYSTEM task target ACL could not be verified. No task was registered; move the script to a protected path and retry.'
+    $script:OOShutUpTaskSecurityDescriptorSddl = 'O:BAG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)'
+    $script:OOShutUpTaskSecurityDescriptorFailureMessage = 'The task security descriptor could not be verified. No new task was enabled; inspect task permissions before retrying.'
     $script:OOShutUpTaskOwnershipFailureMessage = 'Task ownership is ambiguous. No task was deleted; inspect the listed path and retry after confirming ownership.'
     $script:OOShutUpManagedPathFailureMessage = 'The approved O&O executable path is unavailable to the scheduled task. Reapplication was skipped; restore the verified machine copy.'
 
     $validFixture = Join-Path $script:FixtureRoot 'valid.exe'
+    $systemFullControl = New-MockAclRule -Sid 'S-1-5-18' -Rights ([System.Security.AccessControl.FileSystemRights]::FullControl)
+    $administratorsFullControl = New-MockAclRule -Sid 'S-1-5-32-544' -Rights ([System.Security.AccessControl.FileSystemRights]::FullControl)
+    $script:MockAclByPath['__default__'] = New-MockAcl -Rules @($systemFullControl, $administratorsFullControl)
+    $script:OOShutUpTrustedPowerShellFailureMessage = 'A trusted Windows PowerShell executable could not be resolved. No scheduled task was registered or changed.'
+
+    $script:MockWindowsPowerShellDirectory = [System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::Windows)
+    $native64BitPaths = Get-WindowsPowerShellExecutablePaths -WindowsDirectory $script:MockWindowsPowerShellDirectory -Is64BitOperatingSystem $true -Is64BitProcess $true
+    $wow64CallerPaths = Get-WindowsPowerShellExecutablePaths -WindowsDirectory $script:MockWindowsPowerShellDirectory -Is64BitOperatingSystem $true -Is64BitProcess $false
+    $native32BitPaths = Get-WindowsPowerShellExecutablePaths -WindowsDirectory $script:MockWindowsPowerShellDirectory -Is64BitOperatingSystem $false -Is64BitProcess $false
+    $expectedNativeInterpreterPath = [System.IO.Path]::GetFullPath((Join-Path $script:MockWindowsPowerShellDirectory 'System32\WindowsPowerShell\v1.0\powershell.exe'))
+    Assert-Equal $expectedNativeInterpreterPath ([string]$native64BitPaths.TaskPath) 'a 64-bit caller schedules the canonical native Windows PowerShell path'
+    Assert-Equal $expectedNativeInterpreterPath ([string]$native64BitPaths.InspectionPath) 'a 64-bit caller validates the native System32 executable directly'
+    Assert-Equal $expectedNativeInterpreterPath ([string]$wow64CallerPaths.TaskPath) 'a 32-bit caller schedules the canonical native System32 path'
+    Assert-Equal ([System.IO.Path]::GetFullPath((Join-Path $script:MockWindowsPowerShellDirectory 'Sysnative\WindowsPowerShell\v1.0\powershell.exe'))) ([string]$wow64CallerPaths.InspectionPath) 'a 32-bit caller validates the native executable through Sysnative'
+    Assert-Equal ([string]$native32BitPaths.TaskPath) ([string]$native32BitPaths.InspectionPath) 'a 32-bit Windows caller validates its native System32 executable'
+    $redirectedInterpreterPath = [System.IO.Path]::GetFullPath((Join-Path $script:MockWindowsPowerShellDirectory 'SysWOW64\WindowsPowerShell\v1.0\powershell.exe'))
+    Assert-Equal $false (Test-WindowsPowerShellPathIdentity -Candidate $wow64CallerPaths -ResolvedPath $redirectedInterpreterPath) 'a SysWOW64 redirection is rejected for a 32-bit caller on 64-bit Windows'
+    Assert-Equal $false (Test-WindowsPowerShellPathIdentity -Candidate $native64BitPaths -ResolvedPath (Join-Path $script:FixtureRoot 'powershell.exe')) 'an unexpected executable path is rejected'
+    Assert-Equal $null (Get-TrustedWindowsPowerShellExecutable -WindowsDirectory (Join-Path $script:FixtureRoot 'missing-windows-directory') -Is64BitOperatingSystem $true -Is64BitProcess $true) 'a missing Windows PowerShell candidate fails closed'
+
+    $trustedPowerShellPath = Get-TrustedWindowsPowerShellExecutable
+    Assert-Equal $expectedNativeInterpreterPath ([string]$trustedPowerShellPath) 'the trusted Windows PowerShell resolver accepts the Microsoft system binary'
+    $script:MockWindowsPowerShellSignatureMode = 'WrongPublisher'
+    Assert-Equal $null (Get-TrustedWindowsPowerShellExecutable) 'an unexpected Windows PowerShell signer fails closed'
+    $script:MockWindowsPowerShellSignatureMode = 'Unsigned'
+    Assert-Equal $null (Get-TrustedWindowsPowerShellExecutable) 'an unsigned Windows PowerShell executable fails closed'
+    $script:MockWindowsPowerShellSignatureMode = 'Valid'
+
+    $userWritableInterpreterAcl = New-MockAcl -Rules @(
+        $systemFullControl,
+        $administratorsFullControl,
+        (New-MockAclRule -Sid 'S-1-5-11' -Rights ([System.Security.AccessControl.FileSystemRights]::Modify))
+    )
+    foreach ($interpreterPath in @($native64BitPaths.TaskPath, $wow64CallerPaths.InspectionPath)) {
+        $script:MockAclByPath[[System.IO.Path]::GetFullPath([string]$interpreterPath)] = $userWritableInterpreterAcl
+    }
+    Assert-Equal $null (Get-TrustedWindowsPowerShellExecutable) 'a user-writable Windows PowerShell path fails closed'
+    $script:MockAclByPath.Remove([System.IO.Path]::GetFullPath([string]$native64BitPaths.TaskPath)) | Out-Null
+    $script:MockAclByPath.Remove([System.IO.Path]::GetFullPath([string]$wow64CallerPaths.InspectionPath)) | Out-Null
+
     Write-TestPayload -Path $validFixture -Content 'VALID'
     Assert-Equal $true (Test-OOShutUpPayload -Path $validFixture) 'a valid O&O signature, publisher, product, and supported version pass'
 
@@ -803,6 +1002,14 @@ try {
 
     $unrelatedWorkingDirectory = Join-Path $script:FixtureRoot 'unrelated caller directory'
     [System.IO.Directory]::CreateDirectory($unrelatedWorkingDirectory) | Out-Null
+    $reviewedProfileBytes = [System.IO.File]::ReadAllBytes($script:OOShutUpProfilePath)
+    $reviewedManifestBytes = [System.IO.File]::ReadAllBytes($script:OOShutUpProfileManifestPath)
+    $script:OpenedProfilePaths.Clear()
+    $script:OpenedProfileBytes.Clear()
+    $script:OpenedManifestBytes.Clear()
+    $script:SwapProfileBeforeMockOpen = $true
+    $script:MockReplacementProfileContent = "# Unapproved swapped fixture`r`nS003`t-`r`nM003;+`r`n"
+    $script:MockReplacementManifestContent = '{"schemaVersion":3,"tampered":true}'
     Push-Location -LiteralPath $unrelatedWorkingDirectory
     try {
         $script:StartedPaths.Clear()
@@ -812,14 +1019,110 @@ try {
         Assert-Equal $true (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture) 'configuration succeeds from an unrelated current directory'
     }
     finally {
+        $script:SwapProfileBeforeMockOpen = $false
         Pop-Location
     }
     Assert-Equal 1 $script:StartedPaths.Count 'a valid profile launches the verified executable exactly once'
-    Assert-Equal ('/quiet /nosrp "{0}"' -f $script:OOShutUpProfilePath) ([string]$script:StartedArguments[0]) 'O&O receives the quoted absolute profile path'
-    Assert-Equal $script:OOShutUpProfileDirectory ([string]$script:StartedWorkingDirectories[0]) 'O&O starts in the configured profile directory'
+    Assert-Equal 1 $script:OpenedProfilePaths.Count 'the mocked O&O child opens exactly one profile path'
+    $snapshotProfilePath = [string]$script:OpenedProfilePaths[0]
+    $snapshotDirectory = Split-Path -Parent $snapshotProfilePath
+    Assert-True ($snapshotProfilePath.StartsWith([System.IO.Path]::GetFullPath($script:InstallPath), [System.StringComparison]::OrdinalIgnoreCase)) 'the O&O child receives a profile path under the managed machine directory'
+    Assert-True ($snapshotProfilePath -ne $script:OOShutUpProfilePath) 'the O&O child never receives the mutable source profile path'
+    Assert-Equal ('/quiet /nosrp "{0}"' -f $snapshotProfilePath) ([string]$script:StartedArguments[0]) 'O&O receives only the quoted absolute snapshot path'
+    Assert-Equal $snapshotDirectory ([string]$script:StartedWorkingDirectories[0]) 'O&O starts in the protected snapshot directory'
+    Assert-Equal $approvedProfile.Sha256 (Get-OOShutUpProfileDigest -Bytes ([byte[]]$script:OpenedProfileBytes[0])) 'the child opens the exact approved profile bytes after the source swap'
+    Assert-Equal $approvedProfile.ManifestSha256 (Get-OOShutUpProfileDigest -Bytes ([byte[]]$script:OpenedManifestBytes[0])) 'the snapshot manifest retains its exact reviewed digest at the child boundary'
+    Assert-Equal ([Convert]::ToBase64String($reviewedProfileBytes)) ([Convert]::ToBase64String([byte[]]$script:OpenedProfileBytes[0])) 'unapproved profile bytes never reach the child boundary'
+    Assert-Equal ([Convert]::ToBase64String($reviewedManifestBytes)) ([Convert]::ToBase64String([byte[]]$script:OpenedManifestBytes[0])) 'unapproved manifest bytes never reach the child boundary'
+    Assert-Equal $script:MockReplacementProfileContent ([System.IO.File]::ReadAllText($script:OOShutUpProfilePath)) 'the barrier-controlled mock replaced the source after snapshot validation'
+    Assert-Equal $false (Test-Path -LiteralPath $snapshotDirectory) 'a completed O&O child releases its per-run snapshot'
     $launchProfileLog = [string]::Join("`n", [string[]]$script:LogMessages.ToArray())
     Assert-True ($launchProfileLog.Contains("version test-1.0 (SHA-256 $($approvedProfile.Sha256)")) 'profile version and digest are recorded at launch'
     Assert-True ($launchProfileLog -notmatch 'S003|M003|Example setting') 'launch logging omits setting IDs and values'
+
+    Write-ApprovedProfileFixture -Content "# Reviewed fixture`r`nS003`t+`r`nM003;-`r`n" -AllowedSettingIds @('S003', 'M003')
+    $approvedProfile = Get-OOShutUpApprovedProfile
+    Assert-Equal $true (Confirm-OOShutUpProfile -Profile $approvedProfile) 'the restored source profile receives fresh approval after the race fixture'
+
+    $approvedDigestBeforeSnapshotWriteFailure = $script:OOShutUpApprovedDigest
+    $approvedManifestDigestBeforeSnapshotWriteFailure = $script:OOShutUpApprovedManifestDigest
+    $writeSnapshotFunction = (Get-Command -Name Write-OOShutUpProfileSnapshotFile -CommandType Function).ScriptBlock
+    Set-Item -Path Function:\Write-OOShutUpProfileSnapshotFile -Value {
+        param([string]$Path, [byte[]]$Bytes)
+        throw 'Mocked access denied while writing the protected snapshot.'
+    }
+    $startedBeforeSnapshotWriteFailure = $script:StartedPaths.Count
+    $script:LogMessages.Clear()
+    try {
+        Assert-Equal $false (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture) 'a denied protected snapshot write fails closed'
+    }
+    finally {
+        Set-Item -Path Function:\Write-OOShutUpProfileSnapshotFile -Value $writeSnapshotFunction
+    }
+    Assert-Equal $startedBeforeSnapshotWriteFailure $script:StartedPaths.Count 'a denied snapshot write never launches O&O'
+    Assert-Equal $approvedDigestBeforeSnapshotWriteFailure $script:OOShutUpApprovedDigest 'a denied snapshot write does not widen or replace the approved profile digest'
+    Assert-Equal $approvedManifestDigestBeforeSnapshotWriteFailure $script:OOShutUpApprovedManifestDigest 'a denied snapshot write does not widen or replace the approved manifest digest'
+    Assert-True ([string]::Join("`n", [string[]]$script:LogMessages.ToArray()).Contains($script:OOShutUpProfileSnapshotFailureMessage)) 'a denied snapshot write reports the exact no-launch fallback'
+
+    $writeSnapshotFunction = (Get-Command -Name Write-OOShutUpProfileSnapshotFile -CommandType Function).ScriptBlock
+    $script:RealWriteSnapshotFunction = $writeSnapshotFunction
+    Set-Item -Path Function:\Write-OOShutUpProfileSnapshotFile -Value {
+        param([string]$Path, [byte[]]$Bytes)
+        if ($Path.EndsWith('.approval.json', [System.StringComparison]::OrdinalIgnoreCase)) {
+            $Bytes = [System.Text.Encoding]::UTF8.GetBytes('{"schemaVersion":3,"tamperedCopy":true}')
+        }
+        & $script:RealWriteSnapshotFunction -Path $Path -Bytes $Bytes
+    }
+    $startedBeforeCopiedManifestMismatch = $script:StartedPaths.Count
+    $script:LogMessages.Clear()
+    try {
+        Assert-Equal $false (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture) 'a copied manifest digest mismatch fails closed'
+    }
+    finally {
+        Set-Item -Path Function:\Write-OOShutUpProfileSnapshotFile -Value $writeSnapshotFunction
+        $script:RealWriteSnapshotFunction = $null
+    }
+    Assert-Equal $startedBeforeCopiedManifestMismatch $script:StartedPaths.Count 'a copied manifest digest mismatch never launches O&O'
+    Assert-Equal $approvedDigestBeforeSnapshotWriteFailure $script:OOShutUpApprovedDigest 'a copied manifest mismatch leaves the approved profile digest unchanged'
+    Assert-Equal $approvedManifestDigestBeforeSnapshotWriteFailure $script:OOShutUpApprovedManifestDigest 'a copied manifest mismatch leaves the approved manifest digest unchanged'
+    Assert-True ([string]::Join("`n", [string[]]$script:LogMessages.ToArray()).Contains($script:OOShutUpProfileSnapshotFailureMessage)) 'a copied manifest mismatch reports the exact no-launch fallback'
+
+    $script:SnapshotAclDenied = $true
+    $startedBeforeSnapshotAclFailure = $script:StartedPaths.Count
+    $script:LogMessages.Clear()
+    try {
+        Assert-Equal $false (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture) 'a snapshot directory writable by an untrusted account fails closed'
+    }
+    finally {
+        $script:SnapshotAclDenied = $false
+    }
+    Assert-Equal $startedBeforeSnapshotAclFailure $script:StartedPaths.Count 'an untrusted snapshot ACL never launches O&O'
+    Assert-Equal $approvedDigestBeforeSnapshotWriteFailure $script:OOShutUpApprovedDigest 'an untrusted snapshot ACL leaves the approved profile digest unchanged'
+    Assert-Equal $approvedManifestDigestBeforeSnapshotWriteFailure $script:OOShutUpApprovedManifestDigest 'an untrusted snapshot ACL leaves the approved manifest digest unchanged'
+    Assert-True ([string]::Join("`n", [string[]]$script:LogMessages.ToArray()).Contains($script:OOShutUpProfileSnapshotFailureMessage)) 'an untrusted snapshot ACL reports the exact no-launch fallback'
+
+    $removeSnapshotFunction = (Get-Command -Name Remove-OOShutUpProfileSnapshot -CommandType Function).ScriptBlock
+    Set-Item -Path Function:\Remove-OOShutUpProfileSnapshot -Value {
+        param([string]$Directory)
+        throw 'Mocked snapshot cleanup access denied.'
+    }
+    $script:OpenedProfilePaths.Clear()
+    $startedBeforeSnapshotCleanupFailure = $script:StartedPaths.Count
+    $script:LogMessages.Clear()
+    $script:MockExitCode = 30
+    try {
+        Assert-Equal $false (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture) 'a snapshot cleanup failure returns an explicit incomplete result'
+    }
+    finally {
+        $script:MockExitCode = 0
+        Set-Item -Path Function:\Remove-OOShutUpProfileSnapshot -Value $removeSnapshotFunction
+    }
+    Assert-Equal ($startedBeforeSnapshotCleanupFailure + 1) $script:StartedPaths.Count 'cleanup failure occurs only after the child received a protected snapshot'
+    Assert-Equal $true $script:OOShutUpLastRunChanged 'a cleanup failure preserves O&O exit code 30 as an applied-settings result'
+    Assert-Equal $false ([string]$script:OpenedProfilePaths[0] -eq $script:OOShutUpProfilePath) 'cleanup failure never passes the source profile path to O&O'
+    $orphanedSnapshotDirectory = Split-Path -Parent ([string]$script:OpenedProfilePaths[0])
+    Assert-True ([string]::Join("`n", [string[]]$script:LogMessages.ToArray()).Contains("remove '$orphanedSnapshotDirectory' manually")) 'cleanup failure reports the exact protected snapshot path for manual recovery'
+    & $removeSnapshotFunction -Directory $orphanedSnapshotDirectory
 
     $script:StartedPaths.Clear()
     $script:StartedArguments.Clear()
@@ -918,6 +1221,23 @@ try {
     $oldTemp = $env:TEMP
     $env:TEMP = $script:FixtureRoot
     $script:ScheduledTaskLookupCount = 0
+    $savedTrustedPowerShellResolver = (Get-Command -Name Get-TrustedWindowsPowerShellExecutable -CommandType Function).ScriptBlock
+    Set-Item -Path Function:\Get-TrustedWindowsPowerShellExecutable -Value {
+        $script:MockPowerShellResolverCallCount++
+        if ($script:MockPowerShellResolverMode -eq 'Missing') {
+            return $null
+        }
+        $candidate = Get-WindowsPowerShellExecutablePaths -WindowsDirectory $script:MockWindowsPowerShellDirectory -Is64BitOperatingSystem $script:MockPowerShellContextIs64BitOperatingSystem -Is64BitProcess $script:MockPowerShellContextIs64BitProcess
+        if ($null -eq $candidate) {
+            return $null
+        }
+        $script:MockLastPowerShellInspectionPath = [string]$candidate.InspectionPath
+        if ($script:MockPowerShellResolverMode -eq 'Unexpected' -or
+            ($script:MockPowerShellResolverMode -eq 'ChangeAfterResolution' -and $script:MockPowerShellResolverCallCount -ge 2)) {
+            return [string]$script:MockPowerShellResolverChangedPath
+        }
+        return [string]$candidate.TaskPath
+    }
     try {
         [System.IO.Directory]::CreateDirectory($script:InstallPath) | Out-Null
         Write-TestPayload -Path $script:ManagedExecutablePath -Content 'VALID'
@@ -986,6 +1306,15 @@ try {
         Assert-Equal $registrationsBeforeWritableFile $script:TaskRegistrationCalls.Count 'a writable script file never registers a candidate task'
         $script:MockAclByPath.Remove($taskTargetPath) | Out-Null
 
+        $driveRootPath = [System.IO.Path]::GetPathRoot($taskScriptPath)
+        $script:MockAclByPath[[System.IO.Path]::GetFullPath($driveRootPath)] = New-MockAcl -Rules @(
+            $systemFullControl,
+            $administratorsFullControl,
+            (New-MockAclRule -Sid 'S-1-5-11' -Rights ([System.Security.AccessControl.FileSystemRights]::FullControl) -PropagationFlags ([System.Security.AccessControl.PropagationFlags]::InheritOnly))
+        )
+        Assert-Equal $true (Test-SystemTaskTargetAcl -ScriptPath $taskScriptPath) 'an inherit-only write entry on an ancestor does not count as access to that ancestor'
+        $script:MockAclByPath.Remove([System.IO.Path]::GetFullPath($driveRootPath)) | Out-Null
+
         $script:MockAclFailurePath = [System.IO.Path]::GetFullPath($taskScriptPath)
         $registrationsBeforeDeniedAcl = $script:TaskRegistrationCalls.Count
         $script:LogMessages.Clear()
@@ -995,13 +1324,26 @@ try {
         $script:MockAclFailurePath = $null
 
         Assert-Equal $true (Test-SystemTaskTargetAcl -ScriptPath $taskScriptPath) 'a safe temporary ACL fixture permits the target'
-        Assert-Equal $true (New-WindowsUpdateScheduledTask -ScriptPath $taskScriptPath -ApprovedProfileSha256 $taskProfile.Sha256 -ApprovedProfileManifestSha256 $taskProfile.ManifestSha256) 'a safe ACL fixture reaches mocked candidate and final task registration'
+        foreach ($mockedHost in @(
+            @{ Name = '64-bit'; Is64BitProcess = $true },
+            @{ Name = '32-bit'; Is64BitProcess = $false }
+        )) {
+            $script:MockPowerShellContextIs64BitOperatingSystem = $true
+            $script:MockPowerShellContextIs64BitProcess = [bool]$mockedHost.Is64BitProcess
+            $script:MockPowerShellResolverMode = 'Valid'
+            $script:MockPowerShellResolverCallCount = 0
+            $expectedMockedPaths = Get-WindowsPowerShellExecutablePaths -WindowsDirectory $script:MockWindowsPowerShellDirectory -Is64BitOperatingSystem $true -Is64BitProcess ([bool]$mockedHost.Is64BitProcess)
+            Assert-Equal $true (New-WindowsUpdateScheduledTask -ScriptPath $taskScriptPath -ApprovedProfileSha256 $taskProfile.Sha256 -ApprovedProfileManifestSha256 $taskProfile.ManifestSha256) "a safe ACL fixture registers the task under a mocked $($mockedHost.Name) host context"
+            $taskXmlPath = Join-Path $script:FixtureRoot 'OOShutUp10Task_Debug.xml'
+            [xml]$taskXml = [System.IO.File]::ReadAllText($taskXmlPath)
+            Assert-Equal ([string]$expectedMockedPaths.TaskPath) ([string]$taskXml.Task.Actions.Exec.Command) "the $($mockedHost.Name) host stores the canonical trusted Windows PowerShell path"
+            Assert-Equal ([string]$expectedMockedPaths.InspectionPath) ([string]$script:MockLastPowerShellInspectionPath) "the $($mockedHost.Name) host validates the architecture-correct system path"
+        }
         Assert-True ($script:TaskRegistrationCalls.Count -ge 2) 'candidate and final registration use mocked Task Scheduler commands'
-        $taskXmlPath = Join-Path $script:FixtureRoot 'OOShutUp10Task_Debug.xml'
-        [xml]$taskXml = [System.IO.File]::ReadAllText($taskXmlPath)
         $taskWorkingDirectory = $taskXml.Task.Actions.Exec.WorkingDirectory
         Assert-Equal (Split-Path -Parent $taskScriptPath) ([string]$taskWorkingDirectory) 'scheduled task uses the script package as its working directory'
         Assert-Equal 'S-1-5-18' ([string]$taskXml.Task.Principals.Principal.UserId) 'scheduled task runs under LocalSystem'
+        Assert-Equal $expectedNativeInterpreterPath ([string]$taskXml.Task.Actions.Exec.Command) 'the task command is a canonical absolute Windows PowerShell path'
         $taskArguments = [string]$taskXml.Task.Actions.Exec.Arguments
         Assert-True ($taskArguments.Contains("-File `"$taskScriptPath`"")) 'scheduled task invokes the script from the same package'
         Assert-True ($taskArguments -match '-ReapplyOnly') 'scheduled task preserves ReapplyOnly mode'
@@ -1021,19 +1363,95 @@ try {
         Assert-Equal 'Queue' ([string]$taskXml.Task.Settings.MultipleInstancesPolicy) 'scheduled task queues successful-update triggers behind an active reapply'
 
         $verifiedCurrentTask = New-MockScheduledTask -TaskName 'Install-OOShutUp10' -TaskPath '\myTech.Today\' -Xml $taskXml.OuterXml
-        Assert-Equal $true (Test-WindowsUpdateTaskDefinition -Task $verifiedCurrentTask -TaskPath '\myTech.Today\' -TaskName 'Install-OOShutUp10' -TaskDescription ([string]$taskXml.Task.RegistrationInfo.Description) -ScriptPath $taskScriptPath -ApprovedProfileSha256 $taskProfile.Sha256 -ApprovedProfileManifestSha256 $taskProfile.ManifestSha256 -ApprovedOOSExecutablePath $script:ManagedExecutablePath) 'task verification checks the success trigger and queue policy'
+        $taskVerifierParameters = @{
+            Task = $verifiedCurrentTask
+            TaskPath = '\myTech.Today\'
+            TaskName = 'Install-OOShutUp10'
+            TaskDescription = [string]$taskXml.Task.RegistrationInfo.Description
+            ScriptPath = $taskScriptPath
+            ApprovedProfileSha256 = $taskProfile.Sha256
+            ApprovedProfileManifestSha256 = $taskProfile.ManifestSha256
+            ApprovedOOSExecutablePath = $script:ManagedExecutablePath
+            TrustedPowerShellPath = $expectedNativeInterpreterPath
+        }
+        Assert-Equal $true (Test-WindowsUpdateTaskDefinition @taskVerifierParameters) 'task verification checks the canonical interpreter, success trigger, and queue policy'
+
+        $bareInterpreterDocument = New-Object System.Xml.XmlDocument
+        $bareInterpreterDocument.LoadXml($taskXml.OuterXml)
+        $bareInterpreterDocument.SelectSingleNode("/*[local-name()='Task']/*[local-name()='Actions']/*[local-name()='Exec']/*[local-name()='Command']").InnerText = 'PowerShell.exe'
+        $taskVerifierParameters.Task = New-MockScheduledTask -TaskName 'Install-OOShutUp10' -TaskPath '\myTech.Today\' -Xml $bareInterpreterDocument.OuterXml
+        Assert-Equal $false (Test-WindowsUpdateTaskDefinition @taskVerifierParameters) 'task verification rejects a bare PowerShell executable name'
+
+        $userWritableInterpreterDirectory = Join-Path $script:FixtureRoot 'user writable interpreter'
+        [System.IO.Directory]::CreateDirectory($userWritableInterpreterDirectory) | Out-Null
+        $userWritableInterpreterPath = Join-Path $userWritableInterpreterDirectory 'powershell.exe'
+        [System.IO.File]::WriteAllText($userWritableInterpreterPath, 'untrusted interpreter')
+        $script:MockAclByPath[[System.IO.Path]::GetFullPath($userWritableInterpreterPath)] = New-MockAcl -Rules @(
+            $systemFullControl,
+            $administratorsFullControl,
+            (New-MockAclRule -Sid 'S-1-5-11' -Rights ([System.Security.AccessControl.FileSystemRights]::Modify))
+        )
+        Assert-Equal $false (Test-SystemTaskTargetAcl -ScriptPath $userWritableInterpreterPath) 'the user-writable interpreter fixture fails the SYSTEM target ACL check'
+        $userWritableInterpreterDocument = New-Object System.Xml.XmlDocument
+        $userWritableInterpreterDocument.LoadXml($taskXml.OuterXml)
+        $userWritableInterpreterDocument.SelectSingleNode("/*[local-name()='Task']/*[local-name()='Actions']/*[local-name()='Exec']/*[local-name()='Command']").InnerText = [System.IO.Path]::GetFullPath($userWritableInterpreterPath)
+        $taskVerifierParameters.Task = New-MockScheduledTask -TaskName 'Install-OOShutUp10' -TaskPath '\myTech.Today\' -Xml $userWritableInterpreterDocument.OuterXml
+        Assert-Equal $false (Test-WindowsUpdateTaskDefinition @taskVerifierParameters) 'task verification rejects a user-writable interpreter path'
+        $script:MockAclByPath.Remove([System.IO.Path]::GetFullPath($userWritableInterpreterPath)) | Out-Null
+
+        $script:MockPowerShellResolverMode = 'Unexpected'
+        $script:MockPowerShellResolverChangedPath = $redirectedInterpreterPath
+        $taskVerifierParameters.Task = $verifiedCurrentTask
+        Assert-Equal $false (Test-WindowsUpdateTaskDefinition @taskVerifierParameters) 'task verification rejects an interpreter path that changed after resolution'
+        $script:MockPowerShellResolverMode = 'Valid'
+        $script:MockPowerShellResolverChangedPath = $null
+
+        $priorTaskXmlBeforeInterpreterFailures = [string]$script:TaskRegistry['\myTech.Today\|Install-OOShutUp10'].Definition
+        $registrationsBeforeInterpreterFailure = $script:TaskRegistrationCalls.Count
+        $unregistrationsBeforeInterpreterFailure = $script:TaskUnregistrationCalls.Count
+        $lookupsBeforeInterpreterFailure = $script:ScheduledTaskLookupCount
+        $script:LogMessages.Clear()
+        $script:MockPowerShellResolverMode = 'Missing'
+        Assert-Equal $false (New-WindowsUpdateScheduledTask -ScriptPath $taskScriptPath -ApprovedProfileSha256 $taskProfile.Sha256 -ApprovedProfileManifestSha256 $taskProfile.ManifestSha256) 'a missing trusted interpreter prevents task setup'
+        Assert-Equal $registrationsBeforeInterpreterFailure $script:TaskRegistrationCalls.Count 'a missing trusted interpreter does not register a validation task'
+        Assert-Equal $unregistrationsBeforeInterpreterFailure $script:TaskUnregistrationCalls.Count 'a missing trusted interpreter does not remove or replace the existing task'
+        Assert-Equal $lookupsBeforeInterpreterFailure $script:ScheduledTaskLookupCount 'a missing trusted interpreter fails before Task Scheduler inspection'
+        Assert-Equal $priorTaskXmlBeforeInterpreterFailures ([string]$script:TaskRegistry['\myTech.Today\|Install-OOShutUp10'].Definition) 'a missing trusted interpreter preserves the existing approved task'
+        Assert-True ((@($script:LogMessages.ToArray()) -join [Environment]::NewLine).Contains($script:OOShutUpTrustedPowerShellFailureMessage)) 'a missing trusted interpreter reports the exact no-change fallback'
+
+        $script:MockPowerShellResolverMode = 'ChangeAfterResolution'
+        $script:MockPowerShellResolverCallCount = 0
+        $script:MockPowerShellResolverChangedPath = $redirectedInterpreterPath
+        $script:LogMessages.Clear()
+        Assert-Equal $false (New-WindowsUpdateScheduledTask -ScriptPath $taskScriptPath -ApprovedProfileSha256 $taskProfile.Sha256 -ApprovedProfileManifestSha256 $taskProfile.ManifestSha256) 'an interpreter path change after resolution prevents task staging'
+        Assert-Equal $registrationsBeforeInterpreterFailure $script:TaskRegistrationCalls.Count 'an interpreter path change is detected before validation-task registration'
+        Assert-Equal $unregistrationsBeforeInterpreterFailure $script:TaskUnregistrationCalls.Count 'an interpreter path change performs no task rollback or removal'
+        Assert-Equal $priorTaskXmlBeforeInterpreterFailures ([string]$script:TaskRegistry['\myTech.Today\|Install-OOShutUp10'].Definition) 'an interpreter path change preserves the existing approved task'
+        Assert-True ((@($script:LogMessages.ToArray()) -join [Environment]::NewLine).Contains($script:OOShutUpTrustedPowerShellFailureMessage)) 'an interpreter path change reports the exact no-change fallback'
+
+        $script:MockPowerShellResolverMode = 'Unexpected'
+        $script:MockPowerShellResolverCallCount = 0
+        $script:LogMessages.Clear()
+        Assert-Equal $false (New-WindowsUpdateScheduledTask -ScriptPath $taskScriptPath -ApprovedProfileSha256 $taskProfile.Sha256 -ApprovedProfileManifestSha256 $taskProfile.ManifestSha256) 'a redirected interpreter resolution result is rejected before task staging'
+        Assert-Equal $registrationsBeforeInterpreterFailure $script:TaskRegistrationCalls.Count 'a redirected interpreter is never registered as a validation task'
+        Assert-Equal $priorTaskXmlBeforeInterpreterFailures ([string]$script:TaskRegistry['\myTech.Today\|Install-OOShutUp10'].Definition) 'a redirected interpreter result leaves the approved task unchanged'
+        Assert-True ((@($script:LogMessages.ToArray()) -join [Environment]::NewLine).Contains($script:OOShutUpTrustedPowerShellFailureMessage)) 'a redirected interpreter result reports the exact no-change fallback'
+        $script:MockPowerShellResolverMode = 'Valid'
+        $script:MockPowerShellResolverChangedPath = $null
 
         $ignoreNewDocument = New-Object System.Xml.XmlDocument
         $ignoreNewDocument.LoadXml($taskXml.OuterXml)
         $ignoreNewDocument.SelectSingleNode("/*[local-name()='Task']/*[local-name()='Settings']/*[local-name()='MultipleInstancesPolicy']").InnerText = 'IgnoreNew'
         $ignoreNewTask = New-MockScheduledTask -TaskName 'Install-OOShutUp10' -TaskPath '\myTech.Today\' -Xml $ignoreNewDocument.OuterXml
-        Assert-Equal $false (Test-WindowsUpdateTaskDefinition -Task $ignoreNewTask -TaskPath '\myTech.Today\' -TaskName 'Install-OOShutUp10' -TaskDescription ([string]$taskXml.Task.RegistrationInfo.Description) -ScriptPath $taskScriptPath -ApprovedProfileSha256 $taskProfile.Sha256 -ApprovedProfileManifestSha256 $taskProfile.ManifestSha256 -ApprovedOOSExecutablePath $script:ManagedExecutablePath) 'IgnoreNew is rejected as an unsafe current task definition'
+        $taskVerifierParameters.Task = $ignoreNewTask
+        Assert-Equal $false (Test-WindowsUpdateTaskDefinition @taskVerifierParameters) 'IgnoreNew is rejected as an unsafe current task definition'
 
         $startAndSuccessDocument = New-Object System.Xml.XmlDocument
         $startAndSuccessDocument.LoadXml($taskXml.OuterXml)
         $startAndSuccessDocument.SelectSingleNode("/*[local-name()='Task']/*[local-name()='Triggers']/*[local-name()='EventTrigger']/*[local-name()='Subscription']").InnerText = '<QueryList><Query Id="0" Path="System"><Select Path="System">*[System[Provider[@Name=''Microsoft-Windows-WindowsUpdateClient''] and (EventID=19 or EventID=43)]]</Select></Query></QueryList>'
         $startAndSuccessTask = New-MockScheduledTask -TaskName 'Install-OOShutUp10' -TaskPath '\myTech.Today\' -Xml $startAndSuccessDocument.OuterXml
-        Assert-Equal $false (Test-WindowsUpdateTaskDefinition -Task $startAndSuccessTask -TaskPath '\myTech.Today\' -TaskName 'Install-OOShutUp10' -TaskDescription ([string]$taskXml.Task.RegistrationInfo.Description) -ScriptPath $taskScriptPath -ApprovedProfileSha256 $taskProfile.Sha256 -ApprovedProfileManifestSha256 $taskProfile.ManifestSha256 -ApprovedOOSExecutablePath $script:ManagedExecutablePath) 'the old start-and-success trigger is rejected as a current task definition'
+        $taskVerifierParameters.Task = $startAndSuccessTask
+        Assert-Equal $false (Test-WindowsUpdateTaskDefinition @taskVerifierParameters) 'the old start-and-success trigger is rejected as a current task definition'
 
         $noEventRuns = @(Invoke-MockUpdateTaskSchedule -TaskDefinition $taskXml -EventIds @())
         $failureEventRuns = @(Invoke-MockUpdateTaskSchedule -TaskDefinition $taskXml -EventIds @(20))
@@ -1055,6 +1473,8 @@ try {
 
         $legacyTaskDocument = New-Object System.Xml.XmlDocument
         $legacyTaskDocument.LoadXml($taskXml.OuterXml)
+        $legacyCommand = $legacyTaskDocument.SelectSingleNode("/*[local-name()='Task']/*[local-name()='Actions']/*[local-name()='Exec']/*[local-name()='Command']")
+        $legacyCommand.InnerText = 'PowerShell.exe'
         $legacyArguments = $legacyTaskDocument.SelectSingleNode("/*[local-name()='Task']/*[local-name()='Actions']/*[local-name()='Exec']/*[local-name()='Arguments']")
         $legacyArguments.InnerText = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $taskScriptPath + '" -ReapplyOnly -SkipRelocate'
         $legacyWorkingDirectory = $legacyTaskDocument.SelectSingleNode("/*[local-name()='Task']/*[local-name()='Actions']/*[local-name()='Exec']/*[local-name()='WorkingDirectory']")
@@ -1066,10 +1486,18 @@ try {
 
         $previousApprovedTaskDocument = New-Object System.Xml.XmlDocument
         $previousApprovedTaskDocument.LoadXml($taskXml.OuterXml)
+        $previousApprovedCommand = $previousApprovedTaskDocument.SelectSingleNode("/*[local-name()='Task']/*[local-name()='Actions']/*[local-name()='Exec']/*[local-name()='Command']")
+        $previousApprovedCommand.InnerText = 'PowerShell.exe'
         $previousApprovedTaskArguments = $previousApprovedTaskDocument.SelectSingleNode("/*[local-name()='Task']/*[local-name()='Actions']/*[local-name()='Exec']/*[local-name()='Arguments']")
         $previousApprovedTaskArguments.InnerText = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $taskScriptPath + '" -ReapplyOnly -SkipRelocate -NonInteractive -ApprovedProfileSha256 ' + $taskProfile.Sha256 + ' -ApprovedProfileManifestSha256 ' + $taskProfile.ManifestSha256
         $previousApprovedTask = New-MockScheduledTask -TaskName 'Install-OOShutUp10' -TaskPath '\myTech.Today\' -Xml $previousApprovedTaskDocument.OuterXml
         Assert-Equal $true (Test-WindowsUpdateLegacyTaskDefinition -Task $previousApprovedTask -TaskPath '\myTech.Today\' -TaskName 'Install-OOShutUp10' -TaskDescription ([string]$taskXml.Task.RegistrationInfo.Description) -ScriptPath $taskScriptPath -ApprovedProfileSha256 $taskProfile.Sha256 -ApprovedProfileManifestSha256 $taskProfile.ManifestSha256) 'the previous approved task definition remains eligible for safe replacement with the pinned executable path'
+
+        $unexpectedLegacyDocument = New-Object System.Xml.XmlDocument
+        $unexpectedLegacyDocument.LoadXml($previousApprovedTaskDocument.OuterXml)
+        $unexpectedLegacyDocument.SelectSingleNode("/*[local-name()='Task']/*[local-name()='Actions']/*[local-name()='Exec']/*[local-name()='Command']").InnerText = $redirectedInterpreterPath
+        $unexpectedLegacyTask = New-MockScheduledTask -TaskName 'Install-OOShutUp10' -TaskPath '\myTech.Today\' -Xml $unexpectedLegacyDocument.OuterXml
+        Assert-Equal $false (Test-WindowsUpdateLegacyTaskDefinition -Task $unexpectedLegacyTask -TaskPath '\myTech.Today\' -TaskName 'Install-OOShutUp10' -TaskDescription ([string]$taskXml.Task.RegistrationInfo.Description) -ScriptPath $taskScriptPath -ApprovedProfileSha256 $taskProfile.Sha256 -ApprovedProfileManifestSha256 $taskProfile.ManifestSha256) 'legacy migration rejects an unexpected interpreter path even when the task identity matches'
 
         $foreignTaskDocument = New-Object System.Xml.XmlDocument
         $foreignTaskDocument.LoadXml($taskXml.OuterXml)
@@ -1108,6 +1536,125 @@ try {
         Assert-True ($ownershipLog.Contains("Removing verified owned scheduled task '\myTech.Today\Install-OOShutUp10'")) 'the exact owned path is logged before removal'
         Assert-True ($ownershipLog.Contains("Leaving same-named task '\Backup\Install-OOShutUp10' unchanged")) 'the foreign backup path is logged with an operator instruction'
         Assert-True ($ownershipLog.Contains("Leaving same-named task '\Security\Install-OOShutUp10' unchanged")) 'the foreign security path is logged with an operator instruction'
+
+        $script:TaskRegistry.Clear()
+        $script:TaskSecurityDescriptorByIdentity.Clear()
+        $script:TaskRegistrationCalls.Clear()
+        $script:TaskUnregistrationCalls.Clear()
+        $script:TaskSecurityDescriptorReadCalls.Clear()
+        $script:TaskSecurityDescriptorSetCalls.Clear()
+        $script:TaskEnabledCalls.Clear()
+        $script:TaskRegistry['\myTech.Today\|Install-OOShutUp10'] = $oldTask
+        $script:TaskRegistry['\Backup\|Install-OOShutUp10'] = $foreignTask
+        $script:TaskSecurityDescriptorByIdentity['\myTech.Today\|Install-OOShutUp10'] = $script:OOShutUpTaskSecurityDescriptorSddl
+        $script:MockTaskSecurityDescriptorScenario = 'Normal'
+        Assert-Equal $true (New-WindowsUpdateScheduledTask -ScriptPath $taskScriptPath -ApprovedProfileSha256 $taskProfile.Sha256 -ApprovedProfileManifestSha256 $taskProfile.ManifestSha256) 'a prior task with the documented descriptor can be replaced'
+        $stagedDescriptorSet = @($script:TaskSecurityDescriptorSetCalls | Where-Object { $_.TaskName -like 'Install-OOShutUp10-validation-*' })
+        $stagedDescriptorRead = @($script:TaskSecurityDescriptorReadCalls | Where-Object { $_.TaskName -like 'Install-OOShutUp10-validation-*' })
+        $finalDescriptorSet = @($script:TaskSecurityDescriptorSetCalls | Where-Object { $_.TaskName -eq 'Install-OOShutUp10' })
+        $finalDescriptorRead = @($script:TaskSecurityDescriptorReadCalls | Where-Object { $_.TaskName -eq 'Install-OOShutUp10' })
+        Assert-Equal 1 $stagedDescriptorSet.Count 'the disabled staging task receives the documented ACL'
+        Assert-True ($stagedDescriptorRead.Count -ge 1) 'the disabled staging task descriptor is read back'
+        Assert-Equal 1 $finalDescriptorSet.Count 'the disabled final task receives the documented ACL'
+        Assert-True ($finalDescriptorRead.Count -ge 3) 'the final task descriptor is read back before and after enabling, in addition to the prior-task snapshot'
+        Assert-Equal 1 @($script:TaskEnabledCalls | Where-Object { $_.TaskName -eq 'Install-OOShutUp10' -and $_.Enabled }).Count 'the verified final task is enabled only after descriptor checks'
+        Assert-Equal $foreignTaskXml ([string]$script:TaskRegistry['\Backup\|Install-OOShutUp10'].Definition) 'descriptor verification leaves a same-named task outside the owned path unchanged'
+
+        foreach ($descriptorFailure in @('ReadDeniedOnOwnedTask', 'MalformedOnOwnedTask')) {
+            $script:TaskRegistry.Clear()
+            $script:TaskSecurityDescriptorByIdentity.Clear()
+            $script:TaskRegistrationCalls.Clear()
+            $script:TaskUnregistrationCalls.Clear()
+            $script:TaskRegistry['\myTech.Today\|Install-OOShutUp10'] = $oldTask
+            $script:TaskRegistry['\Backup\|Install-OOShutUp10'] = $foreignTask
+            $script:MockTaskSecurityDescriptorScenario = $descriptorFailure
+            $script:LogMessages.Clear()
+            Assert-Equal $false (New-WindowsUpdateScheduledTask -ScriptPath $taskScriptPath -ApprovedProfileSha256 $taskProfile.Sha256 -ApprovedProfileManifestSha256 $taskProfile.ManifestSha256) "$descriptorFailure on the prior task fails closed"
+            Assert-Equal 0 $script:TaskRegistrationCalls.Count "$descriptorFailure does not register a candidate"
+            Assert-Equal 0 $script:TaskUnregistrationCalls.Count "$descriptorFailure does not remove any task"
+            Assert-Equal $oldTaskXml ([string]$script:TaskRegistry['\myTech.Today\|Install-OOShutUp10'].Definition) "$descriptorFailure preserves the existing owned task"
+            Assert-Equal $foreignTaskXml ([string]$script:TaskRegistry['\Backup\|Install-OOShutUp10'].Definition) "$descriptorFailure preserves the same-named task outside the exact owned path"
+            Assert-True ((@($script:LogMessages.ToArray()) -join [Environment]::NewLine).Contains($script:OOShutUpTaskSecurityDescriptorFailureMessage)) "$descriptorFailure uses the exact descriptor fallback"
+        }
+
+        foreach ($descriptorFailure in @('ReadDeniedOnStage', 'MalformedOnStage')) {
+            $script:TaskRegistry.Clear()
+            $script:TaskSecurityDescriptorByIdentity.Clear()
+            $script:TaskRegistrationCalls.Clear()
+            $script:TaskUnregistrationCalls.Clear()
+            $script:TaskRegistry['\myTech.Today\|Install-OOShutUp10'] = $oldTask
+            $script:TaskRegistry['\Backup\|Install-OOShutUp10'] = $foreignTask
+            $script:TaskSecurityDescriptorByIdentity['\myTech.Today\|Install-OOShutUp10'] = $script:OOShutUpTaskSecurityDescriptorSddl
+            $script:MockTaskSecurityDescriptorScenario = $descriptorFailure
+            $script:MockTaskSecurityDescriptorReplacementInjected = $false
+            $script:LogMessages.Clear()
+            Assert-Equal $false (New-WindowsUpdateScheduledTask -ScriptPath $taskScriptPath -ApprovedProfileSha256 $taskProfile.Sha256 -ApprovedProfileManifestSha256 $taskProfile.ManifestSha256) "$descriptorFailure on the staging task fails closed"
+            Assert-Equal $oldTaskXml ([string]$script:TaskRegistry['\myTech.Today\|Install-OOShutUp10'].Definition) "$descriptorFailure on staging leaves the prior task unchanged"
+            Assert-Equal 1 @($script:TaskUnregistrationCalls | Where-Object { $_.TaskPath -eq '\myTech.Today\' -and $_.TaskName -like 'Install-OOShutUp10-validation-*' }).Count "$descriptorFailure cleans only the exact disabled staging task"
+            Assert-Equal 0 @($script:TaskUnregistrationCalls | Where-Object { $_.TaskPath -ne '\myTech.Today\' }).Count "$descriptorFailure never unregisters a same-named task outside the owned folder"
+            Assert-Equal $foreignTaskXml ([string]$script:TaskRegistry['\Backup\|Install-OOShutUp10'].Definition) "$descriptorFailure preserves the foreign same-named task"
+            Assert-True ((@($script:LogMessages.ToArray()) -join [Environment]::NewLine).Contains($script:OOShutUpTaskSecurityDescriptorFailureMessage)) "$descriptorFailure on staging uses the exact descriptor fallback"
+        }
+
+        foreach ($descriptorFailure in @('UnexpectedOnFinal', 'UnprovenOnFinal')) {
+            $script:TaskRegistry.Clear()
+            $script:TaskSecurityDescriptorByIdentity.Clear()
+            $script:TaskRegistrationCalls.Clear()
+            $script:TaskUnregistrationCalls.Clear()
+            $script:TaskEnabledCalls.Clear()
+            $script:TaskRegistry['\myTech.Today\|Install-OOShutUp10'] = $oldTask
+            $script:TaskRegistry['\Backup\|Install-OOShutUp10'] = $foreignTask
+            $script:TaskSecurityDescriptorByIdentity['\myTech.Today\|Install-OOShutUp10'] = $script:OOShutUpTaskSecurityDescriptorSddl
+            $script:MockTaskSecurityDescriptorScenario = $descriptorFailure
+            $script:MockTaskSecurityDescriptorReplacementInjected = $false
+            $script:LogMessages.Clear()
+            $descriptorSetup = Invoke-OOShutUpTaskSetup -ScriptPath $taskScriptPath -ApprovedProfileSha256 $taskProfile.Sha256 -ApprovedProfileManifestSha256 $taskProfile.ManifestSha256
+            $descriptorOutcome = Get-OOShutUpInstallOutcome -SettingsVerified $true -RestorePointVerified $true -RestorePointOverrideUsed $false -TaskSetup $descriptorSetup
+            Assert-Equal $false $descriptorSetup.Verified "$descriptorFailure cannot produce verified task setup"
+            Assert-Equal 'Partial' $descriptorOutcome.Status "$descriptorFailure cannot report Complete"
+            Assert-Equal 2 $descriptorOutcome.ExitCode "$descriptorFailure returns the existing partial exit code"
+            Assert-Equal $script:OOShutUpPartialSetupMessage $descriptorOutcome.Summary "$descriptorFailure reports the existing partial summary instead of Complete"
+            Assert-True ((@($script:LogMessages.ToArray()) -join [Environment]::NewLine).Contains($script:OOShutUpTaskSecurityDescriptorFailureMessage)) "$descriptorFailure uses the exact descriptor fallback"
+            Assert-Equal $foreignTaskXml ([string]$script:TaskRegistry['\Backup\|Install-OOShutUp10'].Definition) "$descriptorFailure leaves the foreign same-named task unchanged"
+            if ($descriptorFailure -eq 'UnexpectedOnFinal') {
+                Assert-Equal $oldTaskXml ([string]$script:TaskRegistry['\myTech.Today\|Install-OOShutUp10'].Definition) 'a permissive final descriptor restores the exact prior task definition'
+                Assert-Equal $script:OOShutUpTaskSecurityDescriptorSddl ([string]$script:TaskSecurityDescriptorByIdentity['\myTech.Today\|Install-OOShutUp10']) 'rollback restores the exact prior task descriptor'
+                Assert-Equal 1 @($script:TaskEnabledCalls | Where-Object { $_.TaskName -eq 'Install-OOShutUp10' -and $_.Enabled }).Count 'rollback re-enables only the prior verified task'
+                Assert-Equal 0 @(Get-ChildItem -LiteralPath $taskScriptDirectory -Filter '.Install-OOShutUp10-task-rollback-*.sddl').Count 'verified rollback removes its protected descriptor backup'
+            }
+            else {
+                Assert-Equal '-UnrecognizedAction' ([string]$script:TaskRegistry['\myTech.Today\|Install-OOShutUp10'].Actions[0].Arguments) 'rollback preserves a task whose ownership became ambiguous'
+                Assert-Equal 1 @($script:TaskUnregistrationCalls | Where-Object { $_.TaskPath -eq '\myTech.Today\' -and $_.TaskName -eq 'Install-OOShutUp10' }).Count 'ambiguous ownership is not unregistered after the original replacement removal'
+                Assert-Equal 0 $script:TaskEnabledCalls.Count 'an unverified replacement remains disabled when ownership is ambiguous'
+                Assert-Equal 1 @(Get-ChildItem -LiteralPath $taskScriptDirectory -Filter '.Install-OOShutUp10-task-rollback-*.xml').Count 'ambiguous rollback retains the protected prior task XML'
+                Assert-Equal 1 @(Get-ChildItem -LiteralPath $taskScriptDirectory -Filter '.Install-OOShutUp10-task-rollback-*.sddl').Count 'ambiguous rollback retains the protected prior descriptor'
+            }
+        }
+        $script:MockTaskSecurityDescriptorScenario = 'Normal'
+        $script:TaskRegistry.Clear()
+        $script:TaskSecurityDescriptorByIdentity.Clear()
+        $script:TaskRegistrationCalls.Clear()
+        $script:TaskUnregistrationCalls.Clear()
+        $script:TaskEnabledCalls.Clear()
+        $script:TaskRegistry['\myTech.Today\|Install-OOShutUp10'] = New-MockScheduledTask -TaskName 'Install-OOShutUp10' -TaskPath '\myTech.Today\' -Xml $taskXml.OuterXml
+        $script:TaskSecurityDescriptorByIdentity['\myTech.Today\|Install-OOShutUp10'] = $script:OOShutUpTaskSecurityDescriptorSddl
+        $script:MockTaskSecurityDescriptorScenario = 'UnexpectedOnFinal'
+        $script:MockTaskSecurityDescriptorReplacementInjected = $false
+        $sameXmlFailureSetup = Invoke-OOShutUpTaskSetup -ScriptPath $taskScriptPath -ApprovedProfileSha256 $taskProfile.Sha256 -ApprovedProfileManifestSha256 $taskProfile.ManifestSha256
+        Assert-Equal $false $sameXmlFailureSetup.Verified 'an unexpected descriptor is rejected when prior and replacement task XML are identical'
+        Assert-Equal $taskXml.OuterXml ([string]$script:TaskRegistry['\myTech.Today\|Install-OOShutUp10'].Definition) 'same-XML rollback restores the prior task definition'
+        Assert-Equal $script:OOShutUpTaskSecurityDescriptorSddl ([string]$script:TaskSecurityDescriptorByIdentity['\myTech.Today\|Install-OOShutUp10']) 'same-XML rollback restores the prior descriptor instead of accepting the permissive replacement'
+        Assert-Equal 2 @($script:TaskUnregistrationCalls | Where-Object { $_.TaskPath -eq '\myTech.Today\' -and $_.TaskName -eq 'Install-OOShutUp10' }).Count 'same-XML rollback removes the old task and then the rejected replacement at the exact path'
+        Assert-Equal 1 @($script:TaskEnabledCalls | Where-Object { $_.TaskName -eq 'Install-OOShutUp10' -and $_.Enabled }).Count 'same-XML rollback enables only the restored prior task'
+        $script:MockTaskSecurityDescriptorScenario = 'Normal'
+        $script:MockTaskSecurityDescriptorReplacementInjected = $false
+        $script:TaskSecurityDescriptorByIdentity.Clear()
+        foreach ($rollbackFile in @(Get-ChildItem -LiteralPath $taskScriptDirectory -Filter '.Install-OOShutUp10-task-rollback-*.xml')) {
+            Remove-Item -LiteralPath $rollbackFile.FullName -Force
+        }
+        foreach ($rollbackFile in @(Get-ChildItem -LiteralPath $taskScriptDirectory -Filter '.Install-OOShutUp10-task-rollback-*.sddl')) {
+            Remove-Item -LiteralPath $rollbackFile.FullName -Force
+        }
 
         $script:TaskRegistry.Clear()
         $script:TaskRegistrationCalls.Clear()
@@ -1236,20 +1783,26 @@ try {
         $script:TaskRegistry['\myTech.Today\|Install-OOShutUp10'] = $oldTask
         $script:FailTaskVerification = $true
         $script:FailTaskRestore = $true
-        $script:FailTaskRestoreXml = $oldTaskXml
+        $restoreFailureDocument = New-Object System.Xml.XmlDocument
+        $restoreFailureDocument.LoadXml($oldTaskXml)
+        $restoreFailureDocument.SelectSingleNode("/*[local-name()='Task']/*[local-name()='Settings']/*[local-name()='Enabled']").InnerText = 'false'
+        $script:FailTaskRestoreXml = $restoreFailureDocument.OuterXml
         $script:LogMessages.Clear()
         Assert-Equal $false (New-WindowsUpdateScheduledTask -ScriptPath $taskScriptPath -ApprovedProfileSha256 $taskProfile.Sha256 -ApprovedProfileManifestSha256 $taskProfile.ManifestSha256) 'a failed automatic rollback reports failure'
         $retainedRollbackFiles = @(Get-ChildItem -LiteralPath $taskScriptDirectory -Filter '.Install-OOShutUp10-task-rollback-*.xml')
         Assert-Equal 1 $retainedRollbackFiles.Count 'failed automatic rollback retains the protected task definition export'
+        $retainedDescriptorFiles = @(Get-ChildItem -LiteralPath $taskScriptDirectory -Filter '.Install-OOShutUp10-task-rollback-*.sddl')
+        Assert-Equal 1 $retainedDescriptorFiles.Count 'failed automatic rollback retains the protected task descriptor export'
         $rollbackFailureLog = [string]::Join("`n", [string[]]$script:LogMessages.ToArray())
-        Assert-True ($rollbackFailureLog.Contains('Register-ScheduledTask -TaskName <name> -TaskPath <path>')) 'failed automatic rollback reports a manual recovery command'
-        Assert-True ($rollbackFailureLog.Contains($retainedRollbackFiles[0].FullName) -and $rollbackFailureLog.Contains('\myTech.Today\Install-OOShutUp10')) 'failed automatic rollback logs the backup and original task identity'
+        Assert-True ($rollbackFailureLog.Contains('RegisteredTask.SetSecurityDescriptor')) 'failed automatic rollback reports how to restore the task descriptor'
+        Assert-True ($rollbackFailureLog.Contains($retainedRollbackFiles[0].FullName) -and $rollbackFailureLog.Contains($retainedDescriptorFiles[0].FullName) -and $rollbackFailureLog.Contains('\myTech.Today\Install-OOShutUp10')) 'failed automatic rollback logs both backups and the original task identity'
         Assert-True (-not $script:TaskRegistry.ContainsKey('\myTech.Today\|Install-OOShutUp10')) 'failed automatic rollback does not leave an unverified SYSTEM task registered'
         $script:FailTaskVerification = $false
         $script:FailTaskRestore = $false
         $script:FailTaskRestoreXml = $null
     }
     finally {
+        Set-Item -Path Function:\Get-TrustedWindowsPowerShellExecutable -Value $savedTrustedPowerShellResolver
         $env:TEMP = $oldTemp
     }
 
