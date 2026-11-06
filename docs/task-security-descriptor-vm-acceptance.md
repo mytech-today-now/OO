@@ -1,8 +1,8 @@
-# Issue 03: Task Scheduler security descriptor acceptance on a disposable VM
+# Issue 02: Task Scheduler security descriptor acceptance on a disposable VM
 
 ## Scope
 
-This acceptance checks the Windows Task Scheduler round trip for harmless SYSTEM tasks and tests access from a separate standard account. It does not run `Install-OOShutUp10.ps1`, O&O ShutUp10++, Windows Update, or the production task at `\myTech.Today\Install-OOShutUp10`. Use only the dedicated paths `\Issue03Validation\` and `\Issue03Foreign\` below. The foreign task has the same leaf name as the validation task so the record can show that exact-path operations leave it unchanged.
+This acceptance checks the Windows Task Scheduler round trip for harmless SYSTEM tasks and tests access from a separate standard account. It does not run `Install-OOShutUp10.ps1`, O&O ShutUp10++, Windows Update, or the production task at `\myTech.Today\Install-OOShutUp10`. Use only the dedicated paths `\Issue02Validation\` and `\Issue02Foreign\` below. The foreign task has the same leaf name as the validation task so the record can show that exact-path operations leave it unchanged.
 
 The offline test `tests/test-ooshutup-payload-trust.ps1` remains the evidence for the installer's mismatch handling, replacement, rollback, and retained recovery files. This VM procedure separately records live Task Scheduler API behavior for harmless tasks. It does not verify a production installer run; that result must be recorded separately. A mocked pass does not count as a live VM result.
 
@@ -22,8 +22,8 @@ Use Task Scheduler's scripting API from elevated PowerShell. The task has no tri
 $service = New-Object -ComObject 'Schedule.Service'
 $service.Connect()
 $rootFolder = $service.GetFolder('\')
-$validationFolder = $rootFolder.CreateFolder('Issue03Validation', $null)
-$foreignFolder = $rootFolder.CreateFolder('Issue03Foreign', $null)
+$validationFolder = $rootFolder.CreateFolder('Issue02Validation', $null)
+$foreignFolder = $rootFolder.CreateFolder('Issue02Foreign', $null)
 $taskName = 'HarmlessDescriptorProbe'
 $expectedSddl = 'O:BAG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)'
 $mismatchedSddl = 'O:BAG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;AU)'
@@ -48,11 +48,11 @@ function New-HarmlessTaskDefinition {
 }
 
 $validationTask = $validationFolder.RegisterTaskDefinition(
-    $taskName, (New-HarmlessTaskDefinition 'Issue 03 harmless descriptor validation'),
+    $taskName, (New-HarmlessTaskDefinition 'Issue 02 harmless descriptor validation'),
     0x2, 'SYSTEM', $null, 5, $null
 )
 $foreignTask = $foreignFolder.RegisterTaskDefinition(
-    $taskName, (New-HarmlessTaskDefinition 'Issue 03 foreign same-name sentinel'),
+    $taskName, (New-HarmlessTaskDefinition 'Issue 02 foreign same-name sentinel'),
     0x2, 'SYSTEM', $null, 5, $null
 )
 $foreignBefore = [pscustomobject]@{
@@ -71,7 +71,7 @@ The owner/group/DACL contract is `O:BAG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)`: owner SI
 Use this structural check for each readback. It allows the API to format the SDDL string differently while requiring the exact owner, group, protected DACL, and ACE set enforced by the installer:
 
 ```powershell
-function Test-Issue03TaskDescriptor {
+function Test-Issue02TaskDescriptor {
     param([string]$Sddl)
 
     try {
@@ -117,7 +117,7 @@ $validationTask.SetSecurityDescriptor($expectedSddl, 0x10)
 $beforeEnableSddl = [string]$validationTask.GetSecurityDescriptor(7)
 $beforeEnableEnabled = [bool]$validationTask.Enabled
 $beforeEnableXml = [string]$validationTask.Definition.XmlText
-if (-not (Test-Issue03TaskDescriptor $beforeEnableSddl) -or $beforeEnableEnabled) {
+if (-not (Test-Issue02TaskDescriptor $beforeEnableSddl) -or $beforeEnableEnabled) {
     throw 'The descriptor or disabled-state check failed; keep the validation task disabled.'
 }
 
@@ -152,7 +152,7 @@ $mismatchReadback = [string]$validationTask.GetSecurityDescriptor(7)
 if ($validationTask.Enabled) {
     throw 'The candidate became enabled during the mismatch case; mark the VM case Failed.'
 }
-if (Test-Issue03TaskDescriptor $mismatchReadback) {
+if (Test-Issue02TaskDescriptor $mismatchReadback) {
     Write-Warning 'Task Scheduler did not preserve the injected mismatch; record this mismatch case as Not run.'
 }
 else {
@@ -165,14 +165,14 @@ After recording that result, restore `$expectedSddl`, read it back, and repeat t
 ```powershell
 $validationTask.SetSecurityDescriptor($expectedSddl, 0x10)
 $preEnableReadback = [string]$validationTask.GetSecurityDescriptor(7)
-if (-not (Test-Issue03TaskDescriptor $preEnableReadback) -or $validationTask.Enabled) {
+if (-not (Test-Issue02TaskDescriptor $preEnableReadback) -or $validationTask.Enabled) {
     throw 'The restored descriptor or disabled-state check failed; keep the task disabled.'
 }
 # Confirm the action and LocalSystem principal again before this line.
 $validationTask.Enabled = $true
 $afterEnableSddl = [string]$validationTask.GetSecurityDescriptor(7)
 $afterEnableEnabled = [bool]$validationTask.Enabled
-if (-not (Test-Issue03TaskDescriptor $afterEnableSddl) -or -not $afterEnableEnabled) {
+if (-not (Test-Issue02TaskDescriptor $afterEnableSddl) -or -not $afterEnableEnabled) {
     throw 'The after-enable descriptor or enabled-state check failed.'
 }
 ```
@@ -184,7 +184,7 @@ Disable the validation task again before the standard-account probes. Confirm it
 ```powershell
 $validationTask.Enabled = $false
 $postEnableDisabledSddl = [string]$validationTask.GetSecurityDescriptor(7)
-if ($validationTask.Enabled -or -not (Test-Issue03TaskDescriptor $postEnableDisabledSddl)) {
+if ($validationTask.Enabled -or -not (Test-Issue02TaskDescriptor $postEnableDisabledSddl)) {
     throw 'The validation task did not return to a disabled state with the approved descriptor.'
 }
 ```
@@ -196,8 +196,8 @@ This test checks real access on the guest instead of inferring effective access 
 ```powershell
 $service = New-Object -ComObject 'Schedule.Service'
 $service.Connect()
-$validationFolder = $service.GetFolder('\Issue03Validation\')
-$foreignFolder = $service.GetFolder('\Issue03Foreign\')
+$validationFolder = $service.GetFolder('\Issue02Validation\')
+$foreignFolder = $service.GetFolder('\Issue02Foreign\')
 $taskName = 'HarmlessDescriptorProbe'
 $userSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $userWriteAttempt = "O:${userSid}G:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;AU)"
@@ -227,14 +227,14 @@ For a permissive positive control, return to the elevated session and apply `$mi
 ```powershell
 $service = New-Object -ComObject 'Schedule.Service'
 $service.Connect()
-$validationTask = $service.GetFolder('\Issue03Validation\').GetTask('HarmlessDescriptorProbe')
+$validationTask = $service.GetFolder('\Issue02Validation\').GetTask('HarmlessDescriptorProbe')
 $userSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $userChangedSddl = "O:${userSid}G:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)"
 $validationTask.SetSecurityDescriptor($userChangedSddl, 0x10)
 Write-Output 'The standard account changed the deliberately permissive fixture descriptor.'
 ```
 
-Return to the elevated session, capture the resulting descriptor, confirm the task stayed disabled, then restore `$expectedSddl` and verify it with `Test-Issue03TaskDescriptor`. This positive control must succeed for the access probe to count as validated. If it is denied, record the standard-account access result as **Not run** and investigate the guest policy. Never enable either fixture to test access.
+Return to the elevated session, capture the resulting descriptor, confirm the task stayed disabled, then restore `$expectedSddl` and verify it with `Test-Issue02TaskDescriptor`. This positive control must succeed for the access probe to count as validated. If it is denied, record the standard-account access result as **Not run** and investigate the guest policy. Never enable either fixture to test access.
 
 ## Rollback and foreign-task checks
 
@@ -250,10 +250,10 @@ Return to the elevated session, capture the resulting descriptor, confirm the ta
    [System.IO.File]::WriteAllText($rollbackSddlPath, $rollbackSddl)
    ```
 
-2. Replace only `\Issue03Validation\HarmlessDescriptorProbe` with a disabled harmless candidate using the Task Scheduler API. Inject the mismatched descriptor and verify the candidate remains disabled.
+2. Replace only `\Issue02Validation\HarmlessDescriptorProbe` with a disabled harmless candidate using the Task Scheduler API. Inject the mismatched descriptor and verify the candidate remains disabled.
 
    ```powershell
-   $candidateDefinition = New-HarmlessTaskDefinition 'Issue 03 injected rollback candidate'
+   $candidateDefinition = New-HarmlessTaskDefinition 'Issue 02 injected rollback candidate'
    $candidateTask = $validationFolder.RegisterTaskDefinition(
        $taskName, $candidateDefinition, 0x6, 'SYSTEM', $null, 5, $null
    )
@@ -262,7 +262,7 @@ Return to the elevated session, capture the resulting descriptor, confirm the ta
    if ($candidateTask.Enabled) {
        throw 'The rollback candidate became enabled during the mismatch case.'
    }
-   if (Test-Issue03TaskDescriptor $candidateMismatch) {
+   if (Test-Issue02TaskDescriptor $candidateMismatch) {
        Write-Warning 'Task Scheduler did not preserve the rollback-candidate mismatch; record this case as Not run.'
    }
    else {
@@ -285,7 +285,7 @@ Return to the elevated session, capture the resulting descriptor, confirm the ta
    $restoredTask.SetSecurityDescriptor($rollbackSddl, 0x10)
    $restoredTask.SetSecurityDescriptor($mismatchedSddl, 0x10) # forced readback mismatch
    $rollbackReadback = [string]$restoredTask.GetSecurityDescriptor(7)
-   $uncertainRollback = -not (Test-Issue03TaskDescriptor $rollbackReadback)
+   $uncertainRollback = -not (Test-Issue02TaskDescriptor $rollbackReadback)
    $backupFilesUnchanged =
        [System.IO.File]::ReadAllText($rollbackXmlPath) -ceq $rollbackXml -and
        [System.IO.File]::ReadAllText($rollbackSddlPath) -ceq $rollbackSddl

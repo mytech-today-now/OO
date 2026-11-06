@@ -725,6 +725,7 @@ try {
     $targetAclPosition = $taskFunctionSource.IndexOf('Test-SystemTaskTargetAcl -ScriptPath $ScriptPath', [System.StringComparison]::Ordinal)
     $taskLookupPosition = $taskFunctionSource.IndexOf('$existingTasks = @(Get-ScheduledTask', [System.StringComparison]::Ordinal)
     Assert-True ($taskApprovalPosition -ge 0 -and $pathCanonicalizationPosition -gt $taskApprovalPosition -and $targetAclPosition -gt $pathCanonicalizationPosition -and $taskLookupPosition -gt $targetAclPosition) 'profile approval, path canonicalization, and target ACL verification precede task inspection or mutation'
+    Assert-True ($taskFunctionSource -notmatch 'OOShutUp10Task_Debug\.xml' -and $taskFunctionSource -notmatch '\$env:TEMP') 'task setup does not export diagnostic XML to a predictable TEMP path'
     Assert-True ($taskFunctionSource.Contains('Get-ScheduledTask -TaskName $taskName -TaskPath $taskPath')) 'replacement queries the exact owned task path'
     Assert-True ($taskFunctionSource.Contains('Removing verified owned scheduled task')) 'removal logs the exact verified task path'
     Assert-True ($taskFunctionSource.Contains('Register-ScheduledTask -TaskName $stagingTaskName')) 'a disabled validation task is registered before replacing the existing task'
@@ -1421,17 +1422,30 @@ try {
             @{ Name = '64-bit'; Is64BitProcess = $true },
             @{ Name = '32-bit'; Is64BitProcess = $false }
         )) {
+            if ($mockedHost.Name -eq '64-bit') {
+                $legacyTaskXmlPath = Join-Path $script:FixtureRoot 'OOShutUp10Task_Debug.xml'
+                $legacyTaskXmlBytes = [System.Text.Encoding]::UTF8.GetBytes('pre-existing diagnostic file must remain unchanged')
+                [System.IO.File]::WriteAllBytes($legacyTaskXmlPath, $legacyTaskXmlBytes)
+                $legacyTaskXmlFingerprint = [System.Convert]::ToBase64String($legacyTaskXmlBytes)
+                # A file cannot contain a child path, so this also makes an attempted TEMP export fail.
+                $env:TEMP = $legacyTaskXmlPath
+            }
             $script:MockPowerShellContextIs64BitOperatingSystem = $true
             $script:MockPowerShellContextIs64BitProcess = [bool]$mockedHost.Is64BitProcess
             $script:MockPowerShellResolverMode = 'Valid'
             $script:MockPowerShellResolverCallCount = 0
             $expectedMockedPaths = Get-WindowsPowerShellExecutablePaths -WindowsDirectory $script:MockWindowsPowerShellDirectory -Is64BitOperatingSystem $true -Is64BitProcess ([bool]$mockedHost.Is64BitProcess)
             Assert-Equal $true (New-WindowsUpdateScheduledTask -ScriptPath $taskScriptPath -ApprovedProfileSha256 $taskProfile.Sha256 -ApprovedProfileManifestSha256 $taskProfile.ManifestSha256) "a safe ACL fixture registers the task under a mocked $($mockedHost.Name) host context"
-            $taskXmlPath = Join-Path $script:FixtureRoot 'OOShutUp10Task_Debug.xml'
-            [xml]$taskXml = [System.IO.File]::ReadAllText($taskXmlPath)
+            [xml]$taskXml = [string]$script:TaskRegistry['\myTech.Today\|Install-OOShutUp10'].Definition
+            Assert-Equal $legacyTaskXmlFingerprint ([System.Convert]::ToBase64String([System.IO.File]::ReadAllBytes($legacyTaskXmlPath))) 'task setup leaves the pre-existing legacy diagnostic target byte-identical'
             Assert-Equal ([string]$expectedMockedPaths.TaskPath) ([string]$taskXml.Task.Actions.Exec.Command) "the $($mockedHost.Name) host stores the canonical trusted Windows PowerShell path"
             Assert-Equal ([string]$expectedMockedPaths.InspectionPath) ([string]$script:MockLastPowerShellInspectionPath) "the $($mockedHost.Name) host validates the architecture-correct system path"
         }
+        Assert-True ([System.IO.File]::Exists($legacyTaskXmlPath)) 'repeated task setup requests do not replace or remove the old diagnostic target'
+        $diagnosticArtifacts = @(Get-ChildItem -LiteralPath $script:FixtureRoot -Filter 'OOShutUp10Task_Debug*.xml' -File)
+        Assert-Equal 1 $diagnosticArtifacts.Count 'task setup creates no additional diagnostic XML containing action details or approved digests'
+        Assert-Equal 'Ready' ([string]$script:TaskRegistry['\myTech.Today\|Install-OOShutUp10'].State) 'task registration remains verified and enabled when TEMP cannot accept a child write'
+        $env:TEMP = $script:FixtureRoot
         Assert-True ($script:TaskRegistrationCalls.Count -ge 2) 'candidate and final registration use mocked Task Scheduler commands'
         $taskWorkingDirectory = $taskXml.Task.Actions.Exec.WorkingDirectory
         Assert-Equal (Split-Path -Parent $taskScriptPath) ([string]$taskWorkingDirectory) 'scheduled task uses the script package as its working directory'

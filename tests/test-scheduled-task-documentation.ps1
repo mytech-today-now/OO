@@ -122,6 +122,9 @@ Assert-True ($recoveryBlock.Contains('$registeredTask.GetSecurityDescriptor(7)')
 $vmProcedurePath = Join-Path $repoRoot 'docs/task-security-descriptor-vm-acceptance.md'
 Assert-True (Test-Path -LiteralPath $vmProcedurePath -PathType Leaf) 'README disposable VM acceptance procedure exists'
 $vmProcedure = [System.IO.File]::ReadAllText($vmProcedurePath)
+$expectedProcedureTitle = '# Issue 02: Task Scheduler security descriptor acceptance on a disposable VM'
+Assert-True $vmProcedure.StartsWith($expectedProcedureTitle, [System.StringComparison]::Ordinal) 'VM procedure identifies the report finding as Issue 02'
+Assert-True (-not $vmProcedure.Contains('Issue03') -and -not $vmProcedure.Contains('Issue 03')) 'VM procedure does not use unrelated Issue 03 identifiers'
 $vmCodeBlocks = [regex]::Matches($vmProcedure, '(?ms)^```powershell\s*\r?\n(?<code>.*?)^```')
 Assert-True ($vmCodeBlocks.Count -ge 3) 'VM procedure includes task registration, descriptor, mismatch, and enablement examples'
 for ($blockIndex = 0; $blockIndex -lt $vmCodeBlocks.Count; $blockIndex++) {
@@ -137,8 +140,8 @@ for ($blockIndex = 0; $blockIndex -lt $vmCodeBlocks.Count; $blockIndex++) {
 foreach ($requiredVmEvidence in @(
     $taskFullPath,
     $taskDescriptor,
-    '\Issue03Validation\',
-    '\Issue03Foreign\',
+    '\Issue02Validation\',
+    '\Issue02Foreign\',
     'Windows build',
     'before enablement',
     'after enablement',
@@ -156,6 +159,7 @@ foreach ($requiredVmEvidence in @(
 }
 
 Assert-True $readme.Contains(('`{0}`' -f $taskFullPath)) 'README documents the implementation task path'
+Assert-True $readme.Contains('[Issue 02 disposable VM procedure](docs/task-security-descriptor-vm-acceptance.md)') 'README links the Issue 02 acceptance procedure'
 Assert-True ($readme.Contains(('The exact registered identity is `TaskPath = {0}` and `TaskName = {1}`.' -f $taskPath, $taskName))) 'README states the exact TaskPath and TaskName'
 Assert-True (-not $readme.Contains('OOShutUp10-PostWindowsUpdate')) 'README does not use the unregistered report name'
 Assert-True ($readme.Contains('The documented task was not found. No removal was attempted; discover the exact task path before retrying.')) 'README gives the exact not-found fallback'

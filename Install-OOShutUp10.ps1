@@ -2748,10 +2748,7 @@ function New-WindowsUpdateScheduledTask {
         $finalEnabled.InnerText = 'false'
         $finalTaskXml = $finalDocument.OuterXml
 
-        # Keep the diagnostic copy for local troubleshooting. Registration uses the in-memory XML.
-        $debugXmlPath = Join-Path $env:TEMP 'OOShutUp10Task_Debug.xml'
-        [System.IO.File]::WriteAllText($debugXmlPath, $taskXml, [System.Text.Encoding]::Unicode)
-        Write-Log "Task XML saved to: $debugXmlPath (for debugging)" -Level INFO
+        # Keep task XML in memory; a temporary diagnostic copy is unnecessary and may expose approved digests.
 
         # Report same-name tasks elsewhere, but only inspect and replace the exact owned task path.
         try {

@@ -280,7 +280,7 @@ If the readback differs or any command fails, leave the task disabled and inspec
 
 #### Disposable VM Task Scheduler acceptance gate
 
-Run the [Issue 03 disposable VM procedure](docs/task-security-descriptor-vm-acceptance.md) on a checkpointed Windows VM before release. It creates only harmless, on-demand `cmd.exe /d /c exit 0` tasks beneath dedicated validation folders; it does not run the installer or use the production task path. Record the actual Task Scheduler descriptor, task action, and enabled state before and after enablement, and test descriptor writes with a standard account against both the allowlisted and permissive fixtures. Keep this live VM result separate from the mocked offline harness result. The fixture procedure does not verify a production installer run; record that live result separately. Do not register these tasks on a workstation.
+Run the [Issue 02 disposable VM procedure](docs/task-security-descriptor-vm-acceptance.md) on a checkpointed Windows VM before release. It creates only harmless, on-demand `cmd.exe /d /c exit 0` tasks beneath dedicated validation folders; it does not run the installer or use the production task path. Record the actual Task Scheduler descriptor, task action, and enabled state before and after enablement, and test descriptor writes with a standard account against both the allowlisted and permissive fixtures. Keep this live VM result separate from the mocked offline harness result. The fixture procedure does not verify a production installer run; record that live result separately. Do not register these tasks on a workstation.
 
 ### Viewing the Scheduled Task
 
