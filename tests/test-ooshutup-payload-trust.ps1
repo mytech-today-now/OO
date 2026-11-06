@@ -11,10 +11,14 @@ $script:StartedWorkingDirectories = New-Object System.Collections.ArrayList
 $script:OpenedProfilePaths = New-Object System.Collections.ArrayList
 $script:OpenedProfileBytes = New-Object System.Collections.ArrayList
 $script:OpenedManifestBytes = New-Object System.Collections.ArrayList
+$script:StartProcessCallCount = 0
+$script:MockStartProcessFailure = $false
 $script:SwapProfileBeforeMockOpen = $false
 $script:MockReplacementProfileContent = ''
 $script:MockReplacementManifestContent = ''
 $script:SnapshotAclDenied = $false
+$script:MockSnapshotAclDeniedTarget = $null
+$script:SnapshotFailureProfile = $null
 $script:DownloadScenario = 'valid'
 $script:DownloadCount = 0
 $script:SignatureCallCount = 0
@@ -201,9 +205,13 @@ function Start-Process {
         [switch]$NoNewWindow
     )
 
+    $script:StartProcessCallCount++
     [void]$script:StartedPaths.Add($FilePath)
     [void]$script:StartedArguments.Add($ArgumentList)
     [void]$script:StartedWorkingDirectories.Add($WorkingDirectory)
+    if ($script:MockStartProcessFailure) {
+        throw 'Mocked Start-Process outcome could not be verified.'
+    }
     $profileArgument = [System.Text.RegularExpressions.Regex]::Match($ArgumentList, '^/quiet /nosrp "([^"]+)"$')
     if ($profileArgument.Success) {
         if ($script:SwapProfileBeforeMockOpen) {
@@ -298,7 +306,19 @@ function Get-Acl {
     if ($script:MockAclFailurePath -and [string]::Equals($resolvedPath, $script:MockAclFailurePath, [System.StringComparison]::OrdinalIgnoreCase)) {
         throw 'Mock ACL access denied.'
     }
-    if ($script:SnapshotAclDenied -and
+    $denySnapshotAclTarget = $false
+    if ($script:MockSnapshotAclDeniedTarget -and $script:InstallPath) {
+        $snapshotPrefix = Join-Path ([System.IO.Path]::GetFullPath($script:InstallPath)) 'ProfileSnapshot-'
+        if ($resolvedPath.StartsWith($snapshotPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $snapshotLeaf = [System.IO.Path]::GetFileName($resolvedPath)
+            switch ([string]$script:MockSnapshotAclDeniedTarget) {
+                'Directory' { $denySnapshotAclTarget = ($snapshotLeaf -match '^ProfileSnapshot-[A-Fa-f0-9]{32}$') }
+                'Profile' { $denySnapshotAclTarget = [string]::Equals($snapshotLeaf, 'ooshutup10.cfg', [System.StringComparison]::OrdinalIgnoreCase) }
+                'Manifest' { $denySnapshotAclTarget = [string]::Equals($snapshotLeaf, 'ooshutup10.approval.json', [System.StringComparison]::OrdinalIgnoreCase) }
+            }
+        }
+    }
+    if (($script:SnapshotAclDenied -or $denySnapshotAclTarget) -and
         $script:InstallPath -and
         $resolvedPath.StartsWith((Join-Path ([System.IO.Path]::GetFullPath($script:InstallPath)) 'ProfileSnapshot-'), [System.StringComparison]::OrdinalIgnoreCase)) {
         return New-MockAcl -Rules @(
@@ -1064,44 +1084,117 @@ try {
     Assert-Equal $approvedManifestDigestBeforeSnapshotWriteFailure $script:OOShutUpApprovedManifestDigest 'a denied snapshot write does not widen or replace the approved manifest digest'
     Assert-True ([string]::Join("`n", [string[]]$script:LogMessages.ToArray()).Contains($script:OOShutUpProfileSnapshotFailureMessage)) 'a denied snapshot write reports the exact no-launch fallback'
 
+    $originalSourceProfileBytes = [System.IO.File]::ReadAllBytes($script:OOShutUpProfilePath)
+    $originalSourceManifestBytes = [System.IO.File]::ReadAllBytes($script:OOShutUpProfileManifestPath)
+    $getApprovedProfileFunction = (Get-Command -Name Get-OOShutUpApprovedProfile -CommandType Function).ScriptBlock
+    $script:SnapshotFailureProfile = $approvedProfile
+    Set-Item -Path Function:\Get-OOShutUpApprovedProfile -Value {
+        param([switch]$RequireMachineScope)
+        return $script:SnapshotFailureProfile
+    }
+    try {
+        foreach ($sourceDigestCase in @(
+            @{ Name = 'source profile'; Path = $script:OOShutUpProfilePath },
+            @{ Name = 'source manifest'; Path = $script:OOShutUpProfileManifestPath }
+        )) {
+            [System.IO.File]::WriteAllBytes([string]$sourceDigestCase.Path, [System.Text.Encoding]::UTF8.GetBytes('changed after approval'))
+            $startProcessCallsBeforeSourceDigestFailure = $script:StartProcessCallCount
+            $script:LogMessages.Clear()
+            try {
+                Assert-Equal $false (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture) "a changed $($sourceDigestCase.Name) digest fails closed"
+            }
+            finally {
+                if ($sourceDigestCase.Name -eq 'source profile') {
+                    [System.IO.File]::WriteAllBytes($script:OOShutUpProfilePath, $originalSourceProfileBytes)
+                }
+                else {
+                    [System.IO.File]::WriteAllBytes($script:OOShutUpProfileManifestPath, $originalSourceManifestBytes)
+                }
+            }
+            Assert-Equal $startProcessCallsBeforeSourceDigestFailure $script:StartProcessCallCount "a changed $($sourceDigestCase.Name) digest never calls Start-Process"
+            Assert-True ([string]::Join("`n", [string[]]$script:LogMessages.ToArray()).Contains($script:OOShutUpProfileSnapshotFailureMessage)) "a changed $($sourceDigestCase.Name) digest reports the exact no-launch fallback"
+        }
+    }
+    finally {
+        Set-Item -Path Function:\Get-OOShutUpApprovedProfile -Value $getApprovedProfileFunction
+        [System.IO.File]::WriteAllBytes($script:OOShutUpProfilePath, $originalSourceProfileBytes)
+        [System.IO.File]::WriteAllBytes($script:OOShutUpProfileManifestPath, $originalSourceManifestBytes)
+        $script:SnapshotFailureProfile = $null
+    }
+
     $writeSnapshotFunction = (Get-Command -Name Write-OOShutUpProfileSnapshotFile -CommandType Function).ScriptBlock
     $script:RealWriteSnapshotFunction = $writeSnapshotFunction
-    Set-Item -Path Function:\Write-OOShutUpProfileSnapshotFile -Value {
-        param([string]$Path, [byte[]]$Bytes)
-        if ($Path.EndsWith('.approval.json', [System.StringComparison]::OrdinalIgnoreCase)) {
-            $Bytes = [System.Text.Encoding]::UTF8.GetBytes('{"schemaVersion":3,"tamperedCopy":true}')
+    foreach ($copiedDigestFileName in @('ooshutup10.cfg', 'ooshutup10.approval.json')) {
+        $script:InjectedSnapshotDigestFileName = $copiedDigestFileName
+        Set-Item -Path Function:\Write-OOShutUpProfileSnapshotFile -Value {
+            param([string]$Path, [byte[]]$Bytes)
+            if ([string]::Equals([System.IO.Path]::GetFileName($Path), $script:InjectedSnapshotDigestFileName, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $Bytes = [System.Text.Encoding]::UTF8.GetBytes('tampered snapshot copy')
+            }
+            & $script:RealWriteSnapshotFunction -Path $Path -Bytes $Bytes
         }
-        & $script:RealWriteSnapshotFunction -Path $Path -Bytes $Bytes
+        $startProcessCallsBeforeCopiedDigestFailure = $script:StartProcessCallCount
+        $script:LogMessages.Clear()
+        try {
+            Assert-Equal $false (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture) "a copied $copiedDigestFileName digest mismatch fails closed"
+        }
+        finally {
+            Set-Item -Path Function:\Write-OOShutUpProfileSnapshotFile -Value $writeSnapshotFunction
+        }
+        Assert-Equal $startProcessCallsBeforeCopiedDigestFailure $script:StartProcessCallCount "a copied $copiedDigestFileName digest mismatch never calls Start-Process"
+        Assert-Equal $approvedDigestBeforeSnapshotWriteFailure $script:OOShutUpApprovedDigest "a copied $copiedDigestFileName mismatch leaves the approved profile digest unchanged"
+        Assert-Equal $approvedManifestDigestBeforeSnapshotWriteFailure $script:OOShutUpApprovedManifestDigest "a copied $copiedDigestFileName mismatch leaves the approved manifest digest unchanged"
+        Assert-True ([string]::Join("`n", [string[]]$script:LogMessages.ToArray()).Contains($script:OOShutUpProfileSnapshotFailureMessage)) "a copied $copiedDigestFileName mismatch reports the exact no-launch fallback"
     }
-    $startedBeforeCopiedManifestMismatch = $script:StartedPaths.Count
-    $script:LogMessages.Clear()
-    try {
-        Assert-Equal $false (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture) 'a copied manifest digest mismatch fails closed'
-    }
-    finally {
-        Set-Item -Path Function:\Write-OOShutUpProfileSnapshotFile -Value $writeSnapshotFunction
-        $script:RealWriteSnapshotFunction = $null
-    }
-    Assert-Equal $startedBeforeCopiedManifestMismatch $script:StartedPaths.Count 'a copied manifest digest mismatch never launches O&O'
-    Assert-Equal $approvedDigestBeforeSnapshotWriteFailure $script:OOShutUpApprovedDigest 'a copied manifest mismatch leaves the approved profile digest unchanged'
-    Assert-Equal $approvedManifestDigestBeforeSnapshotWriteFailure $script:OOShutUpApprovedManifestDigest 'a copied manifest mismatch leaves the approved manifest digest unchanged'
-    Assert-True ([string]::Join("`n", [string[]]$script:LogMessages.ToArray()).Contains($script:OOShutUpProfileSnapshotFailureMessage)) 'a copied manifest mismatch reports the exact no-launch fallback'
+    $script:RealWriteSnapshotFunction = $null
+    $script:InjectedSnapshotDigestFileName = $null
 
-    $script:SnapshotAclDenied = $true
-    $startedBeforeSnapshotAclFailure = $script:StartedPaths.Count
-    $script:LogMessages.Clear()
-    try {
-        Assert-Equal $false (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture) 'a snapshot directory writable by an untrusted account fails closed'
+    $aclFailureCases = @(
+        @{ Name = 'managed O&O directory ACL inspection'; Target = 'ManagedDirectory' },
+        @{ Name = 'snapshot directory ACL'; Target = 'Directory' },
+        @{ Name = 'snapshot profile ACL'; Target = 'Profile' },
+        @{ Name = 'snapshot manifest ACL'; Target = 'Manifest' }
+    )
+    foreach ($aclFailureCase in $aclFailureCases) {
+        $script:MockAclFailurePath = $null
+        $script:MockSnapshotAclDeniedTarget = $null
+        if ($aclFailureCase.Target -eq 'ManagedDirectory') {
+            $script:MockAclFailurePath = [System.IO.Path]::GetFullPath($script:InstallPath)
+        }
+        else {
+            $script:MockSnapshotAclDeniedTarget = [string]$aclFailureCase.Target
+        }
+        $startProcessCallsBeforeAclFailure = $script:StartProcessCallCount
+        $script:LogMessages.Clear()
+        try {
+            Assert-Equal $false (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture) "$($aclFailureCase.Name) fails closed"
+        }
+        finally {
+            $script:MockAclFailurePath = $null
+            $script:MockSnapshotAclDeniedTarget = $null
+        }
+        Assert-Equal $startProcessCallsBeforeAclFailure $script:StartProcessCallCount "$($aclFailureCase.Name) never calls Start-Process"
+        Assert-Equal 0 @(Get-ChildItem -LiteralPath $script:InstallPath -Filter 'ProfileSnapshot-*' -Directory).Count "$($aclFailureCase.Name) cleans its known-invalid snapshot"
+        Assert-True ([string]::Join("`n", [string[]]$script:LogMessages.ToArray()).Contains($script:OOShutUpProfileSnapshotFailureMessage)) "$($aclFailureCase.Name) reports the exact no-launch fallback"
     }
-    finally {
-        $script:SnapshotAclDenied = $false
-    }
-    Assert-Equal $startedBeforeSnapshotAclFailure $script:StartedPaths.Count 'an untrusted snapshot ACL never launches O&O'
-    Assert-Equal $approvedDigestBeforeSnapshotWriteFailure $script:OOShutUpApprovedDigest 'an untrusted snapshot ACL leaves the approved profile digest unchanged'
-    Assert-Equal $approvedManifestDigestBeforeSnapshotWriteFailure $script:OOShutUpApprovedManifestDigest 'an untrusted snapshot ACL leaves the approved manifest digest unchanged'
-    Assert-True ([string]::Join("`n", [string[]]$script:LogMessages.ToArray()).Contains($script:OOShutUpProfileSnapshotFailureMessage)) 'an untrusted snapshot ACL reports the exact no-launch fallback'
 
     $removeSnapshotFunction = (Get-Command -Name Remove-OOShutUpProfileSnapshot -CommandType Function).ScriptBlock
+    $script:MockStartProcessFailure = $true
+    $startProcessCallsBeforeUncertainLaunch = $script:StartProcessCallCount
+    $workingDirectoriesBeforeUncertainLaunch = $script:StartedWorkingDirectories.Count
+    $script:LogMessages.Clear()
+    try {
+        Assert-Equal $false (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture) 'an unverified process-start outcome reports an incomplete result'
+    }
+    finally {
+        $script:MockStartProcessFailure = $false
+    }
+    Assert-Equal ($startProcessCallsBeforeUncertainLaunch + 1) $script:StartProcessCallCount 'the unverified process-start scenario reaches Start-Process once'
+    $uncertainSnapshotDirectory = [string]$script:StartedWorkingDirectories[$workingDirectoriesBeforeUncertainLaunch]
+    Assert-True (Test-Path -LiteralPath $uncertainSnapshotDirectory -PathType Container) 'an uncertain launch retains its protected snapshot for diagnosis'
+    Assert-True ([string]::Join("`n", [string[]]$script:LogMessages.ToArray()).Contains("The O&O launch outcome could not be verified. The protected profile snapshot was retained at '$uncertainSnapshotDirectory'")) 'an uncertain launch reports the retained snapshot path'
+    & $removeSnapshotFunction -Directory $uncertainSnapshotDirectory
+
     Set-Item -Path Function:\Remove-OOShutUpProfileSnapshot -Value {
         param([string]$Directory)
         throw 'Mocked snapshot cleanup access denied.'

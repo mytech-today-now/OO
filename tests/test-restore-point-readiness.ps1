@@ -12,6 +12,13 @@ $script:ProcessBoundaryCalls = 0
 $script:CurrentRestoreJob = $null
 $script:LastRestoreDrive = $null
 $script:RestoreEnableCalls = 0
+$script:ConfigurationEvents = New-Object System.Collections.ArrayList
+$script:ProfileSnapshotScenario = 'success'
+$script:ActiveProfileSnapshots = New-Object System.Collections.ArrayList
+$script:CreatedProfileSnapshotPaths = New-Object System.Collections.ArrayList
+$script:ProfileFixtureBytes = [System.Text.Encoding]::UTF8.GetBytes('approved profile fixture')
+$script:ManifestFixtureBytes = [System.Text.Encoding]::UTF8.GetBytes('approved manifest fixture')
+$script:MockStartProcessFailure = $false
 $script:FrequencyWriteScenario = 'success'
 $script:RegistryFixture = [pscustomobject]@{
     KeyExists = $true
@@ -189,6 +196,7 @@ function Get-ComputerRestorePoint {
         throw 'Mock restore-point enumeration exception.'
     }
     if ($script:RestoreScenario -eq 'success') {
+        [void]$script:ConfigurationEvents.Add('restore-point-verified')
         return @([pscustomobject]@{
             Description = $script:LastRestorePointDescription
             SequenceNumber = 42
@@ -210,13 +218,64 @@ function Get-OOShutUpApprovedProfile {
     [CmdletBinding()]
     param([switch]$RequireMachineScope)
 
+    [void]$script:ConfigurationEvents.Add('profile-validation')
     return [pscustomobject]@{
-        Sha256 = 'profile-digest'
-        ManifestSha256 = 'manifest-digest'
+        Sha256 = $script:OOShutUpApprovedDigest
+        ManifestSha256 = $script:OOShutUpApprovedManifestDigest
         Version = 'test-1.0'
         SettingCount = 1
         Path = 'C:\fixtures\ooshutup10.cfg'
     }
+}
+
+function New-OOShutUpProfileSnapshot {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][pscustomobject]$Profile)
+
+    [void]$script:ConfigurationEvents.Add('snapshot-creation')
+    if ($script:ProfileSnapshotScenario -eq 'creation-failure') {
+        throw 'Mocked profile snapshot creation failure.'
+    }
+
+    $directory = Join-Path 'C:\fixtures' ('ProfileSnapshot-{0}' -f [guid]::NewGuid().ToString('N'))
+    if ($script:CreatedProfileSnapshotPaths.Contains($directory)) {
+        throw 'Mocked profile snapshot path was reused.'
+    }
+    [void]$script:CreatedProfileSnapshotPaths.Add($directory)
+    [void]$script:ActiveProfileSnapshots.Add($directory)
+    [void]$script:ConfigurationEvents.Add('snapshot-verification')
+
+    $profileBytes = [byte[]]$script:ProfileFixtureBytes
+    $manifestBytes = [byte[]]$script:ManifestFixtureBytes
+    if ($script:ProfileSnapshotScenario -eq 'digest-mismatch') {
+        $profileBytes = [System.Text.Encoding]::UTF8.GetBytes('tampered snapshot profile fixture')
+    }
+
+    $profileDigest = Get-OOShutUpProfileDigest -Bytes $profileBytes
+    $manifestDigest = Get-OOShutUpProfileDigest -Bytes $manifestBytes
+    if (-not [string]::Equals($profileDigest, [string]$Profile.Sha256, [System.StringComparison]::OrdinalIgnoreCase) -or
+        -not [string]::Equals($manifestDigest, [string]$Profile.ManifestSha256, [System.StringComparison]::OrdinalIgnoreCase)) {
+        Remove-OOShutUpProfileSnapshot -Directory $directory
+        throw 'Mocked copied profile snapshot digest verification failed.'
+    }
+
+    return [pscustomobject]@{
+        Directory = $directory
+        Path = Join-Path $directory 'ooshutup10.cfg'
+        ManifestPath = Join-Path $directory 'ooshutup10.approval.json'
+    }
+}
+
+function Remove-OOShutUpProfileSnapshot {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Directory)
+
+    [void]$script:ConfigurationEvents.Add('snapshot-removal')
+    if ($script:ProfileSnapshotScenario -eq 'cleanup-failure') {
+        throw 'Mocked profile snapshot cleanup failure.'
+    }
+
+    [void]$script:ActiveProfileSnapshots.Remove($Directory)
 }
 
 function Test-OOShutUpPayload {
@@ -237,7 +296,12 @@ function Start-Process {
         [switch]$NoNewWindow
     )
 
+    [void]$script:ConfigurationEvents.Add('process-start')
     $script:ProcessBoundaryCalls++
+    if ($script:MockStartProcessFailure) {
+        throw 'Mocked Start-Process outcome could not be verified.'
+    }
+    [void]$script:ConfigurationEvents.Add('process-exited')
     return [pscustomobject]@{ ExitCode = 30 }
 }
 
@@ -266,6 +330,7 @@ try {
         'Set-RestorePointFrequencyValue',
         'Set-RestorePointFrequency',
         'Get-WindowsSystemVolume',
+        'Get-OOShutUpProfileDigest',
         'New-SystemRestorePoint',
         'Invoke-OOShutUpConfiguration',
         'Invoke-OOShutUpConfigurationWithRestorePointGate'
@@ -280,6 +345,9 @@ try {
         Assert-True ($null -ne $functionAst) "the $name function exists"
         . ([scriptblock]::Create($functionAst.Extent.Text))
     }
+
+    $script:OOShutUpApprovedDigest = Get-OOShutUpProfileDigest -Bytes ([byte[]]$script:ProfileFixtureBytes)
+    $script:OOShutUpApprovedManifestDigest = Get-OOShutUpProfileDigest -Bytes ([byte[]]$script:ManifestFixtureBytes)
 
     $setFrequencySource = [string](@($functionAsts | Where-Object { $_.Name -eq 'Set-RestorePointFrequency' })[0].Extent.Text)
     $newRestorePointSource = [string](@($functionAsts | Where-Object { $_.Name -eq 'New-SystemRestorePoint' })[0].Extent.Text)
@@ -426,10 +494,12 @@ try {
             Kind = $priorRegistryState.Kind
         }
         $script:LogMessages.Clear()
+        $eventsBeforeBlockedRestore = $script:ConfigurationEvents.Count
         $blockedResult = Invoke-OOShutUpConfigurationWithRestorePointGate -ExecutablePath 'C:\fixtures\OOSU10.exe'
         Assert-Equal $false $blockedResult.ConfigurationStarted "$scenario stops before configuration starts"
         Assert-Equal $false $blockedResult.ConfigurationSucceeded "$scenario does not report configuration success"
         Assert-Equal $callCountBeforeFailure $script:ProcessBoundaryCalls "$scenario never reaches Start-Process"
+        Assert-Equal $eventsBeforeBlockedRestore $script:ConfigurationEvents.Count "$scenario never reaches profile validation or snapshot creation"
         $blockedMessages = [string]::Join("`n", [string[]]$script:LogMessages.ToArray())
         if ($scenario -eq 'enable-failure') {
             Assert-True ($blockedMessages.Contains($script:OOShutUpRestorePointPreparationFailureMessage)) "$scenario gives the exact preparation failure status"
@@ -448,11 +518,65 @@ try {
     }
     $script:RestorePoints = @()
     $script:LogMessages.Clear()
+    $script:ConfigurationEvents.Clear()
     $successResult = Invoke-OOShutUpConfigurationWithRestorePointGate -ExecutablePath 'C:\fixtures\OOSU10.exe'
     Assert-Equal $true $successResult.RestorePointVerified 'verified point status reaches the result'
     Assert-Equal $true $successResult.ConfigurationStarted 'verified point permits configuration'
     Assert-Equal $true $successResult.ConfigurationSucceeded 'mocked O&O reports successful application'
     Assert-Equal ($callCountBeforeFailure + 1) $script:ProcessBoundaryCalls 'verified point reaches Start-Process exactly once'
+    Assert-Equal 'restore-point-verified,profile-validation,snapshot-creation,snapshot-verification,process-start,process-exited,snapshot-removal' ([string]::Join(',', [string[]]$script:ConfigurationEvents.ToArray())) 'the production restore gate, profile validation, snapshot verification, process exit, and cleanup run in order'
+    Assert-Equal 0 $script:ActiveProfileSnapshots.Count 'a completed O&O child removes its unique snapshot after process exit is known'
+
+    $script:ConfigurationEvents.Clear()
+    $script:OOShutUpApprovalConfirmed = $false
+    $profileValidationStartCount = $script:ProcessBoundaryCalls
+    $profileValidationFailure = Invoke-OOShutUpConfigurationWithRestorePointGate -ExecutablePath 'C:\fixtures\OOSU10.exe'
+    $script:OOShutUpApprovalConfirmed = $true
+    Assert-Equal $false $profileValidationFailure.ConfigurationSucceeded 'failed approved-profile validation reports configuration failure'
+    Assert-Equal $profileValidationStartCount $script:ProcessBoundaryCalls 'failed approved-profile validation never launches O&O'
+    Assert-Equal 'restore-point-verified,profile-validation' ([string]::Join(',', [string[]]$script:ConfigurationEvents.ToArray())) 'profile validation must pass before snapshot creation can begin'
+
+    foreach ($snapshotFailureScenario in @('creation-failure', 'digest-mismatch')) {
+        $script:ConfigurationEvents.Clear()
+        $script:ProfileSnapshotScenario = $snapshotFailureScenario
+        $snapshotFailureStartCount = $script:ProcessBoundaryCalls
+        $snapshotFailureResult = Invoke-OOShutUpConfigurationWithRestorePointGate -ExecutablePath 'C:\fixtures\OOSU10.exe'
+        Assert-Equal $false $snapshotFailureResult.ConfigurationSucceeded "$snapshotFailureScenario reports configuration failure"
+        Assert-Equal $snapshotFailureStartCount $script:ProcessBoundaryCalls "$snapshotFailureScenario never launches O&O"
+        Assert-True (-not $script:ConfigurationEvents.Contains('process-start')) "$snapshotFailureScenario does not bypass the snapshot boundary"
+        Assert-Equal 0 $script:ActiveProfileSnapshots.Count "$snapshotFailureScenario leaves no unverified snapshot behind"
+        if ($snapshotFailureScenario -eq 'digest-mismatch') {
+            Assert-True ($script:ConfigurationEvents.Contains('snapshot-removal')) 'a digest-mismatched snapshot is cleaned up before the no-launch result'
+            Assert-Equal 0 $script:ActiveProfileSnapshots.Count 'a digest-mismatched snapshot is not retained'
+        }
+    }
+
+    $script:ProfileSnapshotScenario = 'success'
+    $script:ConfigurationEvents.Clear()
+    $script:MockStartProcessFailure = $true
+    $uncertainStartCount = $script:ProcessBoundaryCalls
+    $uncertainStartResult = Invoke-OOShutUpConfigurationWithRestorePointGate -ExecutablePath 'C:\fixtures\OOSU10.exe'
+    $script:MockStartProcessFailure = $false
+    Assert-Equal $false $uncertainStartResult.ConfigurationSucceeded 'an uncertain Start-Process result fails closed'
+    Assert-Equal ($uncertainStartCount + 1) $script:ProcessBoundaryCalls 'the uncertain process-start scenario reaches Start-Process once'
+    Assert-Equal 1 $script:ActiveProfileSnapshots.Count 'an uncertain process-start outcome retains its profile snapshot'
+    Assert-True (-not $script:ConfigurationEvents.Contains('snapshot-removal')) 'an uncertain process-start outcome does not clean up the snapshot'
+    $uncertainSnapshotDirectory = [string]$script:ActiveProfileSnapshots[0]
+    Assert-True ([string]::Join("`n", [string[]]$script:LogMessages.ToArray()).Contains("The O&O launch outcome could not be verified. The protected profile snapshot was retained at '$uncertainSnapshotDirectory'")) 'an uncertain process-start outcome reports the retained snapshot path'
+    Remove-OOShutUpProfileSnapshot -Directory $uncertainSnapshotDirectory
+
+    $script:ConfigurationEvents.Clear()
+    $script:ProfileSnapshotScenario = 'cleanup-failure'
+    $cleanupFailureStartCount = $script:ProcessBoundaryCalls
+    $cleanupFailureResult = Invoke-OOShutUpConfigurationWithRestorePointGate -ExecutablePath 'C:\fixtures\OOSU10.exe'
+    Assert-Equal $false $cleanupFailureResult.ConfigurationSucceeded 'snapshot cleanup failure reports an incomplete configuration result'
+    Assert-Equal ($cleanupFailureStartCount + 1) $script:ProcessBoundaryCalls 'snapshot cleanup failure happens after the child exits'
+    Assert-Equal 1 $script:ActiveProfileSnapshots.Count 'snapshot cleanup failure leaves the snapshot available for recovery'
+    Assert-True ([string]::Join("`n", [string[]]$script:LogMessages.ToArray()).Contains('The protected profile snapshot could not be removed after O&O exited')) 'snapshot cleanup failure reports that O&O has exited'
+    $cleanupFailureSnapshotDirectory = [string]$script:ActiveProfileSnapshots[0]
+    $script:ProfileSnapshotScenario = 'success'
+    Remove-OOShutUpProfileSnapshot -Directory $cleanupFailureSnapshotDirectory
+    $script:ConfigurationEvents.Clear()
 
     $script:FrequencyWriteScenario = 'rejected'
     $script:RegistryFixture = [pscustomobject]@{
@@ -462,10 +586,11 @@ try {
         Kind = $priorRegistryState.Kind
     }
     $script:LogMessages.Clear()
+    $processCallsBeforePreparationFailure = $script:ProcessBoundaryCalls
     $preparationFailureResult = Invoke-OOShutUpConfigurationWithRestorePointGate -ExecutablePath 'C:\fixtures\OOSU10.exe' -AllowWithoutRestorePoint
     Assert-Equal $false $preparationFailureResult.PreparationSucceeded 'the restore override cannot bypass failed preparation'
     Assert-Equal $false $preparationFailureResult.ConfigurationStarted 'failed preparation blocks privacy settings even with the explicit restore-point override'
-    Assert-Equal ($callCountBeforeFailure + 1) $script:ProcessBoundaryCalls 'failed preparation never reaches Start-Process'
+    Assert-Equal $processCallsBeforePreparationFailure $script:ProcessBoundaryCalls 'failed preparation never reaches Start-Process'
     $preparationFailureMessages = [string]::Join("`n", [string[]]$script:LogMessages.ToArray())
     Assert-True ($preparationFailureMessages.Contains($script:OOShutUpRestorePointPreparationFailureMessage)) 'failed preparation reports the exact fallback status'
     Assert-True (Test-RestorePointFrequencyStateEqual -Expected $priorRegistryState -Actual (Get-RestorePointFrequencyState)) 'failed preparation leaves the original registry state intact'
@@ -480,14 +605,17 @@ try {
         Kind = $priorRegistryState.Kind
     }
     $script:LogMessages.Clear()
+    $processCallsBeforeOverride = $script:ProcessBoundaryCalls
     $overrideResult = Invoke-OOShutUpConfigurationWithRestorePointGate -ExecutablePath 'C:\fixtures\OOSU10.exe' -AllowWithoutRestorePoint
     Assert-Equal $false $overrideResult.RestorePointVerified 'override does not represent a point as verified'
     Assert-Equal $true $overrideResult.OverrideUsed 'the explicit switch is recorded in the result'
     Assert-Equal $true $overrideResult.ConfigurationStarted 'the explicit override permits configuration'
-    Assert-Equal ($callCountBeforeFailure + 2) $script:ProcessBoundaryCalls 'only the explicit override reaches Start-Process'
+    Assert-Equal ($processCallsBeforeOverride + 1) $script:ProcessBoundaryCalls 'only the explicit override reaches Start-Process'
     $overrideMessages = [string]::Join("`n", [string[]]$script:LogMessages.ToArray())
     Assert-True ($overrideMessages.Contains($script:OOShutUpRestorePointOverrideMessage)) 'override reports that System Restore recovery is unavailable'
     Assert-True ($overrideMessages -notmatch 'A system restore point was verified|created and verified successfully') 'override never claims a restore point'
+    $uniqueSnapshotPaths = @($script:CreatedProfileSnapshotPaths | Select-Object -Unique)
+    Assert-Equal $script:CreatedProfileSnapshotPaths.Count $uniqueSnapshotPaths.Count 'each snapshot invocation receives a unique per-run path'
 
     [Console]::Out.WriteLine("Passed $script:AssertionCount restore-point readiness assertions in $($PSVersionTable.PSVersion).")
 }

@@ -278,6 +278,10 @@ if ($wasEnabled) { $registeredTask.Enabled = $true }
 
 If the readback differs or any command fails, leave the task disabled and inspect the exact task in Task Scheduler before retrying. The descriptor backup covers owner, group, and DACL; it does not request the audit SACL.
 
+#### Disposable VM Task Scheduler acceptance gate
+
+Run the [Issue 03 disposable VM procedure](docs/task-security-descriptor-vm-acceptance.md) on a checkpointed Windows VM before release. It creates only harmless, on-demand `cmd.exe /d /c exit 0` tasks beneath dedicated validation folders; it does not run the installer or use the production task path. Record the actual Task Scheduler descriptor, task action, and enabled state before and after enablement, and test descriptor writes with a standard account against both the allowlisted and permissive fixtures. Keep this live VM result separate from the mocked offline harness result. The fixture procedure does not verify a production installer run; record that live result separately. Do not register these tasks on a workstation.
+
 ### Viewing the Scheduled Task
 
 You can view the scheduled task in Task Scheduler:
@@ -412,7 +416,20 @@ The profile is resolved beneath the script's package directory regardless of the
 
 If snapshot creation, ACL verification, or digest verification fails, O&O is not started and the installer reports: `The approved profile changed after validation. No O&O process was started; restore the reviewed profile and retry.` If O&O exits but snapshot cleanup fails, verify O&O's applied settings and manually remove the reported `ProfileSnapshot-<guid>` directory beneath the managed O&O directory after confirming no `OOSU10.exe` process still uses it. If the process start outcome cannot be verified, the installer retains the snapshot and reports its path; check for a running O&O process before removing it manually.
 
-The offline harness uses mocked ACL records and does not establish effective Windows permissions. Before release, record a disposable VM run with two test accounts that inspects the snapshot directory and both files during a harmless reviewed fixture run, confirms SYSTEM and Administrators access, and verifies the lower-privilege account cannot create, modify, replace, or delete the snapshot files.
+The offline harness uses mocked ACL records and does not establish effective Windows permissions. Treat the following disposable-VM check as a release gate; do not run it on a workstation or against a profile that can make unwanted changes.
+
+#### Disposable VM snapshot ACL release gate
+
+1. Create a checkpointed disposable Windows VM with a local NTFS volume. Record the Windows edition, version, build and revision, PowerShell version, VM name, test date, and the exact installer revision or source-file hash. Do not use a network share, synced folder, host-mounted folder, or production profile.
+2. Create two local test accounts: one elevated administrator and one standard user with no membership in Administrators. Record each account name, SID, and local group membership. Sign in as the administrator and verify that the standard account cannot elevate.
+3. Prepare a separate validation copy with both approved profile files and a harmless, reviewed fixture whose settings are already at their intended values. Verify the fixture digests and O&O executable trust using the normal checks. Do not bypass missing trust pins or profile approval; if a trusted executable and harmless approved fixture are unavailable, record the VM gate as **Not run**.
+4. Start the validation run and suspend the O&O child as soon as it appears, before it reads the profile. Confirm the per-run `ProfileSnapshot-<guid>` directory and both files exist. In a second elevated PowerShell process, open both files for read while allowing other handles to share read, write, and delete access, then keep that process open until the lower-privilege probes finish. This makes the snapshot stay in use without a file-sharing lock masking the NTFS ACL result. Record the child PID and snapshot paths. If the snapshot cannot be held for the full check, record the gate as **Not run**.
+5. While the files are held open, record the owner and DACL for the snapshot directory, `ooshutup10.cfg`, and `ooshutup10.approval.json`. Save both `Get-Acl` owner/access output and `icacls` output. As the elevated administrator, read both files and record their SHA-256 digests. Use a temporary SYSTEM scheduled task to read and hash the same files; record its result and remove the task after the probe.
+6. Sign in to a separate session as the standard user and attempt each of these operations while the snapshot is still held open: create a new file in the snapshot directory; write the original bytes back to each snapshot file; replace each snapshot file with a harmless temporary file; and delete each snapshot file. Record `Denied` or `Allowed` for every attempt and confirm the original file hashes remain unchanged. The test fixture contains no sensitive or production data. If any operation is allowed or a hash changes, stop the O&O child without resuming it, preserve the snapshot and logs for diagnosis, and mark the gate **Failed**.
+7. If all mutation attempts are denied and both trusted reads succeed, release the helper handles and resume the O&O child. Wait for the child and installer to finish, then confirm the snapshot was cleaned up. Remove the temporary SYSTEM task, test accounts, fixture files, and validation copy, and restore the VM checkpoint.
+8. Save one VM record containing the tested OS/build, installer revision, both account names/SIDs/groups, snapshot directory and file owners/DACLs, SYSTEM and administrator read results, every lower-privilege access attempt and result, before/after file hashes, child/helper PIDs, cleanup result, and final **Pass**, **Failed**, or **Not run** status. Mark **Pass** only when every mutation is denied, both SYSTEM and Administrators can read both files, hashes remain unchanged, and cleanup is recorded.
+
+The hold-open helper must share read, write, and delete access; a `FileShare.None` lock can make access attempts fail for the wrong reason. Keep the helper open only for the test window. The offline harness result and this live VM record are separate evidence: mocked ACL results never substitute for the VM gate.
 
 ### Rollback
 

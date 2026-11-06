@@ -103,6 +103,57 @@ $taskName = Get-SourceStringAssignment -VariableName 'taskName'
 $taskFolder = Get-SourceStringAssignment -VariableName 'taskFolder'
 $taskPath = '\' + $taskFolder + '\'
 $taskFullPath = $taskPath + $taskName
+$descriptorAssignment = [regex]::Match($installer, '(?im)^\s*\$script:OOShutUpTaskSecurityDescriptorSddl\s*=\s*''(?<value>[^'']+)''\s*$')
+Assert-True $descriptorAssignment.Success 'installer defines a literal task security descriptor allowlist'
+$taskDescriptor = [string]$descriptorAssignment.Groups['value'].Value
+$descriptorSection = Get-MarkdownSection -Heading 'Task Security Descriptor'
+Assert-True ($descriptorSection.Contains(('`{0}`' -f $taskDescriptor))) 'README documents the exact installer task descriptor format'
+$recoveryBlockMatch = [regex]::Match($descriptorSection, '(?ms)^```powershell\s*\r?\n(?<code>.*?)^```')
+Assert-True $recoveryBlockMatch.Success 'README task security section includes a manual recovery command block'
+$recoveryBlock = [string]$recoveryBlockMatch.Groups['code'].Value
+$recoveryNameMatch = [regex]::Match($recoveryBlock, '(?im)^\s*\$taskName\s*=\s*''(?<value>[^'']+)''\s*$')
+$recoveryPathMatch = [regex]::Match($recoveryBlock, '(?im)^\s*\$taskPath\s*=\s*''(?<value>[^'']+)''\s*$')
+Assert-True $recoveryNameMatch.Success 'README recovery declares an exact task name'
+Assert-True $recoveryPathMatch.Success 'README recovery declares an exact task path'
+Assert-Equal $taskName ([string]$recoveryNameMatch.Groups['value'].Value) 'README recovery uses the implementation task name'
+Assert-Equal $taskPath ([string]$recoveryPathMatch.Groups['value'].Value) 'README recovery uses the implementation task path'
+Assert-True ($recoveryBlock.Contains('$registeredTask.SetSecurityDescriptor($savedSddl, 0x10)')) 'README recovery writes the saved owner/group/DACL descriptor'
+Assert-True ($recoveryBlock.Contains('$registeredTask.GetSecurityDescriptor(7)')) 'README recovery reads owner/group/DACL back from Task Scheduler'
+$vmProcedurePath = Join-Path $repoRoot 'docs/task-security-descriptor-vm-acceptance.md'
+Assert-True (Test-Path -LiteralPath $vmProcedurePath -PathType Leaf) 'README disposable VM acceptance procedure exists'
+$vmProcedure = [System.IO.File]::ReadAllText($vmProcedurePath)
+$vmCodeBlocks = [regex]::Matches($vmProcedure, '(?ms)^```powershell\s*\r?\n(?<code>.*?)^```')
+Assert-True ($vmCodeBlocks.Count -ge 3) 'VM procedure includes task registration, descriptor, mismatch, and enablement examples'
+for ($blockIndex = 0; $blockIndex -lt $vmCodeBlocks.Count; $blockIndex++) {
+    $vmTokens = $null
+    $vmParseErrors = $null
+    [void][System.Management.Automation.Language.Parser]::ParseInput(
+        [string]$vmCodeBlocks[$blockIndex].Groups['code'].Value,
+        [ref]$vmTokens,
+        [ref]$vmParseErrors
+    )
+    Assert-Equal 0 @($vmParseErrors).Count "VM procedure PowerShell block $($blockIndex + 1) parses"
+}
+foreach ($requiredVmEvidence in @(
+    $taskFullPath,
+    $taskDescriptor,
+    '\Issue03Validation\',
+    '\Issue03Foreign\',
+    'Windows build',
+    'before enablement',
+    'after enablement',
+    'descriptor mismatch',
+    'uncertain rollback',
+    'foreign same-named task',
+    'Do not run this procedure on a workstation',
+    'standard test account',
+    'SetSecurityDescriptor',
+    'DeleteTask',
+    'permissive positive control',
+    'does not verify a production installer run'
+)) {
+    Assert-True ($vmProcedure.Contains($requiredVmEvidence)) "VM procedure documents '$requiredVmEvidence'"
+}
 
 Assert-True $readme.Contains(('`{0}`' -f $taskFullPath)) 'README documents the implementation task path'
 Assert-True ($readme.Contains(('The exact registered identity is `TaskPath = {0}` and `TaskName = {1}`.' -f $taskPath, $taskName))) 'README states the exact TaskPath and TaskName'
