@@ -298,7 +298,13 @@ function Write-ApprovedProfileFixture {
         [string[]]$AllowedSettingIds,
 
         [Parameter(Mandatory = $false)]
-        [string[]]$CurrentUserSettingIds = @()
+        [string[]]$CurrentUserSettingIds = @(),
+
+        [Parameter(Mandatory = $false)]
+        [string]$OOShutUpMinimumVersion = '3.6.1135.0',
+
+        [Parameter(Mandatory = $false)]
+        [string]$OOShutUpMaximumVersion = '3.6.1135.0'
     )
 
     [System.IO.Directory]::CreateDirectory($script:OOShutUpProfileDirectory) | Out-Null
@@ -322,7 +328,11 @@ function Write-ApprovedProfileFixture {
         }
     )
     $manifest = [pscustomobject]@{
-        schemaVersion = 3
+        schemaVersion = 4
+        ooshutupVersionRange = [pscustomobject]@{
+            minimum = $OOShutUpMinimumVersion
+            maximum = $OOShutUpMaximumVersion
+        }
         profileVersion = 'test-1.0'
         sha256 = $hash
         settingIds = $AllowedSettingIds
@@ -933,7 +943,15 @@ try {
         param([string]$Path)
 
         $content = [System.IO.File]::ReadAllText($Path)
-        $fileVersion = if ($content -eq 'OLD_VERSION') { '3.5.1130.0' } else { '3.6.1135.0' }
+        $fileVersion = if ($content -eq 'OLD_VERSION') {
+            '3.5.1130.0'
+        }
+        elseif ($content -eq 'NEWER_VERSION') {
+            '3.6.1136.0'
+        }
+        else {
+            '3.6.1135.0'
+        }
         $productName = if ($content -eq 'WRONG_PRODUCT') { 'O&O DiskImage' } else { 'O&O ShutUp10++' }
         return [pscustomobject]@{ ProductName = $productName; FileVersion = $fileVersion }
     }
@@ -978,6 +996,7 @@ try {
     $script:OOShutUpProfilePath = Join-Path $script:OOShutUpProfileDirectory 'ooshutup10.cfg'
     $script:OOShutUpProfileManifestPath = Join-Path $script:OOShutUpProfileDirectory 'ooshutup10.approval.json'
     $script:OOShutUpProfileFailureMessage = 'The approved settings profile is missing or invalid. No privacy settings were applied; place the reviewed profile in the configured directory.'
+    $script:OOShutUpProfileVersionFailureMessage = 'The O&O executable version is outside the profile review range. No settings were changed; review and reapprove the profile for this release before applying settings or registering a SYSTEM task.'
     $script:OOShutUpProfileSnapshotFailureMessage = 'The approved profile changed after validation. No O&O process was started; restore the reviewed profile and retry.'
     $script:OOShutUpUnknownScopeFailureMessage = 'The task profile contains settings with unknown user scope. Reapplication was skipped; review the profile scope before retrying.'
     $script:OOShutUpCurrentUserScopeFailureMessage = 'The SYSTEM task profile contains current-user settings. Reapplication was skipped; run them for the intended signed-in user or remove them from the SYSTEM task profile.'
@@ -1066,6 +1085,8 @@ try {
     Assert-True ($null -ne $approvedProfile) 'a well-formed profile matching its digest and allowlist is accepted'
     Assert-Equal $script:OOShutUpProfilePath ([string]$approvedProfile.Path) 'the approved profile path is absolute and package-relative'
     Assert-Equal 2 $approvedProfile.SettingCount 'the approved profile identity records its setting count'
+    Assert-Equal '3.6.1135.0' ([string]$approvedProfile.OOShutUpVersionMinimum) 'an exact profile release policy is retained in the approved profile'
+    Assert-Equal '3.6.1135.0' ([string]$approvedProfile.OOShutUpVersionMaximum) 'equal version bounds represent exact-release approval'
     Assert-Equal 'Test category' ([string]$approvedProfile.Settings[0].Category) 'validated impact metadata is included in the interactive profile summary'
     $profileLog = [string]::Join("`n", [string[]]$script:LogMessages.ToArray())
     Assert-True ($profileLog -notmatch 'S003|M003|Example setting') 'profile identity logging omits setting IDs and values'
@@ -1075,7 +1096,45 @@ try {
     Assert-Equal $true (Confirm-OOShutUpProfile -Profile $approvedProfile) 'interactive YES accepts the reviewed profile'
     $summaryText = [string]::Join("`n", [string[]]$script:PromptMessages.ToArray())
     Assert-True ($summaryText.Contains($approvedProfile.Sha256)) 'interactive summary displays the exact profile digest'
+    Assert-True ($summaryText.Contains('O&O executable file version reviewed: 3.6.1135.0')) 'interactive summary displays the exact reviewed O&O release'
     Assert-True ($summaryText.Contains('Test category') -and $summaryText.Contains('S003') -and $summaryText.Contains('Test fixture impact description.')) 'interactive summary displays reviewed category, ID, and impact text'
+
+    $newerFixture = Join-Path $script:FixtureRoot 'newer-unreviewed.exe'
+    Write-TestPayload -Path $newerFixture -Content 'NEWER_VERSION'
+    $script:LogMessages.Clear()
+    Assert-Equal $false (Test-OOShutUpPayload -Path $newerFixture -ReviewedMinimumVersion $approvedProfile.OOShutUpVersionMinimum -ReviewedMaximumVersion $approvedProfile.OOShutUpVersionMaximum) 'a newer supported O&O release outside the exact approved range is rejected'
+    Assert-True ([string]::Join("`n", [string[]]$script:LogMessages.ToArray()).Contains($script:OOShutUpProfileVersionFailureMessage)) 'an unreviewed release reports the profile compatibility recovery instruction'
+    $startedBeforeUnreviewedRelease = $script:StartedPaths.Count
+    Assert-Equal 'Failed' (Invoke-OOShutUpConfiguration -ExecutablePath $newerFixture).State 'an unreviewed newer executable cannot apply the approved profile'
+    Assert-Equal $startedBeforeUnreviewedRelease $script:StartedPaths.Count 'an unreviewed newer release is rejected before O&O launch'
+
+    $olderFixture = Join-Path $script:FixtureRoot 'unsupported-older.exe'
+    Write-TestPayload -Path $olderFixture -Content 'OLD_VERSION'
+    Assert-Equal $false (Test-OOShutUpPayload -Path $olderFixture -ReviewedMinimumVersion $approvedProfile.OOShutUpVersionMinimum -ReviewedMaximumVersion $approvedProfile.OOShutUpVersionMaximum) 'an unsupported older O&O release is rejected'
+
+    Write-ApprovedProfileFixture `
+        -Content "# Reviewed fixture`r`nS003`t+`r`nM003;-`r`n" `
+        -AllowedSettingIds @('S003', 'M003') `
+        -OOShutUpMinimumVersion '3.6.1136.0' `
+        -OOShutUpMaximumVersion '3.6.1136.0'
+    $newerExactProfile = Get-OOShutUpApprovedProfile
+    Assert-Equal $true (Confirm-OOShutUpProfile -Profile $newerExactProfile -NonInteractive -ApprovedProfileSha256 $newerExactProfile.Sha256 -ApprovedProfileManifestSha256 $newerExactProfile.ManifestSha256) 'a newer exact-release profile is explicitly approved for the older-release rejection fixture'
+    $startedBeforeUnreviewedOlderRelease = $script:StartedPaths.Count
+    Assert-Equal 'Failed' (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture).State 'an older supported executable outside the approved range cannot apply the profile'
+    Assert-Equal $startedBeforeUnreviewedOlderRelease $script:StartedPaths.Count 'an unreviewed older release is rejected before O&O launch'
+
+    Write-ApprovedProfileFixture `
+        -Content "# Reviewed fixture`r`nS003`t+`r`nM003;-`r`n" `
+        -AllowedSettingIds @('S003', 'M003') `
+        -OOShutUpMinimumVersion '3.6.1135.0' `
+        -OOShutUpMaximumVersion '3.6.1136.0'
+    $rangeProfile = Get-OOShutUpApprovedProfile
+    Assert-Equal '3.6.1135.0 through 3.6.1136.0' ([string]$rangeProfile.OOShutUpVersionRange) 'the reviewed compatibility range is retained for approval'
+    Assert-Equal $true (Test-OOShutUpPayload -Path $newerFixture -ReviewedMinimumVersion $rangeProfile.OOShutUpVersionMinimum -ReviewedMaximumVersion $rangeProfile.OOShutUpVersionMaximum) 'a newer executable passes when it lies within the explicitly reviewed range'
+
+    Write-ApprovedProfileFixture -Content "# Reviewed fixture`r`nS003`t+`r`nM003;-`r`n" -AllowedSettingIds @('S003', 'M003')
+    $approvedProfile = Get-OOShutUpApprovedProfile
+    Assert-Equal $true (Confirm-OOShutUpProfile -Profile $approvedProfile -NonInteractive -ApprovedProfileSha256 $approvedProfile.Sha256 -ApprovedProfileManifestSha256 $approvedProfile.ManifestSha256) 'restored exact-release profile is approved with its new manifest digest'
 
     Write-ApprovedProfileFixture -Content "# Mixed-scope fixture`r`nS003`t+`r`nM003;-`r`n" -AllowedSettingIds @('S003', 'M003') -CurrentUserSettingIds @('M003')
     $mixedScopeProfile = Get-OOShutUpApprovedProfile
@@ -1458,6 +1517,51 @@ try {
     }
 
     Write-ApprovedProfileFixture -Content "S003`t+`r`n" -AllowedSettingIds @('S003')
+    $manifestWithoutVersionRange = Get-Content -LiteralPath $script:OOShutUpProfileManifestPath -Raw | ConvertFrom-Json
+    $manifestWithoutVersionRange.PSObject.Properties.Remove('ooshutupVersionRange')
+    [System.IO.File]::WriteAllText(
+        $script:OOShutUpProfileManifestPath,
+        ($manifestWithoutVersionRange | ConvertTo-Json -Depth 4),
+        [System.Text.Encoding]::UTF8
+    )
+    $startedBeforeMissingVersionRange = $script:StartedPaths.Count
+    Assert-Equal $null (Get-OOShutUpApprovedProfile) 'a schema 4 manifest without a reviewed O&O version range is rejected'
+    Assert-Equal 'Failed' (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture).State 'a missing O&O version range prevents configuration'
+    Assert-Equal $startedBeforeMissingVersionRange $script:StartedPaths.Count 'a missing O&O version range causes no process launch'
+    $lookupBeforeMissingVersionRangeTask = $script:ScheduledTaskLookupCount
+    $registrationBeforeMissingVersionRangeTask = $script:TaskRegistrationCalls.Count
+    Assert-Equal $false (New-WindowsUpdateScheduledTask -ScriptPath (Join-Path $script:FixtureRoot 'unused-missing-version-range.ps1') -ApprovedProfileSha256 ('0' * 64) -ApprovedProfileManifestSha256 ('0' * 64)) 'a missing O&O version range blocks SYSTEM task registration'
+    Assert-Equal $lookupBeforeMissingVersionRangeTask $script:ScheduledTaskLookupCount 'a missing O&O version range blocks before task lookup'
+    Assert-Equal $registrationBeforeMissingVersionRangeTask $script:TaskRegistrationCalls.Count 'a missing O&O version range blocks before task registration'
+
+    Write-ApprovedProfileFixture -Content "S003`t+`r`n" -AllowedSettingIds @('S003')
+    $legacyVersionManifest = Get-Content -LiteralPath $script:OOShutUpProfileManifestPath -Raw | ConvertFrom-Json
+    $legacyVersionManifest.schemaVersion = 3
+    $legacyVersionManifest.PSObject.Properties.Remove('ooshutupVersionRange')
+    [System.IO.File]::WriteAllText(
+        $script:OOShutUpProfileManifestPath,
+        ($legacyVersionManifest | ConvertTo-Json -Depth 4),
+        [System.Text.Encoding]::UTF8
+    )
+    Assert-Equal $null (Get-OOShutUpApprovedProfile) 'a prior schema is rejected instead of silently widened'
+
+    $legacyVersionManifest.schemaVersion = 4
+    $legacyVersionManifest.profileVersion = 'test-migrated-1.0'
+    $legacyVersionManifest | Add-Member -MemberType NoteProperty -Name ooshutupVersionRange -Value ([pscustomobject]@{
+        minimum = '3.6.1135.0'
+        maximum = '3.6.1135.0'
+    })
+    [System.IO.File]::WriteAllText(
+        $script:OOShutUpProfileManifestPath,
+        ($legacyVersionManifest | ConvertTo-Json -Depth 4),
+        [System.Text.Encoding]::UTF8
+    )
+    $migratedProfile = Get-OOShutUpApprovedProfile
+    Assert-True ($null -ne $migratedProfile) 'an owner-migrated prior profile is accepted only after adding an exact reviewed release'
+    Assert-Equal 'test-migrated-1.0' ([string]$migratedProfile.Version) 'deliberate migration records a new reviewed profile version'
+    Assert-Equal $true (Confirm-OOShutUpProfile -Profile $migratedProfile -NonInteractive -ApprovedProfileSha256 $migratedProfile.Sha256 -ApprovedProfileManifestSha256 $migratedProfile.ManifestSha256) 'deliberate migration requires approval of the migrated manifest digest'
+
+    Write-ApprovedProfileFixture -Content "S003`t+`r`n" -AllowedSettingIds @('S003')
     $legacyManifest = Get-Content -LiteralPath $script:OOShutUpProfileManifestPath -Raw | ConvertFrom-Json
     $legacyManifest.schemaVersion = 2
     $legacyManifest.settingDetails[0].PSObject.Properties.Remove('scope')
@@ -1624,6 +1728,16 @@ try {
         Assert-Equal $lookupsBeforeMissingPayload $script:ScheduledTaskLookupCount 'a missing managed executable does not inspect existing tasks'
         Assert-Equal $registrationsBeforeMissingPayload $script:TaskRegistrationCalls.Count 'a missing managed executable does not register or replace tasks'
         Assert-True ([string]::Join("`n", [string[]]$script:LogMessages.ToArray()).Contains($script:OOShutUpManagedPathFailureMessage)) 'a missing managed executable reports its recovery instruction'
+        Write-TestPayload -Path $script:ManagedExecutablePath -Content 'VALID'
+
+        $lookupsBeforeUnreviewedTaskVersion = $script:ScheduledTaskLookupCount
+        $registrationsBeforeUnreviewedTaskVersion = $script:TaskRegistrationCalls.Count
+        Write-TestPayload -Path $script:ManagedExecutablePath -Content 'NEWER_VERSION'
+        $script:LogMessages.Clear()
+        Assert-Equal $false (New-WindowsUpdateScheduledTask -ScriptPath $taskScriptPath -ApprovedProfileSha256 $taskProfile.Sha256 -ApprovedProfileManifestSha256 $taskProfile.ManifestSha256) 'task creation refuses an O&O executable newer than the reviewed exact release'
+        Assert-Equal $lookupsBeforeUnreviewedTaskVersion $script:ScheduledTaskLookupCount 'an unreviewed task executable blocks before task lookup'
+        Assert-Equal $registrationsBeforeUnreviewedTaskVersion $script:TaskRegistrationCalls.Count 'an unreviewed task executable blocks before task registration'
+        Assert-True ([string]::Join("`n", [string[]]$script:LogMessages.ToArray()).Contains($script:OOShutUpProfileVersionFailureMessage)) 'task creation reports the unreviewed O&O version rejection'
         Write-TestPayload -Path $script:ManagedExecutablePath -Content 'VALID'
 
         $registrationsBeforeMissingFile = $script:TaskRegistrationCalls.Count

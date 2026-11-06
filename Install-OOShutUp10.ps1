@@ -168,6 +168,7 @@ $script:OOShutUpProfileDirectory = Join-Path $PSScriptRoot 'profiles'
 $script:OOShutUpProfilePath = Join-Path $script:OOShutUpProfileDirectory 'ooshutup10.cfg'
 $script:OOShutUpProfileManifestPath = Join-Path $script:OOShutUpProfileDirectory 'ooshutup10.approval.json'
 $script:OOShutUpProfileFailureMessage = 'The approved settings profile is missing or invalid. No privacy settings were applied; place the reviewed profile in the configured directory.'
+$script:OOShutUpProfileVersionFailureMessage = 'The O&O executable version is outside the profile review range. No settings were changed; review and reapprove the profile for this release before applying settings or registering a SYSTEM task.'
 $script:OOShutUpProfileSnapshotFailureMessage = 'The approved profile changed after validation. No O&O process was started; restore the reviewed profile and retry.'
 $script:OOShutUpUnknownScopeFailureMessage = 'The task profile contains settings with unknown user scope. Reapplication was skipped; review the profile scope before retrying.'
 $script:OOShutUpCurrentUserScopeFailureMessage = 'The SYSTEM task profile contains current-user settings. Reapplication was skipped; run them for the intended signed-in user or remove them from the SYSTEM task profile.'
@@ -1360,10 +1361,17 @@ function Test-OOShutUpPayload {
         [string]$Path,
 
         [Parameter(Mandatory = $false)]
-        [switch]$Quiet
+        [switch]$Quiet,
+
+        [Parameter(Mandatory = $false)]
+        [string]$ReviewedMinimumVersion,
+
+        [Parameter(Mandatory = $false)]
+        [string]$ReviewedMaximumVersion
     )
 
     $isVerified = $false
+    $profileVersionMismatch = $false
 
     try {
         if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
@@ -1393,10 +1401,36 @@ function Test-OOShutUpPayload {
             throw 'The payload is not the O&O ShutUp10 product.'
         }
 
+        $fileVersionText = [string]$versionInfo.FileVersion
         $fileVersion = $null
-        if (-not [version]::TryParse([string]$versionInfo.FileVersion, [ref]$fileVersion) -or
+        if (-not [version]::TryParse($fileVersionText, [ref]$fileVersion) -or
             $fileVersion -lt $MinimumOOShutUpVersion) {
             throw 'The payload version is missing or older than the supported release.'
+        }
+
+        $hasReviewedMinimum = -not [string]::IsNullOrWhiteSpace($ReviewedMinimumVersion)
+        $hasReviewedMaximum = -not [string]::IsNullOrWhiteSpace($ReviewedMaximumVersion)
+        if ($hasReviewedMinimum -xor $hasReviewedMaximum) {
+            $profileVersionMismatch = $true
+            throw 'The reviewed O&O version range is incomplete.'
+        }
+        if ($hasReviewedMinimum) {
+            $reviewedMinimum = $null
+            $reviewedMaximum = $null
+            if (-not [version]::TryParse($ReviewedMinimumVersion, [ref]$reviewedMinimum) -or
+                $reviewedMinimum.ToString(4) -cne $ReviewedMinimumVersion -or
+                -not [version]::TryParse($ReviewedMaximumVersion, [ref]$reviewedMaximum) -or
+                $reviewedMaximum.ToString(4) -cne $ReviewedMaximumVersion -or
+                $reviewedMaximum -lt $reviewedMinimum) {
+                $profileVersionMismatch = $true
+                throw 'The reviewed O&O version range is invalid.'
+            }
+            if ($fileVersion.ToString(4) -cne $fileVersionText -or
+                $fileVersion -lt $reviewedMinimum -or
+                $fileVersion -gt $reviewedMaximum) {
+                $profileVersionMismatch = $true
+                throw 'The payload version is outside the profile review range.'
+            }
         }
 
         $isVerified = $true
@@ -1406,7 +1440,12 @@ function Test-OOShutUpPayload {
     }
 
     if (-not $isVerified -and -not $Quiet) {
-        Write-Log $OOShutUpPayloadFailureMessage -Level ERROR
+        if ($profileVersionMismatch) {
+            Write-Log $script:OOShutUpProfileVersionFailureMessage -Level ERROR
+        }
+        else {
+            Write-Log $OOShutUpPayloadFailureMessage -Level ERROR
+        }
     }
 
     return $isVerified
@@ -1497,10 +1536,15 @@ function Get-OOShutUpApprovedProfile {
         }
         $manifest = ConvertFrom-Json -InputObject $manifestText -ErrorAction Stop
         $manifestPropertyNames = @($manifest.PSObject.Properties.Name)
-        $requiredManifestProperties = @('schemaVersion', 'profileVersion', 'sha256', 'settingIds', 'settingDetails')
+        $requiredManifestProperties = @('schemaVersion', 'ooshutupVersionRange', 'profileVersion', 'sha256', 'settingIds', 'settingDetails')
+        $hasNumericSchemaVersion = $manifest.schemaVersion -is [int] -or $manifest.schemaVersion -is [long]
         if ($RequireMachineScope -and
-            (($manifestPropertyNames -cnotcontains 'schemaVersion') -or $manifest.schemaVersion -ne 3)) {
+            (-not $hasNumericSchemaVersion -or [long]$manifest.schemaVersion -lt 3)) {
             $failureMessage = $script:OOShutUpUnknownScopeFailureMessage
+        }
+        elseif ($RequireMachineScope -and
+            (-not $hasNumericSchemaVersion -or [long]$manifest.schemaVersion -ne 4)) {
+            $failureMessage = $script:OOShutUpProfileFailureMessage
         }
         if ($manifestPropertyNames.Count -ne $requiredManifestProperties.Count) {
             throw 'The profile approval manifest has an unexpected shape.'
@@ -1511,8 +1555,8 @@ function Get-OOShutUpApprovedProfile {
             }
         }
 
-        if (($manifest.schemaVersion -isnot [int] -and $manifest.schemaVersion -isnot [long]) -or
-            [long]$manifest.schemaVersion -ne 3 -or
+        if (-not $hasNumericSchemaVersion -or
+            [long]$manifest.schemaVersion -ne 4 -or
             $manifest.profileVersion -isnot [string] -or
             $manifest.profileVersion -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$' -or
             $manifest.sha256 -isnot [string] -or
@@ -1522,6 +1566,31 @@ function Get-OOShutUpApprovedProfile {
             $manifest.settingDetails -isnot [System.Array] -or
             $null -eq $manifest.settingDetails) {
             throw 'The profile approval manifest contains invalid metadata.'
+        }
+
+        $versionRangePropertyNames = @()
+        if ($null -ne $manifest.ooshutupVersionRange) {
+            $versionRangePropertyNames = @($manifest.ooshutupVersionRange.PSObject.Properties.Name)
+        }
+        if ($null -eq $manifest.ooshutupVersionRange -or
+            $manifest.ooshutupVersionRange -is [string] -or
+            $manifest.ooshutupVersionRange -is [System.Array] -or
+            $versionRangePropertyNames.Count -ne 2 -or
+            $versionRangePropertyNames -cnotcontains 'minimum' -or
+            $versionRangePropertyNames -cnotcontains 'maximum' -or
+            $manifest.ooshutupVersionRange.minimum -isnot [string] -or
+            $manifest.ooshutupVersionRange.maximum -isnot [string]) {
+            throw 'The reviewed O&O version range is missing or malformed.'
+        }
+        $reviewedMinimumVersion = $null
+        $reviewedMaximumVersion = $null
+        if (-not [version]::TryParse([string]$manifest.ooshutupVersionRange.minimum, [ref]$reviewedMinimumVersion) -or
+            $reviewedMinimumVersion.ToString(4) -cne [string]$manifest.ooshutupVersionRange.minimum -or
+            -not [version]::TryParse([string]$manifest.ooshutupVersionRange.maximum, [ref]$reviewedMaximumVersion) -or
+            $reviewedMaximumVersion.ToString(4) -cne [string]$manifest.ooshutupVersionRange.maximum -or
+            $reviewedMinimumVersion -lt $MinimumOOShutUpVersion -or
+            $reviewedMaximumVersion -lt $reviewedMinimumVersion) {
+            throw 'The reviewed O&O version range is invalid or includes an unsupported release.'
         }
 
         $allowedSettingIds = @($manifest.settingIds)
@@ -1661,9 +1730,19 @@ function Get-OOShutUpApprovedProfile {
             }
         }
 
+        $reviewedVersionRange = if ($reviewedMinimumVersion -eq $reviewedMaximumVersion) {
+            [string]$manifest.ooshutupVersionRange.minimum
+        }
+        else {
+            '{0} through {1}' -f [string]$manifest.ooshutupVersionRange.minimum, [string]$manifest.ooshutupVersionRange.maximum
+        }
+
         return [pscustomobject]@{
             Path          = [System.IO.Path]::GetFullPath($script:OOShutUpProfilePath)
             Version       = [string]$manifest.profileVersion
+            OOShutUpVersionMinimum = [string]$manifest.ooshutupVersionRange.minimum
+            OOShutUpVersionMaximum = [string]$manifest.ooshutupVersionRange.maximum
+            OOShutUpVersionRange = $reviewedVersionRange
             Sha256        = $actualDigest
             ManifestSha256 = $manifestDigest
             SettingCount  = $profileSettingIds.Count
@@ -1695,6 +1774,7 @@ function Show-OOShutUpProfileImpactSummary {
     Write-Host ''
     Write-Host 'Review this O&O ShutUp10 settings profile before any system changes:'
     Write-Host ('Profile version: {0}' -f $Profile.Version)
+    Write-Host ('O&O executable file version reviewed: {0}' -f $Profile.OOShutUpVersionRange)
     Write-Host ('Profile SHA-256: {0}' -f $Profile.Sha256)
     Write-Host ('Profile manifest SHA-256: {0}' -f $Profile.ManifestSha256)
     Write-Host ('Settings: {0}' -f $Profile.SettingCount)
@@ -2221,7 +2301,10 @@ function Invoke-OOShutUpConfigurationCore {
             return $script:OOShutUpLastRunOutcome
         }
 
-        if (-not (Test-OOShutUpPayload -Path $ExecutablePath)) {
+        if (-not (Test-OOShutUpPayload `
+                -Path $ExecutablePath `
+                -ReviewedMinimumVersion $approvedProfile.OOShutUpVersionMinimum `
+                -ReviewedMaximumVersion $approvedProfile.OOShutUpVersionMaximum)) {
             return $script:OOShutUpLastRunOutcome
         }
 
@@ -3489,6 +3572,12 @@ function New-WindowsUpdateScheduledTask {
             Write-Log $script:OOShutUpManagedPathFailureMessage -Level ERROR
             return $false
         }
+        if (-not (Test-OOShutUpPayload `
+                -Path $approvedOOSExecutablePath `
+                -ReviewedMinimumVersion $currentApprovedProfile.OOShutUpVersionMinimum `
+                -ReviewedMaximumVersion $currentApprovedProfile.OOShutUpVersionMaximum)) {
+            return $false
+        }
 
         $expectedPowerShellPaths = Get-WindowsPowerShellExecutablePaths
         $trustedPowerShellPath = Get-TrustedWindowsPowerShellExecutable
@@ -3499,7 +3588,7 @@ function New-WindowsUpdateScheduledTask {
             return $false
         }
 
-        Write-Log ("Scheduled task principal SID S-1-5-18 passed the machine-scope gate for {0} settings (profile SHA-256 {1}; manifest SHA-256 {2}); setting values are omitted." -f $currentApprovedProfile.SettingCount, $currentApprovedProfile.Sha256, $currentApprovedProfile.ManifestSha256) -Level INFO
+        Write-Log ("Scheduled task principal SID S-1-5-18 passed the machine-scope gate for {0} settings reviewed for O&O file version range {1} (profile SHA-256 {2}; manifest SHA-256 {3}); setting values are omitted." -f $currentApprovedProfile.SettingCount, $currentApprovedProfile.OOShutUpVersionRange, $currentApprovedProfile.Sha256, $currentApprovedProfile.ManifestSha256) -Level INFO
 
         Write-Log "Creating scheduled task for post-Windows Update execution..." -Level INFO
         Write-Log ("The task listens for Windows Update installation-success event 19 with a two-minute delay; overlapping reapplications are queued sequentially. The O&O child wait is limited to {0} seconds and the task execution limit is {1}." -f $script:OOShutUpChildTimeoutSeconds, $script:OOShutUpTaskExecutionTimeLimit) -Level INFO
@@ -4135,7 +4224,7 @@ try {
     if ($null -eq $approvedProfile) {
         exit 1
     }
-    Write-Log ("Validated approved settings profile version {0} (profile SHA-256 {1}; manifest SHA-256 {2}; {3} settings). Setting values are omitted from logs." -f $approvedProfile.Version, $approvedProfile.Sha256, $approvedProfile.ManifestSha256, $approvedProfile.SettingCount) -Level INFO
+    Write-Log ("Validated approved settings profile version {0} for O&O file version range {1} (profile SHA-256 {2}; manifest SHA-256 {3}; {4} settings). Setting values are omitted from logs." -f $approvedProfile.Version, $approvedProfile.OOShutUpVersionRange, $approvedProfile.Sha256, $approvedProfile.ManifestSha256, $approvedProfile.SettingCount) -Level INFO
 
     $profileApprovalAccepted = Confirm-OOShutUpProfile `
         -Profile $approvedProfile `
