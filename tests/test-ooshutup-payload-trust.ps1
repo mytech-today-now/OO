@@ -687,6 +687,10 @@ try {
     Assert-True ($profileGatePosition -ge 0) 'main execution performs the profile preflight'
     $profileApprovalGatePosition = $mainSource.IndexOf('$profileApprovalAccepted = Confirm-OOShutUpProfile', [System.StringComparison]::Ordinal)
     Assert-True ($profileApprovalGatePosition -gt $profileGatePosition) 'main execution requires an approval decision after profile validation'
+    $relocationTargetPosition = $mainSource.IndexOf('$relocationTarget = Get-ScriptRelocationPackageTarget', [System.StringComparison]::Ordinal)
+    $relocationPosition = $mainSource.IndexOf('Invoke-ScriptRelocation -CurrentScriptPath', [System.StringComparison]::Ordinal)
+    Assert-True ($relocationTargetPosition -gt $profileApprovalGatePosition -and $relocationPosition -gt $relocationTargetPosition) 'the content-addressed package target is derived only after approval and before relocation'
+    Assert-True ($mainSource.Contains('-ScriptFileName $ScriptFileName') -and $mainSource.Contains('$DefaultScriptPath = $relocationTarget.ScriptPath')) 'the package and task use the same installed script entry-point path'
     $reapplyStart = $mainSource.IndexOf('if ($ReapplyOnly)', [System.StringComparison]::Ordinal)
     $reapplyPathPosition = $mainSource.IndexOf('$exePath = Get-OOShutUpPath', $reapplyStart, [System.StringComparison]::Ordinal)
     Assert-True ($reapplyStart -ge 0 -and $reapplyPathPosition -gt $reapplyStart) 'SYSTEM ReapplyOnly resolves the executable through the managed-path lookup'
@@ -703,6 +707,9 @@ try {
     }
     Assert-True ($mainSource.Contains('-ScriptPath $currentScriptPath') -and $mainSource.Contains('-ApprovedProfileSha256 $approvedProfile.Sha256')) 'scheduled task setup receives the running package and validated profile digest'
     Assert-True ($mainSource.Contains('-ApprovedProfileManifestSha256 $approvedProfile.ManifestSha256')) 'scheduled task setup receives the exact scope manifest digest'
+    $taskSetupCallPosition = $mainSource.IndexOf('$taskSetup = Invoke-OOShutUpTaskSetup', [System.StringComparison]::Ordinal)
+    $taskScriptPathPosition = $mainSource.IndexOf('-ScriptPath $currentScriptPath', $taskSetupCallPosition, [System.StringComparison]::Ordinal)
+    Assert-True ($taskSetupCallPosition -ge 0 -and $taskScriptPathPosition -gt $taskSetupCallPosition) 'task setup uses the current complete package path after relocation or in-place fallback'
     Assert-True ($source.Contains('The privacy settings may be applied, but the update task was not verified. Setup is partial; repair the task before relying on automatic reapplication.')) 'task failure uses the exact partial setup status'
     Assert-True ($source.Contains('Verify \myTech.Today\Install-OOShutUp10 in Task Scheduler')) 'partial setup includes the exact task identity for recovery'
     Assert-True ($mainSource.Contains('$taskSetup = Invoke-OOShutUpTaskSetup') -and $mainSource.Contains('$installerOutcome = Get-OOShutUpInstallOutcome')) 'the normal flow consumes explicit task and installer outcomes'

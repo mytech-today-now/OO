@@ -148,6 +148,7 @@ $script:ScriptVersion = '2.3.0'
 
 # Default installation paths
 $DefaultScriptRoot = "$env:USERPROFILE\myTech.Today\scripts\Install-OOShutUp10"
+$script:DefaultScriptPackageContainer = Join-Path $DefaultScriptRoot 'packages'
 $ScriptFileName = "Install-OOShutUp10.ps1"
 $DefaultScriptPath = Join-Path $DefaultScriptRoot $ScriptFileName
 
@@ -455,6 +456,310 @@ function Initialize-LogFile {
 
 #endregion
 
+function Get-ScriptRelocationPackageTarget {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$CurrentScriptPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ProfileDirectory,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ScriptFileName,
+
+        [Parameter(Mandatory = $true)]
+        [string]$PackageContainer,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ApprovedProfileSha256,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ApprovedProfileManifestSha256
+    )
+
+    $profilePath = Join-Path $ProfileDirectory 'ooshutup10.cfg'
+    $manifestPath = Join-Path $ProfileDirectory 'ooshutup10.approval.json'
+    foreach ($path in @($CurrentScriptPath, $profilePath, $manifestPath)) {
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            throw "The relocation package source file is missing: $path"
+        }
+    }
+
+    $digests = [ordered]@{
+        Script   = (Get-FileHash -LiteralPath $CurrentScriptPath -Algorithm SHA256 -ErrorAction Stop).Hash
+        Profile  = (Get-FileHash -LiteralPath $profilePath -Algorithm SHA256 -ErrorAction Stop).Hash
+        Manifest = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256 -ErrorAction Stop).Hash
+    }
+    if ($ApprovedProfileSha256 -notmatch '^[A-Fa-f0-9]{64}$' -or
+        $ApprovedProfileManifestSha256 -notmatch '^[A-Fa-f0-9]{64}$' -or
+        -not [string]::Equals($digests.Profile, $ApprovedProfileSha256, [System.StringComparison]::OrdinalIgnoreCase) -or
+        -not [string]::Equals($digests.Manifest, $ApprovedProfileManifestSha256, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw 'The relocation profile source no longer matches both approved SHA-256 digests.'
+    }
+
+    $packageMaterial = '{0}:{1}:{2}' -f $digests.Script, $digests.Profile, $digests.Manifest
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $packageId = ([System.BitConverter]::ToString(
+            $sha256.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($packageMaterial))
+        )).Replace('-', '').ToLowerInvariant()
+    }
+    finally {
+        $sha256.Dispose()
+    }
+
+    $targetRoot = Join-Path (Join-Path $PackageContainer 'releases') $packageId
+    return [pscustomobject]@{
+        PackageId = $packageId
+        Digests = $digests
+        Root = $targetRoot
+        ScriptPath = Join-Path $targetRoot $ScriptFileName
+    }
+}
+
+function Test-ScriptRelocationPackage {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$PackageRoot,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ScriptFileName,
+
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary]$ExpectedDigests
+    )
+
+    try {
+        if (-not (Test-SystemTaskTargetAcl -ScriptPath $PackageRoot -AllowDirectory)) {
+            return $false
+        }
+
+        $filePaths = [ordered]@{
+            Script   = Join-Path $PackageRoot $ScriptFileName
+            Profile  = Join-Path (Join-Path $PackageRoot 'profiles') 'ooshutup10.cfg'
+            Manifest = Join-Path (Join-Path $PackageRoot 'profiles') 'ooshutup10.approval.json'
+        }
+        foreach ($key in @('Script', 'Profile', 'Manifest')) {
+            $path = [string]$filePaths[$key]
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or
+                -not (Test-SystemTaskTargetAcl -ScriptPath $path)) {
+                return $false
+            }
+            $actualDigest = (Get-FileHash -LiteralPath $path -Algorithm SHA256 -ErrorAction Stop).Hash
+            if (-not [string]::Equals(
+                $actualDigest,
+                [string]$ExpectedDigests[$key],
+                [System.StringComparison]::OrdinalIgnoreCase
+            )) {
+                return $false
+            }
+        }
+
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+function Move-ScriptRelocationDirectory {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Source,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Destination
+    )
+
+    # Source and destination are unique sibling directories on the same volume.
+    [System.IO.Directory]::Move($Source, $Destination)
+}
+
+function Remove-ScriptRelocationStage {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$StageRoot,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ScriptFileName
+    )
+
+    if (-not [System.IO.Directory]::Exists($StageRoot)) {
+        return
+    }
+
+    $stageItem = Get-Item -LiteralPath $StageRoot -Force -ErrorAction Stop
+    if (([int]$stageItem.Attributes -band [int][System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw 'The relocation staging path became a reparse point; it was left untouched.'
+    }
+
+    $profileDirectory = Join-Path $StageRoot 'profiles'
+    if ([System.IO.Directory]::Exists($profileDirectory)) {
+        $profileItem = Get-Item -LiteralPath $profileDirectory -Force -ErrorAction Stop
+        if (([int]$profileItem.Attributes -band [int][System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'The staged profile directory became a reparse point; it was left untouched.'
+        }
+        foreach ($fileName in @('ooshutup10.cfg', 'ooshutup10.approval.json')) {
+            $filePath = Join-Path $profileDirectory $fileName
+            if ([System.IO.File]::Exists($filePath)) {
+                [System.IO.File]::Delete($filePath)
+            }
+        }
+        [System.IO.Directory]::Delete($profileDirectory, $false)
+    }
+
+    $scriptPath = Join-Path $StageRoot $ScriptFileName
+    if ([System.IO.File]::Exists($scriptPath)) {
+        [System.IO.File]::Delete($scriptPath)
+    }
+    [System.IO.Directory]::Delete($StageRoot, $false)
+}
+
+function Install-ScriptRelocationPackage {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$CurrentScriptPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$TargetRoot,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ScriptFileName,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ProfileDirectory,
+
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary]$ExpectedDigests
+    )
+
+    $targetRoot = [System.IO.Path]::GetFullPath($TargetRoot)
+    $targetParent = [System.IO.Path]::GetDirectoryName($targetRoot)
+    if ([string]::IsNullOrWhiteSpace($targetParent)) {
+        throw 'The relocation package target has no parent directory.'
+    }
+
+    if ([System.IO.Directory]::Exists($targetRoot)) {
+        if (Test-ScriptRelocationPackage -PackageRoot $targetRoot -ScriptFileName $ScriptFileName -ExpectedDigests $ExpectedDigests) {
+            return $true
+        }
+        throw 'The content-addressed relocation target exists but its files or ACLs do not verify; it was left unchanged.'
+    }
+    if ([System.IO.File]::Exists($targetRoot)) {
+        throw 'The content-addressed relocation target is occupied by a file; it was left unchanged.'
+    }
+
+    [System.IO.Directory]::CreateDirectory($targetParent) | Out-Null
+    $stageRoot = Join-Path $targetParent ('.stage-{0}' -f [guid]::NewGuid().ToString('N'))
+    $stageProfileDirectory = Join-Path $stageRoot 'profiles'
+    try {
+        [System.IO.Directory]::CreateDirectory($stageRoot) | Out-Null
+        [System.IO.Directory]::CreateDirectory($stageProfileDirectory) | Out-Null
+
+        $sourcePaths = [ordered]@{
+            Script   = $CurrentScriptPath
+            Profile  = Join-Path $ProfileDirectory 'ooshutup10.cfg'
+            Manifest = Join-Path $ProfileDirectory 'ooshutup10.approval.json'
+        }
+        foreach ($key in @('Script', 'Profile', 'Manifest')) {
+            $sourcePath = [string]$sourcePaths[$key]
+            if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
+                throw "The relocation source file is missing: $sourcePath"
+            }
+            $sourceDigest = (Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256 -ErrorAction Stop).Hash
+            if (-not [string]::Equals(
+                $sourceDigest,
+                [string]$ExpectedDigests[$key],
+                [System.StringComparison]::OrdinalIgnoreCase
+            )) {
+                throw "The relocation source file changed after approval: $sourcePath"
+            }
+        }
+
+        Copy-Item -LiteralPath $CurrentScriptPath -Destination (Join-Path $stageRoot $ScriptFileName) -Force -ErrorAction Stop
+        Copy-Item -LiteralPath (Join-Path $ProfileDirectory 'ooshutup10.cfg') -Destination (Join-Path $stageProfileDirectory 'ooshutup10.cfg') -Force -ErrorAction Stop
+        Copy-Item -LiteralPath (Join-Path $ProfileDirectory 'ooshutup10.approval.json') -Destination (Join-Path $stageProfileDirectory 'ooshutup10.approval.json') -Force -ErrorAction Stop
+
+        foreach ($key in @('Script', 'Profile', 'Manifest')) {
+            $sourcePath = [string]$sourcePaths[$key]
+            $sourceDigest = (Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256 -ErrorAction Stop).Hash
+            if (-not [string]::Equals(
+                $sourceDigest,
+                [string]$ExpectedDigests[$key],
+                [System.StringComparison]::OrdinalIgnoreCase
+            )) {
+                throw "The relocation source file changed while staging: $sourcePath"
+            }
+        }
+
+        if (-not (Test-ScriptRelocationPackage -PackageRoot $stageRoot -ScriptFileName $ScriptFileName -ExpectedDigests $ExpectedDigests)) {
+            throw 'The staged relocation package digests or target ACLs could not be verified.'
+        }
+
+        # A concurrent run may have promoted this same content-addressed package.
+        if ([System.IO.Directory]::Exists($targetRoot)) {
+            if (Test-ScriptRelocationPackage -PackageRoot $targetRoot -ScriptFileName $ScriptFileName -ExpectedDigests $ExpectedDigests) {
+                Remove-ScriptRelocationStage -StageRoot $stageRoot -ScriptFileName $ScriptFileName
+                return $true
+            }
+            throw 'Another relocation created an invalid content-addressed target; it was left unchanged.'
+        }
+
+        try {
+            Move-ScriptRelocationDirectory -Source $stageRoot -Destination $targetRoot
+        }
+        catch {
+            # A move API can report an error after completing the same-volume rename. Only accept it after full verification.
+            $moveFailure = $_.Exception.Message
+            if (-not [System.IO.Directory]::Exists($stageRoot)) {
+                if (Test-ScriptRelocationPackage -PackageRoot $targetRoot -ScriptFileName $ScriptFileName -ExpectedDigests $ExpectedDigests) {
+                    return $true
+                }
+                if ([System.IO.Directory]::Exists($targetRoot)) {
+                    $rejectedRoot = Join-Path $targetParent ('.rejected-{0}' -f [guid]::NewGuid().ToString('N'))
+                    try {
+                        Move-ScriptRelocationDirectory -Source $targetRoot -Destination $rejectedRoot
+                    }
+                    catch {
+                        throw ("The directory move failed and the unverified package could not be moved aside from '{0}': {1}. Original move error: {2}" -f $targetRoot, $_.Exception.Message, $moveFailure)
+                    }
+                }
+            }
+            throw "The package promotion move failed: $moveFailure"
+        }
+
+        if (-not (Test-ScriptRelocationPackage -PackageRoot $targetRoot -ScriptFileName $ScriptFileName -ExpectedDigests $ExpectedDigests)) {
+            $rejectedRoot = Join-Path $targetParent ('.rejected-{0}' -f [guid]::NewGuid().ToString('N'))
+            try {
+                Move-ScriptRelocationDirectory -Source $targetRoot -Destination $rejectedRoot
+            }
+            catch {
+                throw ("The promoted package failed verification and could not be moved aside from '{0}': {1}" -f $targetRoot, $_.Exception.Message)
+            }
+            throw "The promoted package failed its post-promotion digest or ACL check and was retained at '$rejectedRoot'."
+        }
+
+        return $true
+    }
+    catch {
+        $failure = $_.Exception.Message
+        if ([System.IO.Directory]::Exists($stageRoot)) {
+            try {
+                Remove-ScriptRelocationStage -StageRoot $stageRoot -ScriptFileName $ScriptFileName
+            }
+            catch {
+                $failure = '{0} Staging cleanup failed and the inactive directory remains at {1}: {2}' -f $failure, $stageRoot, $_.Exception.Message
+            }
+        }
+        throw "Script relocation package was not activated: $failure"
+    }
+}
+
 function Invoke-ScriptRelocation {
     <#
     .SYNOPSIS
@@ -467,49 +772,23 @@ function Invoke-ScriptRelocation {
     )
 
     try {
-        # Check if already running from default location
-        if ($CurrentScriptPath -eq $DefaultScriptPath) {
+        $canonicalCurrentPath = [System.IO.Path]::GetFullPath($CurrentScriptPath)
+        $canonicalDefaultPath = [System.IO.Path]::GetFullPath($DefaultScriptPath)
+        # Check if already running from this content-addressed package location.
+        if ([string]::Equals($canonicalCurrentPath, $canonicalDefaultPath, [System.StringComparison]::OrdinalIgnoreCase)) {
             Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [INFO] Script is already running from default location" -ForegroundColor Cyan
             return $true
         }
 
-        Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [INFO] Relocating script to default location..." -ForegroundColor Cyan
+        Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [INFO] Staging the approved script and profile package..." -ForegroundColor Cyan
+        Install-ScriptRelocationPackage `
+            -CurrentScriptPath $CurrentScriptPath `
+            -TargetRoot $DefaultScriptRoot `
+            -ScriptFileName $ScriptFileName `
+            -ProfileDirectory $script:OOShutUpProfileDirectory `
+            -ExpectedDigests $script:OOShutUpRelocationPackageDigests | Out-Null
 
-        # Create default directory if it doesn't exist
-        if (-not (Test-Path $DefaultScriptRoot)) {
-            New-Item -Path $DefaultScriptRoot -ItemType Directory -Force | Out-Null
-            Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [SUCCESS] Created directory: $DefaultScriptRoot" -ForegroundColor Green
-        }
-
-        # Copy script to default location (terminating on failure so we don't print a misleading success line)
-        Copy-Item -Path $CurrentScriptPath -Destination $DefaultScriptPath -Force -ErrorAction Stop
-
-        # Verify the copy actually produced an identical file (guards against locked/stale destinations)
-        $sourceHash = (Get-FileHash -Path $CurrentScriptPath -Algorithm SHA256 -ErrorAction Stop).Hash
-        $destHash = (Get-FileHash -Path $DefaultScriptPath -Algorithm SHA256 -ErrorAction Stop).Hash
-        if ($sourceHash -ne $destHash) {
-            Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [WARN] Relocated script hash mismatch (destination may be locked or stale). Continuing in-place." -ForegroundColor Yellow
-            return $false
-        }
-
-        # Keep the reviewed profile package beside the relocated script for interactive and SYSTEM runs.
-        $destinationProfileDirectory = Join-Path $DefaultScriptRoot 'profiles'
-        if (-not (Test-Path -LiteralPath $destinationProfileDirectory -PathType Container)) {
-            New-Item -Path $destinationProfileDirectory -ItemType Directory -Force -ErrorAction Stop | Out-Null
-        }
-        foreach ($profileFileName in @('ooshutup10.cfg', 'ooshutup10.approval.json')) {
-            $sourceProfileFile = Join-Path $script:OOShutUpProfileDirectory $profileFileName
-            $destinationProfileFile = Join-Path $destinationProfileDirectory $profileFileName
-            Copy-Item -LiteralPath $sourceProfileFile -Destination $destinationProfileFile -Force -ErrorAction Stop
-            $sourceProfileHash = (Get-FileHash -LiteralPath $sourceProfileFile -Algorithm SHA256 -ErrorAction Stop).Hash
-            $destinationProfileHash = (Get-FileHash -LiteralPath $destinationProfileFile -Algorithm SHA256 -ErrorAction Stop).Hash
-            if ($sourceProfileHash -ne $destinationProfileHash) {
-                Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [WARN] Relocated settings profile hash mismatch. Continuing in-place." -ForegroundColor Yellow
-                return $false
-            }
-        }
-
-        Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [SUCCESS] Script copied to: $DefaultScriptPath" -ForegroundColor Green
+        Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [SUCCESS] Verified package promoted to: $DefaultScriptRoot" -ForegroundColor Green
 
         # Re-execute from default location with same parameters
         Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [INFO] Re-executing from default location..." -ForegroundColor Cyan
@@ -3222,16 +3501,30 @@ try {
         exit 1
     }
 
+    $currentPath = $PSCommandPath
+    if ([string]::IsNullOrEmpty($currentPath)) {
+        $currentPath = $MyInvocation.MyCommand.Path
+    }
+    $relocationTarget = Get-ScriptRelocationPackageTarget `
+        -CurrentScriptPath $currentPath `
+        -ProfileDirectory $script:OOShutUpProfileDirectory `
+        -ScriptFileName $ScriptFileName `
+        -PackageContainer $script:DefaultScriptPackageContainer `
+        -ApprovedProfileSha256 $script:OOShutUpApprovedDigest `
+        -ApprovedProfileManifestSha256 $script:OOShutUpApprovedManifestDigest
+    $DefaultScriptRoot = $relocationTarget.Root
+    $DefaultScriptPath = $relocationTarget.ScriptPath
+    $script:OOShutUpRelocationPackageDigests = $relocationTarget.Digests
+
     # Step 0: Ensure script is running from default location (unless SkipRelocate is set)
     if (-not $SkipRelocate) {
         Update-ScriptProgress -PercentComplete 5 -Status "Initializing..." -CurrentOperation "Checking script location"
 
-        $currentPath = $PSCommandPath
-        if ([string]::IsNullOrEmpty($currentPath)) {
-            $currentPath = $MyInvocation.MyCommand.Path
-        }
-
-        if ($currentPath -ne $DefaultScriptPath) {
+        if (-not [string]::Equals(
+            [System.IO.Path]::GetFullPath($currentPath),
+            [System.IO.Path]::GetFullPath($DefaultScriptPath),
+            [System.StringComparison]::OrdinalIgnoreCase
+        )) {
             Invoke-ScriptRelocation -CurrentScriptPath $currentPath
             # If we reach here, relocation failed, but continue anyway
         }
