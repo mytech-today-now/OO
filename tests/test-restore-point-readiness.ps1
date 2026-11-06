@@ -34,6 +34,8 @@ $script:OOShutUpApprovalConfirmed = $true
 $script:OOShutUpApprovedDigest = 'profile-digest'
 $script:OOShutUpApprovedManifestDigest = 'manifest-digest'
 $script:OOShutUpLastRunChanged = $false
+$script:OOShutUpMutationMutexName = "Global\myTech.Today.OOShutUp.RestorePointTest.$PID"
+$script:OOShutUpMutationLockTimeoutMilliseconds = 600000
 
 function Assert-True {
     param([bool]$Condition, [string]$Message)
@@ -323,16 +325,25 @@ try {
     Assert-True ($source.Contains($script:OOShutUpRestorePointPreparationFailureMessage)) 'restore preparation has the exact fail-closed status'
     Assert-True ($source -notmatch 'Set-ItemProperty\s+-[^\r\n]*-Type\b') 'Set-ItemProperty is not passed the unsupported Type parameter'
     Assert-True (-not $source.Contains('Set-RestorePointFrequency | Out-Null')) 'the main flow no longer discards restore preparation status'
+    Assert-True ($source.Contains("`$script:OOShutUpMutationMutexName = 'Global\myTech.Today.OOShutUp.Mutation'")) 'manual and SYSTEM runs use the same Global named mutex'
+    Assert-True ($source.Contains('$script:OOShutUpMutationLockTimeoutMilliseconds = 600000')) 'the machine-wide mutex has a documented ten-minute bounded wait'
 
     $requiredFunctions = @(
+        'New-OOShutUpMutationMutex',
+        'Open-OOShutUpMutationMutex',
+        'Release-OOShutUpMutationMutex',
+        'Invoke-WithOOShutUpMutationLock',
         'Test-RestorePointFrequencyStateEqual',
         'Restore-RestorePointFrequencyState',
         'Set-RestorePointFrequencyValue',
         'Set-RestorePointFrequency',
         'Get-WindowsSystemVolume',
         'Get-OOShutUpProfileDigest',
-        'New-SystemRestorePoint',
+        'Invoke-OOShutUpConfigurationCore',
         'Invoke-OOShutUpConfiguration',
+        'New-SystemRestorePointCore',
+        'New-SystemRestorePoint',
+        'Invoke-OOShutUpConfigurationWithRestorePointGateCore',
         'Invoke-OOShutUpConfigurationWithRestorePointGate'
     )
     $functionAsts = $scriptAst.FindAll({
@@ -350,10 +361,28 @@ try {
     $script:OOShutUpApprovedManifestDigest = Get-OOShutUpProfileDigest -Bytes ([byte[]]$script:ManifestFixtureBytes)
 
     $setFrequencySource = [string](@($functionAsts | Where-Object { $_.Name -eq 'Set-RestorePointFrequency' })[0].Extent.Text)
-    $newRestorePointSource = [string](@($functionAsts | Where-Object { $_.Name -eq 'New-SystemRestorePoint' })[0].Extent.Text)
+    $newRestorePointSource = [string](@($functionAsts | Where-Object { $_.Name -eq 'New-SystemRestorePointCore' })[0].Extent.Text)
     Assert-True ($setFrequencySource.Contains('[Microsoft.Win32.RegistryValueKind]::DWord')) 'the temporary value is explicitly written as DWORD'
     Assert-True (-not $newRestorePointSource.Contains('Enable-ComputerRestore -Drive "C:"')) 'restore protection does not assume the C drive'
     Assert-True ($newRestorePointSource.Contains('Restore-RestorePointFrequencyState -State $frequencyPreparation.PreviousState')) 'the captured registry state is restored after restore-point preparation'
+
+    $lockFunctionSource = [string](@($functionAsts | Where-Object { $_.Name -eq 'Invoke-WithOOShutUpMutationLock' })[0].Extent.Text)
+    $mutexFactorySource = [string](@($functionAsts | Where-Object { $_.Name -eq 'New-OOShutUpMutationMutex' })[0].Extent.Text)
+    $lockWaitPosition = $lockFunctionSource.IndexOf('$mutex.WaitOne($TimeoutMilliseconds)', [System.StringComparison]::Ordinal)
+    $operationStartPosition = $lockFunctionSource.IndexOf('$operationStarted = $true', [System.StringComparison]::Ordinal)
+    Assert-True ($mutexFactorySource.Contains("'S-1-5-18'") -and $mutexFactorySource.Contains("'S-1-5-32-544'")) 'the named mutex ACL grants Local System and Administrators access'
+    Assert-True ($lockWaitPosition -ge 0 -and $operationStartPosition -gt $lockWaitPosition) 'protected registry and O&O work begins only after the bounded mutex wait succeeds'
+    Assert-True ($lockFunctionSource.Contains('[System.Threading.AbandonedMutexException]') -and $lockFunctionSource.Contains('$failureType = ''Abandoned''')) 'abandoned ownership fails before the operation runs'
+    Assert-True ($lockFunctionSource.Contains('$failureType -ne ''Abandoned''')) 'abandoned ownership remains held until the failing process exits so queued runs cannot proceed'
+    $configurationWrapperSource = [string](@($functionAsts | Where-Object { $_.Name -eq 'Invoke-OOShutUpConfiguration' })[0].Extent.Text)
+    $restorePointWrapperSource = [string](@($functionAsts | Where-Object { $_.Name -eq 'New-SystemRestorePoint' })[0].Extent.Text)
+    $gateFunctionSource = [string](@($functionAsts | Where-Object { $_.Name -eq 'Invoke-OOShutUpConfigurationWithRestorePointGateCore' })[0].Extent.Text)
+    $gateWrapperSource = [string](@($functionAsts | Where-Object { $_.Name -eq 'Invoke-OOShutUpConfigurationWithRestorePointGate' })[0].Extent.Text)
+    Assert-True ($configurationWrapperSource.Contains('Invoke-WithOOShutUpMutationLock') -and $configurationWrapperSource.Contains('Invoke-OOShutUpConfigurationCore')) 'SYSTEM ReapplyOnly reaches O&O only through the shared mutex wrapper'
+    Assert-True ($restorePointWrapperSource.Contains('Invoke-WithOOShutUpMutationLock')) 'direct restore-point entry acquires the same mutex before registry work'
+    Assert-True ($gateWrapperSource.Contains('Invoke-WithOOShutUpMutationLock') -and $gateWrapperSource.Contains('Invoke-OOShutUpConfigurationWithRestorePointGateCore')) 'manual restore-point and O&O work is covered by one outer mutex ownership interval'
+    Assert-True ($gateFunctionSource.Contains('New-SystemRestorePointCore') -and $gateFunctionSource.Contains('Invoke-OOShutUpConfigurationCore')) 'the manual path keeps restore-point registry work and O&O execution in the same lock interval'
+    Assert-True ($source.Contains("`$script:OOShutUpUpdateMultipleInstancesPolicy = 'Queue'")) 'the scheduled task Queue policy remains unchanged'
 
     $env:SystemRoot = 'C:\Windows'
     $detectedVolume = Get-WindowsSystemVolume
@@ -427,10 +456,9 @@ try {
     Assert-True (Test-RestorePointFrequencyStateEqual -Expected $priorRegistryState -Actual (Get-RestorePointFrequencyState)) 'failed write verification preserves the prior registry state'
     $script:FrequencyWriteScenario = 'success'
 
-    $gateFunctionSource = [string](@($functionAsts | Where-Object { $_.Name -eq 'Invoke-OOShutUpConfigurationWithRestorePointGate' })[0].Extent.Text)
     $pointCreationPosition = $gateFunctionSource.IndexOf('New-SystemRestorePoint', [System.StringComparison]::Ordinal)
     $failureGatePosition = $gateFunctionSource.IndexOf('if (-not $restorePointVerified -and -not $AllowWithoutRestorePoint)', [System.StringComparison]::Ordinal)
-    $configurationPosition = $gateFunctionSource.IndexOf('Invoke-OOShutUpConfiguration -ExecutablePath', [System.StringComparison]::Ordinal)
+    $configurationPosition = $gateFunctionSource.IndexOf('Invoke-OOShutUpConfigurationCore -ExecutablePath', [System.StringComparison]::Ordinal)
     Assert-True ($pointCreationPosition -ge 0 -and $failureGatePosition -gt $pointCreationPosition -and $configurationPosition -gt $failureGatePosition) 'restore verification and the default failure gate precede O&O configuration'
 
     $mainSource = $source.Substring($source.IndexOf('#region Main Script', [System.StringComparison]::Ordinal))
@@ -616,6 +644,286 @@ try {
     Assert-True ($overrideMessages -notmatch 'A system restore point was verified|created and verified successfully') 'override never claims a restore point'
     $uniqueSnapshotPaths = @($script:CreatedProfileSnapshotPaths | Select-Object -Unique)
     Assert-Equal $script:CreatedProfileSnapshotPaths.Count $uniqueSnapshotPaths.Count 'each snapshot invocation receives a unique per-run path'
+
+    $mutexHelperSources = @(
+        $mutexFactorySource,
+        [string](@($functionAsts | Where-Object { $_.Name -eq 'Open-OOShutUpMutationMutex' })[0].Extent.Text),
+        [string](@($functionAsts | Where-Object { $_.Name -eq 'Release-OOShutUpMutationMutex' })[0].Extent.Text),
+        $lockFunctionSource
+    )
+    $mutexHelperText = [string]::Join("`r`n", $mutexHelperSources)
+    $mutexWorkerBody = @'
+$workDir = [string]$args[0]
+$mutexName = [string]$args[1]
+$role = [string]$args[2]
+$eventPath = Join-Path $workDir 'events.txt'
+$script:MutationLockWorkerDirectory = $workDir
+$script:MutationLockWorkerRole = $role
+$script:MutationLockOriginalFactory = (Get-Command New-OOShutUpMutationMutex).ScriptBlock
+Set-Item -Path Function:New-OOShutUpMutationMutex -Value {
+    param([string]$Name)
+    $mutex = & $script:MutationLockOriginalFactory -Name $Name
+    [System.IO.File]::WriteAllText((Join-Path $script:MutationLockWorkerDirectory "$script:MutationLockWorkerRole-mutex-opened"), '')
+    return $mutex
+}
+[System.IO.File]::WriteAllText((Join-Path $workDir "$role-lock-name"), $mutexName)
+[System.IO.File]::WriteAllText((Join-Path $workDir "$role-attempted"), '')
+$lock = Invoke-WithOOShutUpMutationLock -MutexName $mutexName -TimeoutMilliseconds 60000 -Operation {
+    [System.IO.File]::AppendAllText($eventPath, "$role-owner-enter`r`n")
+    [System.IO.File]::WriteAllText((Join-Path $workDir "$role-registry-capture"), '')
+    [System.IO.File]::AppendAllText($eventPath, "$role-registry-capture`r`n")
+    if ($role -eq 'first') {
+        $deadline = [DateTime]::UtcNow.AddSeconds(60)
+        $releaseMarker = Join-Path $workDir 'release-first'
+        while (-not [System.IO.File]::Exists($releaseMarker) -and [DateTime]::UtcNow -lt $deadline) {
+            Start-Sleep -Milliseconds 20
+        }
+        if (-not [System.IO.File]::Exists($releaseMarker)) { throw 'The first run barrier timed out.' }
+    }
+    [System.IO.File]::WriteAllText((Join-Path $workDir "$role-ooshutup-start"), '')
+    [System.IO.File]::AppendAllText($eventPath, "$role-ooshutup-start`r`n")
+    [System.IO.File]::AppendAllText($eventPath, "$role-owner-exit`r`n")
+    return "$role-complete"
+}
+if (-not $lock.Succeeded) {
+    [Console]::Error.WriteLine($lock.FailureMessage)
+    exit 2
+}
+exit 0
+'@
+    $mutexTestName = "$script:OOShutUpMutationMutexName.Barrier"
+    $workerRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('oosu-mutation-lock-' + [guid]::NewGuid().ToString('N'))
+    [void][System.IO.Directory]::CreateDirectory($workerRoot)
+    $workerScriptPath = Join-Path $workerRoot 'mutex-worker.ps1'
+    [System.IO.File]::WriteAllText($workerScriptPath, $mutexHelperText + "`r`n" + $mutexWorkerBody, [System.Text.Encoding]::UTF8)
+    # Use the available Core host for subprocess barriers when possible; the in-process helpers still run in the caller's edition.
+    $coreHost = Get-Command pwsh -ErrorAction SilentlyContinue
+    $workerExecutable = if ($null -ne $coreHost) { $coreHost.Source } else { Join-Path $PSHOME 'powershell.exe' }
+    $firstWorker = $null
+    $secondWorker = $null
+    try {
+        $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $startInfo.FileName = $workerExecutable
+        $startInfo.Arguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" "{1}" "{2}" first' -f $workerScriptPath, $workerRoot, $mutexTestName
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        $firstWorker = [System.Diagnostics.Process]::Start($startInfo)
+
+function Wait-ForMutationLockTestFile {
+            param([string]$Path, [int]$TimeoutMilliseconds = 30000)
+            $watch = [System.Diagnostics.Stopwatch]::StartNew()
+            while (-not [System.IO.File]::Exists($Path) -and $watch.ElapsedMilliseconds -lt $TimeoutMilliseconds) {
+                [System.Threading.Thread]::Sleep(20)
+            }
+            return [System.IO.File]::Exists($Path)
+        }
+
+        $firstRegistryMarker = Join-Path $workerRoot 'first-registry-capture'
+        $firstReachedRegistry = Wait-ForMutationLockTestFile -Path $firstRegistryMarker
+        if (-not $firstReachedRegistry) {
+            $firstExited = $firstWorker.WaitForExit(1000)
+            if ($firstExited) {
+                $firstWorkerOutput = $firstWorker.StandardOutput.ReadToEnd()
+                $firstWorkerError = $firstWorker.StandardError.ReadToEnd()
+                [Console]::Error.WriteLine("First barrier process: exited=true code=$($firstWorker.ExitCode) stdout=[$firstWorkerOutput] stderr=[$firstWorkerError]")
+            }
+            else {
+                [Console]::Error.WriteLine('First barrier process remained active without reaching the registry marker.')
+            }
+        }
+        Assert-True $firstReachedRegistry 'the first mocked run reaches the registry-capture barrier while holding the mutex'
+        $secondStartInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $secondStartInfo.FileName = $workerExecutable
+        $secondStartInfo.Arguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" "{1}" "{2}" second' -f $workerScriptPath, $workerRoot, $mutexTestName
+        $secondStartInfo.UseShellExecute = $false
+        $secondStartInfo.CreateNoWindow = $true
+        $secondStartInfo.RedirectStandardOutput = $true
+        $secondStartInfo.RedirectStandardError = $true
+        $secondWorker = [System.Diagnostics.Process]::Start($secondStartInfo)
+        Assert-True (Wait-ForMutationLockTestFile -Path (Join-Path $workerRoot 'second-attempted')) 'the second mocked entry point attempts to acquire the mutex while the first owns it'
+        Assert-Equal $mutexTestName ([System.IO.File]::ReadAllText((Join-Path $workerRoot 'second-lock-name'))) 'the second process receives the exact shared mutex name'
+        Assert-Equal $false $firstWorker.HasExited 'the first process still owns the mutex when the second arrives'
+        Assert-True (Wait-ForMutationLockTestFile -Path (Join-Path $workerRoot 'second-mutex-opened')) 'the second process opens the shared mutex handle before the first is released'
+
+        $secondRegistryMarker = Join-Path $workerRoot 'second-registry-capture'
+        $secondProcessMarker = Join-Path $workerRoot 'second-ooshutup-start'
+        $watch = [System.Diagnostics.Stopwatch]::StartNew()
+        while ($watch.ElapsedMilliseconds -lt 250) { [System.Threading.Thread]::Sleep(20) }
+        Assert-Equal $false ([System.IO.File]::Exists($secondRegistryMarker)) 'the second run performs no registry call before acquiring the mutex'
+        Assert-Equal $false ([System.IO.File]::Exists($secondProcessMarker)) 'the second run performs no O&O start before acquiring the mutex'
+        Assert-Equal $false ([System.IO.File]::Exists((Join-Path $workerRoot 'first-ooshutup-start'))) 'the first run remains at the registry barrier during the overlap check'
+
+        [System.IO.File]::WriteAllText((Join-Path $workerRoot 'release-first'), '')
+        Assert-True $firstWorker.WaitForExit(15000) 'the first barrier process completes after its release signal'
+        Assert-True $secondWorker.WaitForExit(15000) 'the second barrier process completes after the first releases the mutex'
+        $firstWorkerOutput = $firstWorker.StandardOutput.ReadToEnd()
+        $firstWorkerError = $firstWorker.StandardError.ReadToEnd()
+        $secondWorkerOutput = $secondWorker.StandardOutput.ReadToEnd()
+        $secondWorkerError = $secondWorker.StandardError.ReadToEnd()
+        Assert-Equal 0 $firstWorker.ExitCode "the first barrier process exits successfully ($firstWorkerError)"
+        Assert-Equal 0 $secondWorker.ExitCode "the second barrier process exits successfully ($secondWorkerError)"
+        Assert-True ([System.IO.File]::Exists($secondRegistryMarker)) 'the second registry capture starts after acquiring the released mutex'
+        Assert-True ([System.IO.File]::Exists($secondProcessMarker)) 'the second O&O start occurs after acquiring the mutex'
+        $barrierEvents = [System.IO.File]::ReadAllText((Join-Path $workerRoot 'events.txt')).Trim() -split "`r?`n"
+        Assert-Equal 'first-owner-enter,first-registry-capture,first-ooshutup-start,first-owner-exit,second-owner-enter,second-registry-capture,second-ooshutup-start,second-owner-exit' ([string]::Join(',', [string[]]$barrierEvents)) 'the two mocked runs own the lock and perform registry/O&O work in one ordered sequence'
+        Assert-Equal '' $firstWorkerOutput 'the first barrier process does not emit unexpected output'
+        Assert-Equal '' $secondWorkerOutput 'the second barrier process does not emit unexpected output'
+    }
+    finally {
+        if ($null -ne $firstWorker -and -not $firstWorker.HasExited) {
+            [System.IO.File]::WriteAllText((Join-Path $workerRoot 'release-first'), '')
+            if (-not $firstWorker.WaitForExit(5000)) { $firstWorker.Kill(); $firstWorker.WaitForExit() }
+        }
+        if ($null -ne $secondWorker -and -not $secondWorker.HasExited) {
+            if (-not $secondWorker.WaitForExit(5000)) { $secondWorker.Kill(); $secondWorker.WaitForExit() }
+        }
+        if ($null -ne $firstWorker) { $firstWorker.Dispose() }
+        if ($null -ne $secondWorker) { $secondWorker.Dispose() }
+        if ([System.IO.Directory]::Exists($workerRoot)) {
+            Get-ChildItem -LiteralPath $workerRoot -File -Force | Remove-Item -Force
+            Remove-Item -LiteralPath $workerRoot -Force
+        }
+    }
+
+    $timeoutTestName = "$script:OOShutUpMutationMutexName.Timeout"
+    $timeoutAnchor = New-OOShutUpMutationMutex -Name $timeoutTestName
+    $abandonedTestName = "$script:OOShutUpMutationMutexName.Abandoned"
+    $abandonedAnchor = $null
+    $failureRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('oosu-mutation-lock-failures-' + [guid]::NewGuid().ToString('N'))
+    [void][System.IO.Directory]::CreateDirectory($failureRoot)
+    $failureWorkerPath = Join-Path $failureRoot 'mutex-failure-worker.ps1'
+    $failureWorkerBody = @'
+$workDir = [string]$args[0]
+$mutexName = [string]$args[1]
+$role = [string]$args[2]
+if ($role -eq 'probe') {
+    $result = Invoke-WithOOShutUpMutationLock -MutexName $mutexName -TimeoutMilliseconds 250 -Operation {
+        [System.IO.File]::WriteAllText((Join-Path $workDir 'probe-operation'), '')
+    }
+    [System.IO.File]::WriteAllText((Join-Path $workDir 'probe-result'), [string]$result.FailureType)
+    if ($result.Succeeded) { exit 3 }
+    exit 0
+}
+$mutex = New-OOShutUpMutationMutex -Name $mutexName
+if (-not $mutex.WaitOne(10000)) { exit 2 }
+[System.IO.File]::WriteAllText((Join-Path $workDir "$role-owned"), '')
+if ($role -eq 'holder') {
+    $deadline = [DateTime]::UtcNow.AddSeconds(30)
+    $releaseMarker = Join-Path $workDir 'release-holder'
+    while (-not [System.IO.File]::Exists($releaseMarker) -and [DateTime]::UtcNow -lt $deadline) {
+        Start-Sleep -Milliseconds 20
+    }
+    if (-not [System.IO.File]::Exists($releaseMarker)) { exit 4 }
+    Release-OOShutUpMutationMutex -Mutex $mutex
+    $mutex.Dispose()
+}
+# The abandoner exits here without releasing the owned mutex.
+exit 0
+'@
+    [System.IO.File]::WriteAllText($failureWorkerPath, $mutexHelperText + "`r`n" + $failureWorkerBody, [System.Text.Encoding]::UTF8)
+    $timeoutState = [pscustomobject]@{ OperationCalled = $false }
+    $timeoutHolder = $null
+    $abandonerProcess = $null
+    $abandonedProbe = $null
+    try {
+        $holderInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $holderInfo.FileName = $workerExecutable
+        $holderInfo.Arguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" "{1}" "{2}" holder' -f $failureWorkerPath, $failureRoot, $timeoutTestName
+        $holderInfo.UseShellExecute = $false
+        $holderInfo.CreateNoWindow = $true
+        $holderInfo.RedirectStandardOutput = $true
+        $holderInfo.RedirectStandardError = $true
+        $timeoutHolder = [System.Diagnostics.Process]::Start($holderInfo)
+        Assert-True (Wait-ForMutationLockTestFile -Path (Join-Path $failureRoot 'holder-owned')) 'the timeout fixture owns the mutex before the contender starts'
+        $timeoutResult = Invoke-WithOOShutUpMutationLock -MutexName $timeoutTestName -TimeoutMilliseconds 100 -Operation {
+            $timeoutState.OperationCalled = $true
+        }
+        Assert-Equal $false $timeoutResult.Succeeded 'mutex timeout returns a non-success result'
+        Assert-Equal 'Timeout' $timeoutResult.FailureType 'mutex timeout is reported as a bounded wait failure'
+        Assert-Equal $false $timeoutResult.OperationStarted 'mutex timeout stops before the protected operation'
+        Assert-Equal $false $timeoutState.OperationCalled 'timeout performs no registry or O&O mock call'
+        [System.IO.File]::WriteAllText((Join-Path $failureRoot 'release-holder'), '')
+        Assert-True $timeoutHolder.WaitForExit(15000) 'the timeout fixture owner releases its lock'
+        Assert-Equal 0 $timeoutHolder.ExitCode 'the timeout fixture owner exits cleanly'
+        $timeoutAnchor.Dispose()
+        $timeoutAnchor = $null
+
+        $abandonedAnchor = New-OOShutUpMutationMutex -Name $abandonedTestName
+        $abandonerInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $abandonerInfo.FileName = $workerExecutable
+        $abandonerInfo.Arguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" "{1}" "{2}" abandoner' -f $failureWorkerPath, $failureRoot, $abandonedTestName
+        $abandonerInfo.UseShellExecute = $false
+        $abandonerInfo.CreateNoWindow = $true
+        $abandonerInfo.RedirectStandardOutput = $true
+        $abandonerInfo.RedirectStandardError = $true
+        $abandonerProcess = [System.Diagnostics.Process]::Start($abandonerInfo)
+        Assert-True (Wait-ForMutationLockTestFile -Path (Join-Path $failureRoot 'abandoner-owned')) 'the abandoned-lock fixture acquired the named mutex'
+        Assert-True $abandonerProcess.WaitForExit(15000) 'the fixture process exited while holding the mutex'
+        Assert-Equal 0 $abandonerProcess.ExitCode 'the abandoned fixture exits without releasing the mutex'
+
+        $abandonedOperationState = [pscustomobject]@{ Called = $false }
+        $abandonedResult = Invoke-WithOOShutUpMutationLock -MutexName $abandonedTestName -TimeoutMilliseconds 1000 -Operation {
+            $abandonedOperationState.Called = $true
+        }
+        Assert-Equal $false $abandonedResult.Succeeded 'abandoned mutex ownership returns a non-success result'
+        Assert-Equal 'Abandoned' $abandonedResult.FailureType 'abandoned mutex ownership is identified explicitly'
+        Assert-Equal $false $abandonedResult.OperationStarted 'abandoned mutex ownership stops before the protected operation'
+        Assert-Equal $false $abandonedOperationState.Called 'abandoned ownership performs no registry or O&O mock call'
+
+        $probeInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $probeInfo.FileName = $workerExecutable
+        $probeInfo.Arguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" "{1}" "{2}" probe' -f $failureWorkerPath, $failureRoot, $abandonedTestName
+        $probeInfo.UseShellExecute = $false
+        $probeInfo.CreateNoWindow = $true
+        $probeInfo.RedirectStandardOutput = $true
+        $probeInfo.RedirectStandardError = $true
+        $abandonedProbe = [System.Diagnostics.Process]::Start($probeInfo)
+        Assert-True $abandonedProbe.WaitForExit(15000) 'a queued contender returns while the abandoned owner still holds the lock'
+        Assert-Equal 0 $abandonedProbe.ExitCode 'the queued contender reports timeout without worker errors'
+        Assert-Equal 'Timeout' ([System.IO.File]::ReadAllText((Join-Path $failureRoot 'probe-result'))) 'a queued contender does not proceed after abandonment was detected'
+        Assert-Equal $false ([System.IO.File]::Exists((Join-Path $failureRoot 'probe-operation'))) 'no queued registry or O&O mock call starts after abandoned ownership'
+        $abandonedAnchor.Dispose()
+        $abandonedAnchor = $null
+    }
+    finally {
+        if ($null -ne $timeoutHolder -and -not $timeoutHolder.HasExited) {
+            [System.IO.File]::WriteAllText((Join-Path $failureRoot 'release-holder'), '')
+            if (-not $timeoutHolder.WaitForExit(5000)) { $timeoutHolder.Kill(); $timeoutHolder.WaitForExit() }
+        }
+        foreach ($child in @($timeoutHolder, $abandonerProcess, $abandonedProbe)) {
+            if ($null -ne $child) { $child.Dispose() }
+        }
+        if ($null -ne $timeoutAnchor) { $timeoutAnchor.Dispose() }
+        if ($null -ne $abandonedAnchor) { $abandonedAnchor.Dispose() }
+        if ([System.IO.Directory]::Exists($failureRoot)) {
+            Get-ChildItem -LiteralPath $failureRoot -File -Force | Remove-Item -Force
+            Remove-Item -LiteralPath $failureRoot -Force
+        }
+    }
+
+    $releaseTestName = "$script:OOShutUpMutationMutexName.ReleaseFailure"
+    $releaseFunction = (Get-Command Release-OOShutUpMutationMutex).ScriptBlock
+    $releaseFailureHandler = {
+        param([System.Threading.Mutex]$Mutex)
+        $Mutex.ReleaseMutex()
+        throw 'Mocked mutex release verification failure.'
+    }
+    Set-Item -Path Function:Release-OOShutUpMutationMutex -Value $releaseFailureHandler
+    try {
+        $releaseResult = Invoke-WithOOShutUpMutationLock -MutexName $releaseTestName -TimeoutMilliseconds 1000 -Operation {
+            return 'mocked-state-change'
+        }
+    }
+    finally {
+        Set-Item -Path Function:Release-OOShutUpMutationMutex -Value $releaseFunction
+    }
+    Assert-Equal $false $releaseResult.Succeeded 'a mutex release verification failure cannot report overall success'
+    Assert-Equal 'ReleaseFailed' $releaseResult.FailureType 'mutex release failure has an explicit failure status'
+    Assert-Equal $true $releaseResult.OperationStarted 'release failure is reported after the protected operation may have run'
+    Assert-Equal 'mocked-state-change' $releaseResult.Value 'release failure preserves the protected operation outcome for diagnosis'
+    Assert-True ($releaseResult.FailureMessage.Contains('inspect the System Restore frequency value and O&O settings')) 'release failure gives actionable recovery guidance'
 
     [Console]::Out.WriteLine("Passed $script:AssertionCount restore-point readiness assertions in $($PSVersionTable.PSVersion).")
 }

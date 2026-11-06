@@ -63,6 +63,8 @@ $script:MockPowerShellResolverMode = 'Valid'
 $script:MockPowerShellResolverCallCount = 0
 $script:MockPowerShellResolverChangedPath = $null
 $script:MockLastPowerShellInspectionPath = $null
+$script:OOShutUpMutationMutexName = "Global\myTech.Today.OOShutUp.PayloadTrustTest.$PID"
+$script:OOShutUpMutationLockTimeoutMilliseconds = 600000
 
 function Assert-True {
     param(
@@ -544,8 +546,14 @@ try {
     Assert-True ($source -notmatch 'Start-Process[^\r\n]*ooshutup10\.cfg') 'the O&O invocation does not pass a bare profile filename'
     Assert-True ($source -notmatch '\$TempPath') 'the managed executable path no longer depends on a TEMP-derived variable'
     Assert-True ($source.Contains('$env:ProgramW6432') -and $source.Contains('$env:ProgramFiles')) 'the machine install directory uses the machine Program Files location'
+    Assert-True ($source.Contains("`$script:OOShutUpMutationMutexName = 'Global\myTech.Today.OOShutUp.Mutation'")) 'manual and SYSTEM entry points use the shared machine-wide O&O mutex'
+    Assert-True ($source.Contains('$script:OOShutUpMutationLockTimeoutMilliseconds = 600000')) 'the O&O mutex acquisition is bounded at ten minutes'
 
     $requiredFunctions = @(
+        'New-OOShutUpMutationMutex',
+        'Open-OOShutUpMutationMutex',
+        'Release-OOShutUpMutationMutex',
+        'Invoke-WithOOShutUpMutationLock',
         'Get-OOShutUpFileVersionInfo',
         'Test-OOShutUpPayload',
         'Test-OOShutUpInstalled',
@@ -560,6 +568,7 @@ try {
         'New-OOShutUpWebClient',
         'Move-OOShutUpFileAtomically',
         'Install-OOShutUp',
+        'Invoke-OOShutUpConfigurationCore',
         'Invoke-OOShutUpConfiguration',
         'ConvertTo-SystemTaskSid',
         'Test-SystemTaskTargetAcl',

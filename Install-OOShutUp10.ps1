@@ -177,6 +177,9 @@ $script:OOShutUpRestorePointPreparationFailureMessage = 'Restore-point preparati
 $script:OOShutUpRestorePointOverrideMessage = 'A restore point could not be verified. System Restore recovery is unavailable; continuing only because -AllowWithoutRestorePoint was supplied. The approved O&O profile export remains separate.'
 $script:OOShutUpRestorePointFrequencyRegistryPath = 'SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore'
 $script:OOShutUpRestorePointFrequencyRegistryName = 'SystemRestorePointCreationFrequency'
+# Manual and SYSTEM entry points share this Global mutex. Wait at most ten minutes before failing closed.
+$script:OOShutUpMutationMutexName = 'Global\myTech.Today.OOShutUp.Mutation'
+$script:OOShutUpMutationLockTimeoutMilliseconds = 600000
 $script:OOShutUpTaskAclFailureMessage = 'The SYSTEM task target ACL could not be verified. No task was registered; move the script to a protected path and retry.'
 $script:OOShutUpTaskSecurityDescriptorSddl = 'O:BAG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)'
 $script:OOShutUpTaskSecurityDescriptorFailureMessage = 'The task security descriptor could not be verified. No new task was enabled; inspect task permissions before retrying.'
@@ -823,6 +826,272 @@ function Invoke-ScriptRelocation {
     catch {
         Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [WARN] Could not relocate script ($($_.Exception.Message)). Continuing in-place." -ForegroundColor Yellow
         return $false
+    }
+}
+
+function New-OOShutUpMutationMutex {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name
+    )
+
+    $security = [System.Security.AccessControl.MutexSecurity]::new()
+    $allowedSids = @(
+        [System.Security.Principal.SecurityIdentifier]::new('S-1-5-18'),
+        [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544'),
+        [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+    )
+    foreach ($sid in $allowedSids) {
+        if ($null -eq $sid) {
+            throw 'The current Windows identity could not be resolved for the mutation lock.'
+        }
+        $rule = [System.Security.AccessControl.MutexAccessRule]::new(
+            $sid,
+            [System.Security.AccessControl.MutexRights]::FullControl,
+            [System.Security.AccessControl.AccessControlType]::Allow
+        )
+        [void]$security.AddAccessRule($rule)
+    }
+
+    $createdNew = $false
+    $constructorTypes = [type[]]@(
+        [bool],
+        [string],
+        [bool].MakeByRefType(),
+        [System.Security.AccessControl.MutexSecurity]
+    )
+    $securityAwareConstructor = [System.Threading.Mutex].GetConstructor($constructorTypes)
+    if ($null -ne $securityAwareConstructor) {
+        $arguments = [object[]]::new(4)
+        $arguments[0] = $false
+        $arguments[1] = $Name
+        $arguments[2] = $createdNew
+        $arguments[3] = $security
+        try {
+            $creationMutex = $securityAwareConstructor.Invoke($arguments)
+        }
+        catch {
+            return Open-OOShutUpMutationMutex -Name $Name
+        }
+    }
+    else {
+        $mutexAclType = [type]::GetType('System.Threading.MutexAcl, System.Threading.AccessControl', $false)
+        if ($null -eq $mutexAclType) {
+            throw 'This PowerShell runtime cannot create a named mutex with the required SYSTEM and Administrators access rules.'
+        }
+        $createMethod = $mutexAclType.GetMethod(
+            'Create',
+            [System.Reflection.BindingFlags]'Public,Static',
+            $null,
+            [type[]]@(
+                [bool],
+                [string],
+                [bool].MakeByRefType(),
+                [System.Security.AccessControl.MutexSecurity]
+            ),
+            $null
+        )
+        if ($null -eq $createMethod) {
+            throw 'The Windows named-mutex ACL creation method is unavailable.'
+        }
+        $arguments = [object[]]::new(4)
+        $arguments[0] = $false
+        $arguments[1] = $Name
+        $arguments[2] = $createdNew
+        $arguments[3] = $security
+        try {
+            $creationMutex = $createMethod.Invoke($null, $arguments)
+        }
+        catch {
+            return Open-OOShutUpMutationMutex -Name $Name
+        }
+    }
+
+    try {
+        # Reopen and inspect even a successful create-or-open result; an existing name may have an unsafe DACL.
+        return Open-OOShutUpMutationMutex -Name $Name
+    }
+    finally {
+        if ($null -ne $creationMutex) {
+            $creationMutex.Dispose()
+        }
+    }
+}
+
+function Release-OOShutUpMutationMutex {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Threading.Mutex]$Mutex
+    )
+
+    $Mutex.ReleaseMutex()
+}
+
+function Open-OOShutUpMutationMutex {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name
+    )
+
+    $requiredRights = [System.Security.AccessControl.MutexRights]::Synchronize -bor `
+        [System.Security.AccessControl.MutexRights]::Modify -bor `
+        [System.Security.AccessControl.MutexRights]::ReadPermissions
+    $mutex = $null
+    $mutexAclType = [type]::GetType('System.Threading.MutexAcl, System.Threading.AccessControl', $false)
+    if ($null -ne $mutexAclType) {
+        $openMethod = $mutexAclType.GetMethod(
+            'OpenExisting',
+            [System.Reflection.BindingFlags]'Public,Static',
+            $null,
+            [type[]]@([string], [System.Security.AccessControl.MutexRights]),
+            $null
+        )
+        if ($null -ne $openMethod) {
+            $arguments = [object[]]::new(2)
+            $arguments[0] = $Name
+            $arguments[1] = $requiredRights
+            $mutex = $openMethod.Invoke($null, $arguments)
+        }
+    }
+    if ($null -eq $mutex) {
+        $mutex = [System.Threading.Mutex]::OpenExisting($Name, $requiredRights)
+    }
+    try {
+        $security = [System.Security.AccessControl.MutexSecurity]::new(
+            $Name,
+            [System.Security.AccessControl.AccessControlSections]::Access
+        )
+        $rules = @($security.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+        $requiredSids = @(
+            'S-1-5-18',
+            'S-1-5-32-544',
+            [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        ) | Select-Object -Unique
+        foreach ($sid in $requiredSids) {
+            $hasRequiredAccess = $false
+            foreach ($rule in $rules) {
+                if ($rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow -or
+                    $rule.IdentityReference.Value -ne $sid) {
+                    continue
+                }
+                $grantedRights = [long][int]$rule.MutexRights
+                $rightsToCheck = [long][int]$requiredRights
+                if (($grantedRights -band $rightsToCheck) -eq $rightsToCheck) {
+                    $hasRequiredAccess = $true
+                    break
+                }
+            }
+            if (-not $hasRequiredAccess) {
+                throw "The existing machine-wide O&O mutation lock does not grant required access to '$sid'."
+            }
+        }
+        return $mutex
+    }
+    catch {
+        $mutex.Dispose()
+        throw
+    }
+}
+
+function Invoke-WithOOShutUpMutationLock {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [scriptblock]$Operation,
+
+        [Parameter(Mandatory = $false)]
+        [string]$MutexName = $script:OOShutUpMutationMutexName,
+
+        [Parameter(Mandatory = $false)]
+        [int]$TimeoutMilliseconds = $script:OOShutUpMutationLockTimeoutMilliseconds
+    )
+
+    $mutex = $null
+    $ownsMutex = $false
+    $operationStarted = $false
+    $succeeded = $false
+    $value = $null
+    $failureType = $null
+    $failureMessage = $null
+
+    try {
+        $mutex = New-OOShutUpMutationMutex -Name $MutexName
+        try {
+            $ownsMutex = $mutex.WaitOne($TimeoutMilliseconds)
+        }
+        catch [System.Threading.AbandonedMutexException] {
+            # Keep abandoned ownership until this process exits so queued callers also fail closed.
+            $ownsMutex = $true
+            $failureType = 'Abandoned'
+            $failureMessage = 'The machine-wide O&O mutation lock was abandoned by an earlier run. This run made no System Restore registry or O&O changes. Inspect the SystemRestorePointCreationFrequency value and O&O settings, then retry.'
+        }
+
+        if (-not $failureType -and -not $ownsMutex) {
+            $failureType = 'Timeout'
+            $failureMessage = 'The machine-wide O&O mutation lock was not acquired within 600 seconds. This run made no System Restore registry or O&O changes. Wait for the active run to finish, then retry.'
+        }
+        elseif (-not $failureType) {
+            $operationStarted = $true
+            $value = & $Operation
+            $succeeded = $true
+        }
+    }
+    catch {
+        if (-not $failureType) {
+            $failureType = if ($operationStarted) { 'OperationFailed' } else { 'Unavailable' }
+            if ($operationStarted) {
+                $failureMessage = "The protected O&O operation failed: $($_.Exception.Message)"
+            }
+            else {
+                $failureMessage = "The machine-wide O&O mutation lock could not be opened or ownership could not be verified. No protected operation was started. Run the installer as Administrator and check that the Global lock is available to Local System and Administrators: $($_.Exception.Message)"
+            }
+        }
+        $succeeded = $false
+    }
+    finally {
+        if ($ownsMutex -and $null -ne $mutex -and $failureType -ne 'Abandoned') {
+            try {
+                Release-OOShutUpMutationMutex -Mutex $mutex
+            }
+            catch {
+                $succeeded = $false
+                $failureType = 'ReleaseFailed'
+                $releaseDetail = "The machine-wide O&O mutation lock could not be released or verified. The protected operation may have changed system state; inspect the System Restore frequency value and O&O settings before retrying: $($_.Exception.Message)"
+                if (-not [string]::IsNullOrWhiteSpace($failureMessage)) {
+                    $failureMessage = "$failureMessage $releaseDetail"
+                }
+                else {
+                    $failureMessage = $releaseDetail
+                }
+            }
+        }
+        if ($null -ne $mutex) {
+            try {
+                $mutex.Dispose()
+            }
+            catch {
+                $succeeded = $false
+                $failureType = 'ReleaseFailed'
+                $disposeDetail = "The machine-wide O&O mutation lock handle could not be closed. Inspect the System Restore frequency value and O&O settings before retrying: $($_.Exception.Message)"
+                if (-not [string]::IsNullOrWhiteSpace($failureMessage)) {
+                    $failureMessage = "$failureMessage $disposeDetail"
+                }
+                else {
+                    $failureMessage = $disposeDetail
+                }
+            }
+        }
+    }
+
+    return [pscustomobject]@{
+        Succeeded = [bool]$succeeded
+        OperationStarted = [bool]$operationStarted
+        Value = $value
+        FailureType = $failureType
+        FailureMessage = $failureMessage
     }
 }
 
@@ -1784,7 +2053,7 @@ function New-OOShutUpProfileSnapshot {
     }
 }
 
-function Invoke-OOShutUpConfiguration {
+function Invoke-OOShutUpConfigurationCore {
     <#
     .SYNOPSIS
         Applies an approved, digest-verified profile using a verified O&O ShutUp10++ executable.
@@ -1890,6 +2159,28 @@ function Invoke-OOShutUpConfiguration {
     }
 }
 
+function Invoke-OOShutUpConfiguration {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ExecutablePath,
+
+        [Parameter(Mandatory = $false)]
+        [switch]$SystemReapply
+    )
+
+    $script:OOShutUpLastRunChanged = $false
+    $lockResult = Invoke-WithOOShutUpMutationLock -Operation {
+        Invoke-OOShutUpConfigurationCore -ExecutablePath $ExecutablePath -SystemReapply:$SystemReapply
+    }
+    if (-not $lockResult.Succeeded) {
+        Write-Log $lockResult.FailureMessage -Level ERROR
+        return $false
+    }
+
+    return [bool]$lockResult.Value
+}
+
 function Get-WindowsSystemVolume {
     [CmdletBinding()]
     [OutputType([string])]
@@ -1909,7 +2200,7 @@ function Get-WindowsSystemVolume {
     return $volume
 }
 
-function New-SystemRestorePoint {
+function New-SystemRestorePointCore {
     <#
     .SYNOPSIS
         Creates and verifies a system restore point, restoring the prior frequency registry state afterward.
@@ -2042,7 +2333,29 @@ function New-SystemRestorePoint {
     }
 }
 
-function Invoke-OOShutUpConfigurationWithRestorePointGate {
+function New-SystemRestorePoint {
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param()
+
+    $lockResult = Invoke-WithOOShutUpMutationLock -Operation {
+        New-SystemRestorePointCore
+    }
+    if (-not $lockResult.Succeeded) {
+        Write-Log $lockResult.FailureMessage -Level ERROR
+        return [pscustomobject]@{
+            PreparationSucceeded = $false
+            RestorePointVerified = $false
+            RegistryRollbackSucceeded = $false
+            SystemVolume = $null
+            FailureDetail = $lockResult.FailureMessage
+        }
+    }
+
+    return $lockResult.Value
+}
+
+function Invoke-OOShutUpConfigurationWithRestorePointGateCore {
     [CmdletBinding()]
     [OutputType([pscustomobject])]
     param(
@@ -2053,7 +2366,7 @@ function Invoke-OOShutUpConfigurationWithRestorePointGate {
         [switch]$AllowWithoutRestorePoint
     )
 
-    $restorePointResult = New-SystemRestorePoint
+    $restorePointResult = New-SystemRestorePointCore
     $restorePointVerified = [bool]$restorePointResult.RestorePointVerified
     if (-not $restorePointResult.PreparationSucceeded) {
         Write-Log $script:OOShutUpRestorePointPreparationFailureMessage -Level ERROR
@@ -2083,7 +2396,7 @@ function Invoke-OOShutUpConfigurationWithRestorePointGate {
 
     Update-ScriptProgress -PercentComplete 70 -Status "Step 4 of 5: Applying Privacy Settings" -CurrentOperation "Applying the approved privacy settings profile"
     Write-Log "Step 4: Applying the approved privacy settings profile..." -Level INFO
-    $configurationSucceeded = Invoke-OOShutUpConfiguration -ExecutablePath $ExecutablePath
+    $configurationSucceeded = Invoke-OOShutUpConfigurationCore -ExecutablePath $ExecutablePath
 
     return [pscustomobject]@{
         PreparationSucceeded = $true
@@ -2092,6 +2405,45 @@ function Invoke-OOShutUpConfigurationWithRestorePointGate {
         ConfigurationStarted = $true
         ConfigurationSucceeded = [bool]$configurationSucceeded
     }
+}
+
+function Invoke-OOShutUpConfigurationWithRestorePointGate {
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ExecutablePath,
+
+        [Parameter(Mandatory = $false)]
+        [switch]$AllowWithoutRestorePoint
+    )
+
+    $script:OOShutUpLastRunChanged = $false
+    $lockResult = Invoke-WithOOShutUpMutationLock -Operation {
+        Invoke-OOShutUpConfigurationWithRestorePointGateCore `
+            -ExecutablePath $ExecutablePath `
+            -AllowWithoutRestorePoint:$AllowWithoutRestorePoint
+    }
+    if (-not $lockResult.Succeeded) {
+        Write-Log $lockResult.FailureMessage -Level ERROR
+        if ($lockResult.OperationStarted -and $null -ne $lockResult.Value) {
+            $result = $lockResult.Value
+            $result.ConfigurationSucceeded = $false
+            $result | Add-Member -NotePropertyName FailureDetail -NotePropertyValue $lockResult.FailureMessage -Force
+            return $result
+        }
+
+        return [pscustomobject]@{
+            PreparationSucceeded = $false
+            RestorePointVerified = $false
+            OverrideUsed = $false
+            ConfigurationStarted = $false
+            ConfigurationSucceeded = $false
+            FailureDetail = $lockResult.FailureMessage
+        }
+    }
+
+    return $lockResult.Value
 }
 
 function ConvertTo-SystemTaskSid {
