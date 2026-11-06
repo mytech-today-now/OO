@@ -191,9 +191,12 @@ $script:OOShutUpManagedPathFailureMessage = 'The approved O&O executable path is
 $script:OOShutUpUpdateEventSubscription = '<QueryList><Query Id="0" Path="System"><Select Path="System">*[System[Provider[@Name=''Microsoft-Windows-WindowsUpdateClient''] and (EventID=19)]]</Select></Query></QueryList>'
 $script:OOShutUpUpdateEventDelay = 'PT2M'
 $script:OOShutUpUpdateMultipleInstancesPolicy = 'Queue'
+# The task limit leaves room for the ten-minute mutation-lock wait, the O&O wait, and cleanup.
+$script:OOShutUpChildTimeoutSeconds = 900
+$script:OOShutUpTaskExecutionTimeLimit = 'PT30M'
 $script:OOShutUpApprovedDigest = $null
 $script:OOShutUpApprovedManifestDigest = $null
-$script:OOShutUpLastRunChanged = $false
+$script:OOShutUpLastRunOutcome = $null
 $script:OOShutUpRestartDeferredMessage = 'Restart was deferred. Setup status remains unchanged; save your work and restart when ready.'
 $script:OOShutUpRestartPromptUnavailableMessage = 'No interactive restart prompt is available. Configuration status is retained; restart manually when convenient.'
 $script:OOShutUpRestartPromptTimeoutSeconds = 60
@@ -1696,9 +1699,11 @@ function Show-OOShutUpProfileImpactSummary {
     Write-Host ('Profile manifest SHA-256: {0}' -f $Profile.ManifestSha256)
     Write-Host ('Settings: {0}' -f $Profile.SettingCount)
     Write-Host 'Affected categories and reviewed setting descriptions:'
+    Write-Host 'Scope declarations and evidence references are reviewer claims; the validator does not authenticate their source or observe registry changes.'
+    Write-Host 'Before approving a SYSTEM profile, verify every setting against current O&O information and its disposable two-account registry record. Omit any entry with unconfirmed scope.'
     foreach ($setting in $Profile.Settings) {
         $stateLabel = if ($setting.State -eq '+') { 'on' } else { 'off' }
-        Write-Host ('- {0}: {1} ({2}; {3} scope): {4} [Scope evidence: {5}]' -f $setting.Category, $setting.Id, $stateLabel, $setting.Scope, $setting.Impact, $setting.ScopeEvidence)
+        Write-Host ('- {0}: {1} ({2}; {3} scope): {4} [Declared scope evidence reference: {5}]' -f $setting.Category, $setting.Id, $stateLabel, $setting.Scope, $setting.Impact, $setting.ScopeEvidence)
     }
     Write-Host 'The category and impact text comes from the reviewed manifest; no setting names are inferred from IDs.'
     Write-Host 'O&O settings can affect Windows features. Review every entry before accepting.'
@@ -1969,6 +1974,92 @@ function Remove-OOShutUpProfileSnapshot {
     [System.IO.Directory]::Delete($snapshotDirectory, $false)
 }
 
+function Get-OOShutUpRetainedProfileSnapshots {
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param()
+
+    if ([string]::IsNullOrWhiteSpace([string]$script:InstallPath)) {
+        return @()
+    }
+
+    $installDirectory = [System.IO.Path]::GetFullPath($script:InstallPath)
+    try {
+        $installItem = Get-Item -LiteralPath $installDirectory -Force -ErrorAction Stop
+    }
+    catch [System.Management.Automation.ItemNotFoundException] {
+        return @()
+    }
+
+    if (-not $installItem.PSIsContainer -or
+        (([int]$installItem.Attributes -band [int][System.IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        throw 'The managed O&O directory is not a regular directory.'
+    }
+
+    $retainedItems = @(
+        Get-ChildItem -LiteralPath $installDirectory -Force -ErrorAction Stop |
+            Where-Object { $_.Name -like 'ProfileSnapshot-*' }
+    )
+    return @($retainedItems | ForEach-Object { [string]$_.FullName })
+}
+
+function Wait-OOShutUpChildProcess {
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Process,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateRange(1, 2147483)]
+        [int]$TimeoutSeconds
+    )
+
+    $timeoutMilliseconds = [int]([long]$TimeoutSeconds * 1000)
+    try {
+        if ($null -eq $Process.PSObject.Methods['WaitForExit'] -or
+            $null -eq $Process.PSObject.Properties['HasExited'] -or
+            $null -eq $Process.PSObject.Properties['ExitCode']) {
+            throw 'Start-Process did not return a process object with exit status support.'
+        }
+
+        if ($Process.WaitForExit($timeoutMilliseconds)) {
+            [void]$Process.WaitForExit()
+            $processExitCode = $Process.ExitCode
+            if ($null -eq $processExitCode) {
+                throw 'The completed O&O process exit code could not be read.'
+            }
+            return [pscustomobject]@{
+                State    = 'Completed'
+                ExitCode = [int]$processExitCode
+            }
+        }
+
+        # A false timed wait is the deadline. The process may exit between that
+        # result and this check; keep the timeout outcome, but distinguish a
+        # confirmed stop from a child that may still be reading its snapshot.
+        if ($Process.HasExited) {
+            [void]$Process.WaitForExit()
+            return [pscustomobject]@{
+                State    = 'TimedOutStopped'
+                ExitCode = $null
+            }
+        }
+
+        return [pscustomobject]@{
+            State    = 'TimedOutRunning'
+            ExitCode = $null
+        }
+    }
+    catch {
+        return [pscustomobject]@{
+            State        = 'Unknown'
+            ExitCode     = $null
+            ErrorMessage = $_.Exception.Message
+        }
+    }
+}
+
 function New-OOShutUpProfileSnapshot {
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -2053,6 +2144,39 @@ function New-OOShutUpProfileSnapshot {
     }
 }
 
+function New-OOShutUpConfigurationOutcome {
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('Changed', 'Unchanged', 'Failed', 'Unknown')]
+        [string]$State,
+
+        [Parameter(Mandatory = $false)]
+        [object]$ExitCode,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Evidence,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Message,
+
+        [Parameter(Mandatory = $false)]
+        [ValidateSet('Proceed', 'Stop')]
+        [string]$NextStep = 'Stop'
+    )
+
+    $normalizedExitCode = if ($null -eq $ExitCode) { $null } else { [int]$ExitCode }
+    return [pscustomobject]@{
+        State = $State
+        ExitCode = $normalizedExitCode
+        Evidence = $Evidence
+        ReadbackState = 'Unavailable'
+        NextStep = $NextStep
+        Message = $Message
+    }
+}
+
 function Invoke-OOShutUpConfigurationCore {
     <#
     .SYNOPSIS
@@ -2067,26 +2191,38 @@ function Invoke-OOShutUpConfigurationCore {
         [switch]$SystemReapply
     )
 
-    $script:OOShutUpLastRunChanged = $false
+    $script:OOShutUpLastRunOutcome = New-OOShutUpConfigurationOutcome `
+        -State Failed `
+        -Evidence 'Installer pre-launch checks' `
+        -Message 'Configuration stopped before an O&O exit result was available.'
     $snapshot = $null
-    $stage = 'profile validation'
+    $stage = 'checking for a retained profile snapshot'
     $launchAttempted = $false
+    $processWaitResult = $null
 
     try {
+        $retainedSnapshots = @(Get-OOShutUpRetainedProfileSnapshots)
+        if ($retainedSnapshots.Count -gt 0) {
+            $retainedSnapshotList = [string]::Join("', '", [string[]]$retainedSnapshots)
+            Write-Log ("A prior O&O profile snapshot is still retained at '{0}'. Inspect the O&O process and settings outcome before retrying; remove the snapshot only after confirming the child is stopped." -f $retainedSnapshotList) -Level ERROR
+            return $script:OOShutUpLastRunOutcome
+        }
+
+        $stage = 'profile validation'
         $approvedProfile = Get-OOShutUpApprovedProfile -RequireMachineScope:$SystemReapply
         if ($null -eq $approvedProfile) {
-            return $false
+            return $script:OOShutUpLastRunOutcome
         }
 
         if (-not $script:OOShutUpApprovalConfirmed -or
             -not [string]::Equals($script:OOShutUpApprovedDigest, $approvedProfile.Sha256, [System.StringComparison]::OrdinalIgnoreCase) -or
             -not [string]::Equals($script:OOShutUpApprovedManifestDigest, $approvedProfile.ManifestSha256, [System.StringComparison]::OrdinalIgnoreCase)) {
             Write-Log $script:OOShutUpApprovalFailureMessage -Level ERROR
-            return $false
+            return $script:OOShutUpLastRunOutcome
         }
 
         if (-not (Test-OOShutUpPayload -Path $ExecutablePath)) {
-            return $false
+            return $script:OOShutUpLastRunOutcome
         }
 
         $stage = 'protected profile snapshot'
@@ -2102,13 +2238,35 @@ function Invoke-OOShutUpConfigurationCore {
         $profileWorkingDirectory = $snapshot.Directory
         $stage = 'O&O process launch'
         $launchAttempted = $true
-        $processInfo = Start-Process -FilePath $ExecutablePath -ArgumentList $arguments -WorkingDirectory $profileWorkingDirectory -Wait -PassThru -NoNewWindow
-        if ($null -eq $processInfo -or $null -eq $processInfo.PSObject.Properties['ExitCode']) {
-            throw 'Start-Process did not return a completed O&O process result.'
+        $processInfo = Start-Process -FilePath $ExecutablePath -ArgumentList $arguments -WorkingDirectory $profileWorkingDirectory -PassThru -NoNewWindow
+        if ($null -eq $processInfo -or
+            $null -eq $processInfo.PSObject.Methods['WaitForExit'] -or
+            $null -eq $processInfo.PSObject.Properties['HasExited'] -or
+            $null -eq $processInfo.PSObject.Properties['ExitCode']) {
+            throw 'Start-Process did not return an O&O process object.'
+        }
+
+        $stage = 'waiting for the O&O child process'
+        Write-Log ("Waiting up to {0} seconds for the O&O child process." -f $script:OOShutUpChildTimeoutSeconds) -Level INFO
+        $processWaitResult = Wait-OOShutUpChildProcess -Process $processInfo -TimeoutSeconds $script:OOShutUpChildTimeoutSeconds
+        if ($null -eq $processWaitResult -or $null -eq $processWaitResult.PSObject.Properties['State']) {
+            throw 'The bounded O&O process wait did not return a verifiable state.'
         }
     }
     catch {
         Write-Log ("Error during {0}: {1}" -f $stage, $_.Exception.Message) -Level ERROR
+        if ($launchAttempted) {
+            $script:OOShutUpLastRunOutcome = New-OOShutUpConfigurationOutcome `
+                -State Unknown `
+                -Evidence 'O&O launch was attempted, but no reliable exit result was available' `
+                -Message 'The O&O child may have changed settings, but its exit result is unavailable. Inspect O&O Undo History and current settings before retrying; no rollback was performed.'
+        }
+        else {
+            $script:OOShutUpLastRunOutcome = New-OOShutUpConfigurationOutcome `
+                -State Failed `
+                -Evidence 'Installer pre-launch checks' `
+                -Message 'O&O was not launched because a required configuration check failed.'
+        }
         if ($snapshot) {
             if ($launchAttempted) {
                 Write-Log ("The O&O launch outcome could not be verified. The protected profile snapshot was retained at '{0}'; check for a running OOSU10.exe process before removing it." -f $snapshot.Directory) -Level ERROR
@@ -2125,37 +2283,95 @@ function Invoke-OOShutUpConfigurationCore {
         if ($stage -eq 'protected profile snapshot') {
             Write-Log $script:OOShutUpProfileSnapshotFailureMessage -Level ERROR
         }
-        return $false
+        return $script:OOShutUpLastRunOutcome
     }
 
-    $processExitCode = [int]$processInfo.ExitCode
+    if ($processWaitResult.State -ne 'Completed') {
+        $processIdForInspection = 'unknown'
+        try {
+            $processIdForInspection = [string]$processInfo.Id
+        }
+        catch {
+            $processIdForInspection = 'unavailable'
+        }
+
+        $childState = switch -Exact ($processWaitResult.State) {
+            'TimedOutStopped' { 'The child was confirmed stopped after the wait limit, but its settings outcome is unknown.' }
+            'TimedOutRunning' { 'The child was still running at the wait limit and may still be reading its snapshot.' }
+            default { 'The child state could not be verified.' }
+        }
+        $waitErrorDetail = if ($processWaitResult.PSObject.Properties['ErrorMessage']) { " Wait detail: $($processWaitResult.ErrorMessage)" } else { '' }
+        $waitStatus = if ($processWaitResult.State -in @('TimedOutStopped', 'TimedOutRunning')) {
+            "O&O exceeded its $($script:OOShutUpChildTimeoutSeconds)-second wait limit."
+        }
+        else {
+            "The O&O child wait result could not be verified within its $($script:OOShutUpChildTimeoutSeconds)-second bound."
+        }
+        Write-Log ("{0} {1} No success was reported. The protected profile snapshot was retained at '{2}'. Inspect the settings outcome and confirm no O&O child is using the snapshot before removing it and retrying. Child process ID for inspection: {3}.{4}" -f $waitStatus, $childState, $snapshot.Directory, $processIdForInspection, $waitErrorDetail) -Level ERROR
+        $script:OOShutUpLastRunOutcome = New-OOShutUpConfigurationOutcome `
+            -State Unknown `
+            -Evidence 'O&O child did not produce a completed exit result' `
+            -Message 'The O&O child did not produce a reliable exit result. Its settings outcome is unknown. Inspect O&O Undo History and current settings before retrying; no rollback was performed.'
+        return $script:OOShutUpLastRunOutcome
+    }
+
+    $processExitCode = [int]$processWaitResult.ExitCode
     if ($processExitCode -eq 30) {
-        $script:OOShutUpLastRunChanged = $true
+        $script:OOShutUpLastRunOutcome = New-OOShutUpConfigurationOutcome `
+            -State Changed `
+            -ExitCode $processExitCode `
+            -Evidence 'O&O-reported status from the existing exit-code contract' `
+            -Message 'O&O reported that settings changed. Windows settings were not independently read back.' `
+            -NextStep Proceed
+    }
+    elseif ($processExitCode -eq 0) {
+        $script:OOShutUpLastRunOutcome = New-OOShutUpConfigurationOutcome `
+            -State Unchanged `
+            -ExitCode $processExitCode `
+            -Evidence 'O&O-reported status from the existing exit-code contract' `
+            -Message 'O&O reported that no setting changes were needed. Windows settings were not independently read back.' `
+            -NextStep Proceed
+    }
+    else {
+        $script:OOShutUpLastRunOutcome = New-OOShutUpConfigurationOutcome `
+            -State Unknown `
+            -ExitCode $processExitCode `
+            -Evidence 'Unrecognized O&O native exit code' `
+            -Message ("O&O returned unrecognized exit code {0}; settings may have changed before it exited. Inspect O&O Undo History and current settings before retrying; no rollback was performed." -f $processExitCode)
     }
 
     try {
         Remove-OOShutUpProfileSnapshot -Directory $snapshot.Directory
     }
     catch {
-        Write-Log ("The protected profile snapshot could not be removed after O&O exited. Verify O&O's applied settings, then remove '{0}' manually after confirming no OOSU10.exe process still uses it: {1}" -f $snapshot.Directory, $_.Exception.Message) -Level ERROR
-        return $false
+        Write-Log ("The protected profile snapshot could not be removed after O&O exited with code {0}. O&O's report is not an independent settings readback. Inspect the settings and remove '{1}' manually only after confirming no OOSU10.exe process still uses it: {2}" -f $processExitCode, $snapshot.Directory, $_.Exception.Message) -Level ERROR
+        $reportedState = [string]$script:OOShutUpLastRunOutcome.State
+        if ($reportedState -in @('Changed', 'Unchanged')) {
+            $script:OOShutUpLastRunOutcome = New-OOShutUpConfigurationOutcome `
+                -State $reportedState `
+                -ExitCode $processExitCode `
+                -Evidence 'O&O-reported status; protected snapshot cleanup failed' `
+                -Message ("O&O reported {0} settings, but the protected profile snapshot could not be removed. Confirm no O&O process uses the snapshot, inspect current settings, then remove '{1}' manually before retrying." -f $reportedState.ToLowerInvariant(), $snapshot.Directory) `
+                -NextStep Stop
+        }
+        return $script:OOShutUpLastRunOutcome
     }
 
-    # O&O ShutUp10++ exit codes: 0 = no changes, 30 = settings applied, other codes are failures.
+    # The existing integration contract treats 0 as O&O-reported unchanged and 30 as O&O-reported changed.
+    # Neither status is an independent readback. Other exit codes remain unknown because partial changes are possible.
     if ($processExitCode -eq 0 -or $processExitCode -eq 30) {
         if ($processExitCode -eq 30) {
-            Write-Log "Successfully applied the approved privacy settings profile" -Level SUCCESS
-            Write-Log "Settings were applied and changes were made (exit code 30 is normal)" -Level INFO
+            Write-Log 'O&O reported that the approved privacy settings profile changed Windows settings (exit code 30). No independent readback was performed.' -Level INFO
         }
         else {
-            Write-Log 'O&O reported that no setting changes were needed for the approved profile.' -Level INFO
+            Write-Log 'O&O reported that no setting changes were needed for the approved profile (exit code 0). No independent readback was performed.' -Level INFO
         }
-        return $true
+        return $script:OOShutUpLastRunOutcome
     }
     else {
         Write-Log "O&O ShutUp10++ exited with unexpected code: $processExitCode" -Level WARNING
-        Write-Log "Settings may not have been applied correctly. Please check manually." -Level WARNING
-        return $false
+        Write-Log $script:OOShutUpLastRunOutcome.Message -Level WARNING
+        return $script:OOShutUpLastRunOutcome
     }
 }
 
@@ -2169,16 +2385,42 @@ function Invoke-OOShutUpConfiguration {
         [switch]$SystemReapply
     )
 
-    $script:OOShutUpLastRunChanged = $false
+    $script:OOShutUpLastRunOutcome = $null
     $lockResult = Invoke-WithOOShutUpMutationLock -Operation {
         Invoke-OOShutUpConfigurationCore -ExecutablePath $ExecutablePath -SystemReapply:$SystemReapply
     }
     if (-not $lockResult.Succeeded) {
         Write-Log $lockResult.FailureMessage -Level ERROR
-        return $false
+        if ($lockResult.OperationStarted -and $null -ne $script:OOShutUpLastRunOutcome -and
+            $script:OOShutUpLastRunOutcome.State -in @('Changed', 'Unchanged')) {
+            $reportedState = [string]$script:OOShutUpLastRunOutcome.State
+            $reportedExitCode = $script:OOShutUpLastRunOutcome.ExitCode
+            $script:OOShutUpLastRunOutcome = New-OOShutUpConfigurationOutcome `
+                -State $reportedState `
+                -ExitCode $reportedExitCode `
+                -Evidence 'O&O-reported status; mutation lock operation did not complete cleanly' `
+                -Message ("O&O reported {0} settings, but the mutation lock operation did not complete cleanly. Review the logs, O&O Undo History, and current settings before retrying." -f $reportedState.ToLowerInvariant()) `
+                -NextStep Stop
+        }
+        elseif (-not $lockResult.OperationStarted -or $null -eq $script:OOShutUpLastRunOutcome) {
+            $script:OOShutUpLastRunOutcome = New-OOShutUpConfigurationOutcome `
+                -State Failed `
+                -Evidence 'Configuration mutation lock was not acquired' `
+                -Message 'Configuration did not start because the mutation lock was unavailable.'
+        }
+        return $script:OOShutUpLastRunOutcome
     }
 
-    return [bool]$lockResult.Value
+    if ($null -eq $lockResult.Value -or $null -eq $lockResult.Value.PSObject.Properties['State']) {
+        $script:OOShutUpLastRunOutcome = New-OOShutUpConfigurationOutcome `
+            -State Unknown `
+            -Evidence 'Configuration operation returned no structured result' `
+            -Message 'No structured O&O settings outcome was returned. Inspect O&O Undo History and current settings before retrying; no rollback was performed.'
+        return $script:OOShutUpLastRunOutcome
+    }
+
+    $script:OOShutUpLastRunOutcome = $lockResult.Value
+    return $script:OOShutUpLastRunOutcome
 }
 
 function Get-WindowsSystemVolume {
@@ -2375,7 +2617,7 @@ function Invoke-OOShutUpConfigurationWithRestorePointGateCore {
             RestorePointVerified = $false
             OverrideUsed = $false
             ConfigurationStarted = $false
-            ConfigurationSucceeded = $false
+            ConfigurationOutcome = $script:OOShutUpLastRunOutcome
         }
     }
 
@@ -2386,7 +2628,7 @@ function Invoke-OOShutUpConfigurationWithRestorePointGateCore {
             RestorePointVerified = $false
             OverrideUsed = $false
             ConfigurationStarted = $false
-            ConfigurationSucceeded = $false
+            ConfigurationOutcome = $script:OOShutUpLastRunOutcome
         }
     }
 
@@ -2396,14 +2638,14 @@ function Invoke-OOShutUpConfigurationWithRestorePointGateCore {
 
     Update-ScriptProgress -PercentComplete 70 -Status "Step 4 of 5: Applying Privacy Settings" -CurrentOperation "Applying the approved privacy settings profile"
     Write-Log "Step 4: Applying the approved privacy settings profile..." -Level INFO
-    $configurationSucceeded = Invoke-OOShutUpConfigurationCore -ExecutablePath $ExecutablePath
+    $configurationOutcome = Invoke-OOShutUpConfigurationCore -ExecutablePath $ExecutablePath
 
     return [pscustomobject]@{
         PreparationSucceeded = $true
         RestorePointVerified = [bool]$restorePointVerified
         OverrideUsed = [bool](-not $restorePointVerified -and $AllowWithoutRestorePoint)
         ConfigurationStarted = $true
-        ConfigurationSucceeded = [bool]$configurationSucceeded
+        ConfigurationOutcome = $configurationOutcome
     }
 }
 
@@ -2418,7 +2660,10 @@ function Invoke-OOShutUpConfigurationWithRestorePointGate {
         [switch]$AllowWithoutRestorePoint
     )
 
-    $script:OOShutUpLastRunChanged = $false
+    $script:OOShutUpLastRunOutcome = New-OOShutUpConfigurationOutcome `
+        -State Failed `
+        -Evidence 'Configuration gate did not launch O&O' `
+        -Message 'Configuration did not reach an O&O process result.'
     $lockResult = Invoke-WithOOShutUpMutationLock -Operation {
         Invoke-OOShutUpConfigurationWithRestorePointGateCore `
             -ExecutablePath $ExecutablePath `
@@ -2428,7 +2673,6 @@ function Invoke-OOShutUpConfigurationWithRestorePointGate {
         Write-Log $lockResult.FailureMessage -Level ERROR
         if ($lockResult.OperationStarted -and $null -ne $lockResult.Value) {
             $result = $lockResult.Value
-            $result.ConfigurationSucceeded = $false
             $result | Add-Member -NotePropertyName FailureDetail -NotePropertyValue $lockResult.FailureMessage -Force
             return $result
         }
@@ -2438,8 +2682,8 @@ function Invoke-OOShutUpConfigurationWithRestorePointGate {
             RestorePointVerified = $false
             OverrideUsed = $false
             ConfigurationStarted = $false
-            ConfigurationSucceeded = $false
             FailureDetail = $lockResult.FailureMessage
+            ConfigurationOutcome = $script:OOShutUpLastRunOutcome
         }
     }
 
@@ -2803,6 +3047,24 @@ function Test-WindowsUpdateTaskDefinition {
         $settings = $Task.Settings
         if ($null -eq $settings -or
             -not [string]::Equals([string]$settings.MultipleInstances, $script:OOShutUpUpdateMultipleInstancesPolicy, [System.StringComparison]::Ordinal)) {
+            return $false
+        }
+        try {
+            $expectedExecutionTimeLimit = [System.Xml.XmlConvert]::ToTimeSpan($script:OOShutUpTaskExecutionTimeLimit)
+            $actualExecutionTimeLimit = $settings.ExecutionTimeLimit
+            if ($actualExecutionTimeLimit -isnot [TimeSpan]) {
+                try {
+                    $actualExecutionTimeLimit = [System.Xml.XmlConvert]::ToTimeSpan([string]$actualExecutionTimeLimit)
+                }
+                catch {
+                    $actualExecutionTimeLimit = [TimeSpan]::Parse([string]$actualExecutionTimeLimit, [System.Globalization.CultureInfo]::InvariantCulture)
+                }
+            }
+            if ($actualExecutionTimeLimit -ne $expectedExecutionTimeLimit) {
+                return $false
+            }
+        }
+        catch {
             return $false
         }
 
@@ -3240,7 +3502,7 @@ function New-WindowsUpdateScheduledTask {
         Write-Log ("Scheduled task principal SID S-1-5-18 passed the machine-scope gate for {0} settings (profile SHA-256 {1}; manifest SHA-256 {2}); setting values are omitted." -f $currentApprovedProfile.SettingCount, $currentApprovedProfile.Sha256, $currentApprovedProfile.ManifestSha256) -Level INFO
 
         Write-Log "Creating scheduled task for post-Windows Update execution..." -Level INFO
-        Write-Log 'The task listens for Windows Update installation-success event 19 with a two-minute delay; overlapping reapplications are queued sequentially.' -Level INFO
+        Write-Log ("The task listens for Windows Update installation-success event 19 with a two-minute delay; overlapping reapplications are queued sequentially. The O&O child wait is limited to {0} seconds and the task execution limit is {1}." -f $script:OOShutUpChildTimeoutSeconds, $script:OOShutUpTaskExecutionTimeLimit) -Level INFO
 
         $taskName     = "Install-OOShutUp10"
         $taskFolder   = "myTech.Today"
@@ -3325,6 +3587,10 @@ function New-WindowsUpdateScheduledTask {
         $enabled2 = $xml.CreateElement("Enabled")
         $enabled2.InnerText = "true"
         $settings.AppendChild($enabled2) | Out-Null
+
+        $executionTimeLimit = $xml.CreateElement("ExecutionTimeLimit")
+        $executionTimeLimit.InnerText = $script:OOShutUpTaskExecutionTimeLimit
+        $settings.AppendChild($executionTimeLimit) | Out-Null
 
         $task.AppendChild($settings) | Out-Null
 
@@ -3509,7 +3775,7 @@ function New-WindowsUpdateScheduledTask {
             Select-Object -First 1
         if ($null -eq $stagedTask -or [string]$stagedTask.State -ne 'Disabled' -or
             -not (Test-WindowsUpdateTaskDefinition -Task $stagedTask -TaskPath $taskPath -TaskName $stagingTaskName -TaskDescription $taskDescription -ScriptPath $ScriptPath -ApprovedProfileSha256 $ApprovedProfileSha256 -ApprovedProfileManifestSha256 $ApprovedProfileManifestSha256 -ApprovedOOSExecutablePath $approvedOOSExecutablePath -TrustedPowerShellPath $trustedPowerShellPath)) {
-            throw 'The disabled candidate task did not match the approved SYSTEM action, trigger, and queue settings; the existing task was left unchanged.'
+            throw 'The disabled candidate task did not match the approved SYSTEM action, trigger, queue, and execution-time settings; the existing task was left unchanged.'
         }
 
         # The verified candidate is ready. Replace prior tasks and roll them back if final verification fails.
@@ -3527,7 +3793,7 @@ function New-WindowsUpdateScheduledTask {
             Select-Object -First 1
         if ($null -eq $verifiedTask -or [string]$verifiedTask.State -ne 'Disabled' -or
             -not (Test-WindowsUpdateTaskDefinition -Task $verifiedTask -TaskPath $taskPath -TaskName $taskName -TaskDescription $taskDescription -ScriptPath $ScriptPath -ApprovedProfileSha256 $ApprovedProfileSha256 -ApprovedProfileManifestSha256 $ApprovedProfileManifestSha256 -ApprovedOOSExecutablePath $approvedOOSExecutablePath -TrustedPowerShellPath $trustedPowerShellPath)) {
-            throw 'The disabled replacement task did not match the approved SYSTEM action, success trigger, and queue settings after registration.'
+            throw 'The disabled replacement task did not match the approved SYSTEM action, success trigger, queue, and execution-time settings after registration.'
         }
 
         Set-WindowsUpdateTaskEnabled -TaskPath $taskPath -TaskName $taskName -Enabled $true
@@ -3536,7 +3802,7 @@ function New-WindowsUpdateScheduledTask {
             Select-Object -First 1
         if ($null -eq $verifiedTask -or [string]$verifiedTask.State -eq 'Disabled' -or
             -not (Test-WindowsUpdateTaskDefinition -Task $verifiedTask -TaskPath $taskPath -TaskName $taskName -TaskDescription $taskDescription -ScriptPath $ScriptPath -ApprovedProfileSha256 $ApprovedProfileSha256 -ApprovedProfileManifestSha256 $ApprovedProfileManifestSha256 -ApprovedOOSExecutablePath $approvedOOSExecutablePath -TrustedPowerShellPath $trustedPowerShellPath)) {
-            throw 'The replacement task was not enabled with the approved SYSTEM action, success trigger, and queue settings.'
+            throw 'The replacement task was not enabled with the approved SYSTEM action, success trigger, queue, and execution-time settings.'
         }
         [void](Assert-WindowsUpdateTaskSecurityDescriptor -TaskPath $taskPath -TaskName $taskName)
 
@@ -3737,7 +4003,7 @@ function Get-OOShutUpInstallOutcome {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
-        [bool]$SettingsVerified,
+        [psobject]$ConfigurationOutcome,
 
         [Parameter(Mandatory = $true)]
         [bool]$RestorePointVerified,
@@ -3750,7 +4016,12 @@ function Get-OOShutUpInstallOutcome {
     )
 
     $taskVerified = [object]::Equals($TaskSetup.Verified, [bool]$true)
-    $settingsOutcome = if ($SettingsVerified) { 'Verified' } else { 'Not verified' }
+    $settingsOutcome = [string]$ConfigurationOutcome.State
+    if ($settingsOutcome -notin @('Changed', 'Unchanged', 'Failed', 'Unknown')) {
+        $settingsOutcome = 'Unknown'
+    }
+    $settingsEvidence = [string]$ConfigurationOutcome.Evidence
+    $settingsReadback = 'Unavailable'
     $restorePointOutcome = if ($RestorePointVerified) {
         'Verified'
     }
@@ -3763,18 +4034,39 @@ function Get-OOShutUpInstallOutcome {
     $taskOutcome = if ($taskVerified) { 'Verified' } else { 'Not verified' }
     $status = 'Complete'
     $exitCode = 0
-    $summary = 'The approved privacy settings are verified and the update task \myTech.Today\Install-OOShutUp10 is registered and verified.'
+    $reportedSettingsSummary = if ($settingsOutcome -eq 'Changed') {
+        'O&O reported that settings changed.'
+    }
+    elseif ($settingsOutcome -eq 'Unchanged') {
+        'O&O reported that no setting changes were needed.'
+    }
+    else {
+        'The O&O settings outcome is not available.'
+    }
+    $summary = "{0} Windows settings were not independently read back. The update task \myTech.Today\Install-OOShutUp10 is registered and verified." -f $reportedSettingsSummary
     $recoveryMessage = $null
 
-    if (-not $SettingsVerified) {
+    if ($settingsOutcome -eq 'Unknown') {
         $status = 'Failed'
         $exitCode = 1
-        $summary = 'Setup failed because the approved privacy settings were not verified. Review the preceding error and retry after resolving it.'
+        $summary = 'The O&O settings outcome is unknown. Review O&O Undo History and current settings before retrying; no rollback was performed.'
+        $recoveryMessage = $summary
+    }
+    elseif ($settingsOutcome -eq 'Failed') {
+        $status = 'Failed'
+        $exitCode = 1
+        $summary = 'Setup failed before a known O&O settings outcome was available. Resolve the logged pre-launch error before retrying.'
+    }
+    elseif ($ConfigurationOutcome.NextStep -ne 'Proceed') {
+        $status = 'Failed'
+        $exitCode = 1
+        $summary = $ConfigurationOutcome.Message
+        $recoveryMessage = $ConfigurationOutcome.Message
     }
     elseif (-not $taskVerified) {
         $status = 'Partial'
         $exitCode = 2
-        $summary = $script:OOShutUpPartialSetupMessage
+        $summary = "{0} Windows settings were not independently read back. {1}" -f $reportedSettingsSummary, $script:OOShutUpPartialSetupMessage
         $recoveryMessage = $script:OOShutUpTaskRecoveryMessage
     }
     elseif (-not $RestorePointVerified -and -not $RestorePointOverrideUsed) {
@@ -3788,6 +4080,8 @@ function Get-OOShutUpInstallOutcome {
         Status = $status
         ExitCode = $exitCode
         SettingsOutcome = $settingsOutcome
+        SettingsEvidence = $settingsEvidence
+        SettingsReadback = $settingsReadback
         RestorePointOutcome = $restorePointOutcome
         TaskOutcome = $taskOutcome
         TaskVerified = $taskVerified
@@ -3913,27 +4207,20 @@ try {
 
         # Apply the validated profile
         Write-Log "Reapplying the approved privacy settings profile..." -Level INFO
-        $configSuccess = Invoke-OOShutUpConfiguration -ExecutablePath $exePath -SystemReapply
+        $configurationOutcome = Invoke-OOShutUpConfiguration -ExecutablePath $exePath -SystemReapply
 
-        if ($configSuccess) {
-            if ($script:OOShutUpLastRunChanged) {
-                Write-Log "Successfully reapplied privacy settings after Windows Update" -Level SUCCESS
-            }
-            else {
-                Write-Log 'The approved profile already matched the current settings; no setting changes were made.' -Level INFO
-            }
+        if ($configurationOutcome.State -eq 'Changed' -and $configurationOutcome.NextStep -eq 'Proceed') {
+            Write-Log 'O&O reported that the approved profile changed settings after Windows Update. Settings were not independently read back.' -Level INFO
+        }
+        elseif ($configurationOutcome.State -eq 'Unchanged' -and $configurationOutcome.NextStep -eq 'Proceed') {
+            Write-Log 'O&O reported that no settings needed restoration after Windows Update. Settings were not independently read back.' -Level INFO
         }
         else {
-            Write-Log "Failed to reapply privacy settings" -Level ERROR
+            Write-Log $configurationOutcome.Message -Level ERROR
+            Write-Log 'Review O&O Undo History and current settings before retrying. No rollback was performed.' -Level ERROR
             exit 1
         }
 
-        if ($script:OOShutUpLastRunChanged) {
-            Write-Log "Privacy settings have been restored after Windows Update" -Level SUCCESS
-        }
-        else {
-            Write-Log 'No settings needed restoration after Windows Update.' -Level INFO
-        }
         exit 0
     }
 
@@ -3996,11 +4283,14 @@ try {
         exit 1
     }
 
-    $configSuccess = $configurationResult.ConfigurationSucceeded
+    $configurationOutcome = $configurationResult.ConfigurationOutcome
 
-    if (-not $configSuccess) {
+    if ($configurationOutcome.State -notin @('Changed', 'Unchanged') -or $configurationOutcome.NextStep -ne 'Proceed') {
         Write-Progress -Activity "O&O ShutUp10++ Installation and Configuration" -Completed
-        Write-Log "Failed to apply privacy settings. Please run O&O ShutUp10++ manually." -Level ERROR
+        Write-Log $configurationOutcome.Message -Level ERROR
+        if ($configurationOutcome.State -eq 'Unknown') {
+            Write-Log 'Review O&O Undo History and current settings before retrying. No rollback was performed.' -Level ERROR
+        }
         exit 1
     }
 
@@ -4013,7 +4303,7 @@ try {
         -ApprovedProfileSha256 $approvedProfile.Sha256 `
         -ApprovedProfileManifestSha256 $approvedProfile.ManifestSha256
     $installerOutcome = Get-OOShutUpInstallOutcome `
-        -SettingsVerified $configSuccess `
+        -ConfigurationOutcome $configurationOutcome `
         -RestorePointVerified $restorePointVerified `
         -RestorePointOverrideUsed $restorePointOverrideUsed `
         -TaskSetup $taskSetup
@@ -4029,24 +4319,24 @@ try {
     # Step 6: Completion
     Write-Log " " -Level INFO
     if ($installerOutcome.Status -eq 'Complete') {
-        Update-ScriptProgress -PercentComplete 100 -Status "Complete!" -CurrentOperation "Settings and scheduled task verified"
+        Update-ScriptProgress -PercentComplete 100 -Status "Complete!" -CurrentOperation "O&O status recorded; scheduled task verified"
     }
     elseif ($installerOutcome.Status -eq 'Partial') {
-        Update-ScriptProgress -PercentComplete 100 -Status "Partial setup" -CurrentOperation "Settings applied; update task not verified"
+        Update-ScriptProgress -PercentComplete 100 -Status "Partial setup" -CurrentOperation "O&O status recorded; update task not verified"
     }
     else {
-        Update-ScriptProgress -PercentComplete 100 -Status "Setup failed" -CurrentOperation "A required outcome was not verified"
+        Update-ScriptProgress -PercentComplete 100 -Status "Setup failed" -CurrentOperation "Review the O&O settings outcome"
     }
     Write-OOShutUpInstallSummary -Outcome $installerOutcome
     Write-Log " " -Level INFO
-    if ($script:OOShutUpLastRunChanged) {
-        Write-Log "O&O ShutUp10++ applied the approved privacy settings profile." -Level SUCCESS
+    if ($configurationOutcome.State -eq 'Changed') {
+        Write-Log 'O&O reported that the approved privacy settings profile changed Windows settings. No independent readback was performed.' -Level INFO
     }
-    elseif ($configSuccess) {
-        Write-Log 'O&O reported that no setting changes were needed for the approved profile.' -Level INFO
+    elseif ($configurationOutcome.State -eq 'Unchanged') {
+        Write-Log 'O&O reported that no setting changes were needed for the approved profile. No independent readback was performed.' -Level INFO
     }
     else {
-        Write-Log 'The O&O configuration did not complete successfully. Review the preceding error and O&O Undo History before retrying.' -Level WARNING
+        Write-Log $configurationOutcome.Message -Level WARNING
     }
     if ($restorePointVerified) {
         Write-Log "A system restore point was verified before applying settings; it is separate from the exported O&O profile." -Level SUCCESS
@@ -4106,15 +4396,19 @@ try {
         }
     }
 
-    # Request a restart only after O&O confirms that it changed settings.
-    if (-not $script:OOShutUpLastRunChanged) {
-        Write-Log 'No setting changes were made; a restart is not required.' -Level INFO
-    }
-    else {
+    # Request a restart only when the recognized O&O status reports changed settings.
+    if ($configurationOutcome.State -eq 'Changed') {
         Invoke-OOShutUpRestart -NonInteractive:$NonInteractive -ForceRestart:$ForceRestart
     }
+    elseif ($configurationOutcome.State -eq 'Unchanged') {
+        Write-Log 'O&O reported that no setting changes were made; a restart is not required.' -Level INFO
+    }
+    else {
+        Write-Log 'The settings outcome is unknown; no restart decision was made. Inspect O&O Undo History and current settings before retrying.' -Level WARNING
+    }
 
-    # Exit 0 is reserved for verified settings, an acceptable restore-point outcome, and a verified update task.
+    # Exit 0 requires a recognized O&O-reported state, an acceptable restore-point outcome, and a verified update task.
+    # This script does not independently read back the configured Windows settings.
     exit $installerOutcome.ExitCode
 }
 catch {

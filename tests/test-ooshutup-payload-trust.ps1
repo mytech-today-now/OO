@@ -8,11 +8,14 @@ $script:PromptMessages = New-Object System.Collections.ArrayList
 $script:StartedPaths = New-Object System.Collections.ArrayList
 $script:StartedArguments = New-Object System.Collections.ArrayList
 $script:StartedWorkingDirectories = New-Object System.Collections.ArrayList
+$script:StartedWaitFlags = New-Object System.Collections.ArrayList
+$script:StartedProcessObjects = New-Object System.Collections.ArrayList
 $script:OpenedProfilePaths = New-Object System.Collections.ArrayList
 $script:OpenedProfileBytes = New-Object System.Collections.ArrayList
 $script:OpenedManifestBytes = New-Object System.Collections.ArrayList
 $script:StartProcessCallCount = 0
 $script:MockStartProcessFailure = $false
+$script:MockStartProcessReturnsNull = $false
 $script:SwapProfileBeforeMockOpen = $false
 $script:MockReplacementProfileContent = ''
 $script:MockReplacementManifestContent = ''
@@ -23,6 +26,8 @@ $script:DownloadScenario = 'valid'
 $script:DownloadCount = 0
 $script:SignatureCallCount = 0
 $script:MockExitCode = 0
+$script:MockChildWaitScenario = 'fast-exit'
+$script:MockChildWaitTimeoutMilliseconds = 0
 $script:PromptDecision = 'YES'
 $script:FixtureRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('oosu10-trust-tests-' + [guid]::NewGuid().ToString('N'))
 $script:TaskRegistry = @{}
@@ -43,6 +48,7 @@ $script:FailTaskRestoreXml = $null
 $script:FailTaskVerification = $false
 $script:FailStageVerification = $false
 $script:FailStageQueuePolicyVerification = $false
+$script:FailStageExecutionTimeLimitVerification = $false
 $script:FailTaskRestore = $false
 $script:MockInstallerTaskScenario = 'Success'
 $script:OOShutUpPartialSetupMessage = 'The privacy settings may be applied, but the update task was not verified. Setup is partial; repair the task before relying on automatic reapplication.'
@@ -52,6 +58,8 @@ $script:OOShutUpTaskRecoveryMessage = 'Recovery: resolve the logged Task Schedul
 $script:OOShutUpUpdateEventSubscription = '<QueryList><Query Id="0" Path="System"><Select Path="System">*[System[Provider[@Name=''Microsoft-Windows-WindowsUpdateClient''] and (EventID=19)]]</Select></Query></QueryList>'
 $script:OOShutUpUpdateEventDelay = 'PT2M'
 $script:OOShutUpUpdateMultipleInstancesPolicy = 'Queue'
+$script:OOShutUpChildTimeoutSeconds = 900
+$script:OOShutUpTaskExecutionTimeLimit = 'PT30M'
 $script:OOShutUpRestorePointFailureMessage = 'A restore point could not be verified. No privacy settings were applied; free space or enable restore protection, then retry.'
 $script:MockAclByPath = @{}
 $script:MockAclFailurePath = $null
@@ -196,6 +204,52 @@ function Get-AuthenticodeSignature {
     }
 }
 
+function New-MockOOSChildProcess {
+    $process = [pscustomobject]@{
+        Id = 4000 + $script:StartProcessCallCount
+        ExitCode = $script:MockExitCode
+        HasExited = $false
+        WaitCalls = 0
+        UntimedWaitCalls = 0
+        KillCalls = 0
+    }
+    $process | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value {
+        param([int]$Milliseconds = -1)
+
+        $this.WaitCalls++
+        if ($Milliseconds -lt 0) {
+            $this.UntimedWaitCalls++
+            return [bool]$this.HasExited
+        }
+
+        $script:MockChildWaitTimeoutMilliseconds = $Milliseconds
+        switch -Exact ($script:MockChildWaitScenario) {
+            'fast-exit' {
+                $this.HasExited = $true
+                return $true
+            }
+            'timeout-boundary-race' {
+                $this.HasExited = $true
+                return $false
+            }
+            'still-running' {
+                return $false
+            }
+            'wait-error' {
+                throw 'Mock process wait could not be verified.'
+            }
+            default {
+                throw "Unexpected mocked O&O child wait scenario: $script:MockChildWaitScenario"
+            }
+        }
+    } -Force
+    $process | Add-Member -MemberType ScriptMethod -Name Kill -Value {
+        $this.KillCalls++
+        $this.HasExited = $true
+    } -Force
+    return $process
+}
+
 function Start-Process {
     [CmdletBinding()]
     param(
@@ -211,8 +265,12 @@ function Start-Process {
     [void]$script:StartedPaths.Add($FilePath)
     [void]$script:StartedArguments.Add($ArgumentList)
     [void]$script:StartedWorkingDirectories.Add($WorkingDirectory)
+    [void]$script:StartedWaitFlags.Add([bool]$Wait)
     if ($script:MockStartProcessFailure) {
         throw 'Mocked Start-Process outcome could not be verified.'
+    }
+    if ($script:MockStartProcessReturnsNull) {
+        return $null
     }
     $profileArgument = [System.Text.RegularExpressions.Regex]::Match($ArgumentList, '^/quiet /nosrp "([^"]+)"$')
     if ($profileArgument.Success) {
@@ -226,7 +284,9 @@ function Start-Process {
         $openedManifestPath = Join-Path (Split-Path -Parent $openedProfilePath) 'ooshutup10.approval.json'
         [void]$script:OpenedManifestBytes.Add([System.IO.File]::ReadAllBytes($openedManifestPath))
     }
-    return [pscustomobject]@{ ExitCode = $script:MockExitCode }
+    $process = New-MockOOSChildProcess
+    [void]$script:StartedProcessObjects.Add($process)
+    return $process
 }
 
 function Write-ApprovedProfileFixture {
@@ -349,6 +409,7 @@ function New-MockScheduledTask {
     $action = $definition.SelectSingleNode("/*[local-name()='Task']/*[local-name()='Actions']/*[local-name()='Exec']")
     $enabledNode = $definition.SelectSingleNode("/*[local-name()='Task']/*[local-name()='Settings']/*[local-name()='Enabled']")
     $multipleInstancesNode = $definition.SelectSingleNode("/*[local-name()='Task']/*[local-name()='Settings']/*[local-name()='MultipleInstancesPolicy']")
+    $executionTimeLimitNode = $definition.SelectSingleNode("/*[local-name()='Task']/*[local-name()='Settings']/*[local-name()='ExecutionTimeLimit']")
     $descriptionNode = $definition.SelectSingleNode("/*[local-name()='Task']/*[local-name()='RegistrationInfo']/*[local-name()='Description']")
     $triggerMocks = @(
         foreach ($triggerNode in $definition.SelectNodes("/*[local-name()='Task']/*[local-name()='Triggers']/*[local-name()='EventTrigger']")) {
@@ -373,7 +434,10 @@ function New-MockScheduledTask {
         Description = [string]$descriptionNode.InnerText
         State = if ([string]$enabledNode.InnerText -eq 'false') { 'Disabled' } else { 'Ready' }
         Principal = [pscustomobject]@{ UserId = [string]$principal.UserId; RunLevel = [string]$principal.RunLevel }
-        Settings = [pscustomobject]@{ MultipleInstances = [string]$multipleInstancesNode.InnerText }
+        Settings = [pscustomobject]@{
+            MultipleInstances = [string]$multipleInstancesNode.InnerText
+            ExecutionTimeLimit = if ($null -eq $executionTimeLimitNode) { '' } else { [string]$executionTimeLimitNode.InnerText }
+        }
         Triggers = $triggerMocks
         Actions = @([pscustomobject]@{ Execute = [string]$action.Command; Arguments = $arguments; WorkingDirectory = [string]$action.WorkingDirectory })
         Definition = $Xml
@@ -489,6 +553,9 @@ function Register-ScheduledTask {
     if ($script:FailStageQueuePolicyVerification -and $TaskName -like 'Install-OOShutUp10-validation-*') {
         $task.Settings.MultipleInstances = 'IgnoreNew'
     }
+    if ($script:FailStageExecutionTimeLimitVerification -and $TaskName -like 'Install-OOShutUp10-validation-*') {
+        $task.Settings.ExecutionTimeLimit = 'PT0S'
+    }
     $script:TaskRegistry["$TaskPath|$TaskName"] = $task
     $script:TaskSecurityDescriptorByIdentity["$TaskPath|$TaskName"] = [string]$script:OOShutUpTaskSecurityDescriptorSddl
     if ($script:FailTaskVerification -and $TaskName -eq 'Install-OOShutUp10' -and $TaskPath -eq '\myTech.Today\') {
@@ -542,12 +609,17 @@ try {
     Assert-True ($source.Contains('The task security descriptor could not be verified. No new task was enabled; inspect task permissions before retrying.')) 'task descriptor failures use the exact required fallback'
     Assert-True ($source.Contains("O:BAG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)")) 'the task descriptor allowlist is explicit for SYSTEM and Administrators'
     Assert-True ($source.Contains('-RequireMachineScope:$ReapplyOnly')) 'ReapplyOnly validates machine scope before later work'
+    Assert-True ($source.Contains('Scope declarations and evidence references are reviewer claims; the validator does not authenticate their source or observe registry changes.')) 'interactive approval states the limits of scope and evidence validation'
+    Assert-True ($source.Contains('Before approving a SYSTEM profile, verify every setting against current O&O information and its disposable two-account registry record. Omit any entry with unconfirmed scope.')) 'interactive approval requires current product and two-account evidence review'
     Assert-True ($source.Contains("Join-Path `$PSScriptRoot 'profiles'")) 'the profile package path is rooted beside the script'
     Assert-True ($source -notmatch 'Start-Process[^\r\n]*ooshutup10\.cfg') 'the O&O invocation does not pass a bare profile filename'
     Assert-True ($source -notmatch '\$TempPath') 'the managed executable path no longer depends on a TEMP-derived variable'
     Assert-True ($source.Contains('$env:ProgramW6432') -and $source.Contains('$env:ProgramFiles')) 'the machine install directory uses the machine Program Files location'
     Assert-True ($source.Contains("`$script:OOShutUpMutationMutexName = 'Global\myTech.Today.OOShutUp.Mutation'")) 'manual and SYSTEM entry points use the shared machine-wide O&O mutex'
     Assert-True ($source.Contains('$script:OOShutUpMutationLockTimeoutMilliseconds = 600000')) 'the O&O mutex acquisition is bounded at ten minutes'
+    Assert-True ($source.Contains('$script:OOShutUpChildTimeoutSeconds = 900')) 'the O&O child wait has a documented fifteen-minute bound'
+    Assert-True ($source.Contains("`$script:OOShutUpTaskExecutionTimeLimit = 'PT30M'")) 'the scheduled task has a documented thirty-minute execution limit'
+    Assert-True ($source -notmatch '(?m)Start-Process[^\r\n]*-Wait') 'the O&O child is started without an unbounded Start-Process wait'
 
     $requiredFunctions = @(
         'New-OOShutUpMutationMutex',
@@ -562,6 +634,9 @@ try {
         'Get-OOShutUpProfileDigest',
         'Write-OOShutUpProfileSnapshotFile',
         'Remove-OOShutUpProfileSnapshot',
+        'Get-OOShutUpRetainedProfileSnapshots',
+        'Wait-OOShutUpChildProcess',
+        'New-OOShutUpConfigurationOutcome',
         'New-OOShutUpProfileSnapshot',
         'Show-OOShutUpProfileImpactSummary',
         'Confirm-OOShutUpProfile',
@@ -604,6 +679,12 @@ try {
         Assert-True ($null -ne $functionAst) "the $name function exists"
         . ([scriptblock]::Create($functionAst.Extent.Text))
     }
+
+    $childWaitSource = [string](@($functionAsts | Where-Object { $_.Name -eq 'Wait-OOShutUpChildProcess' })[0].Extent.Text)
+    $configurationSource = [string](@($functionAsts | Where-Object { $_.Name -eq 'Invoke-OOShutUpConfigurationCore' })[0].Extent.Text)
+    Assert-True ($childWaitSource.Contains('$Process.WaitForExit($timeoutMilliseconds)') -and $childWaitSource.Contains('$Process.HasExited')) 'the bounded wait observes only the exact process object returned by Start-Process'
+    Assert-True ($childWaitSource -notmatch '\.Kill\(|Stop-Process|taskkill') 'timeout handling never terminates a process by PID or by name'
+    Assert-True ($configurationSource.Contains('Get-OOShutUpRetainedProfileSnapshots') -and $configurationSource.Contains('Wait-OOShutUpChildProcess -Process $processInfo')) 'retained snapshots block retries and the exact started child is waited'
 
     Assert-Equal $true (Test-WindowsUpdateTaskSecurityDescriptor -SecurityDescriptor $script:OOShutUpTaskSecurityDescriptorSddl) 'the documented SYSTEM and Administrators task descriptor passes verification'
     Assert-Equal $false (Test-WindowsUpdateTaskSecurityDescriptor -SecurityDescriptor ($script:OOShutUpTaskSecurityDescriptorSddl + '(A;;FA;;;AU)')) 'an unexpected Authenticated Users write ACE fails descriptor verification'
@@ -721,7 +802,9 @@ try {
     Assert-True ($taskSetupCallPosition -ge 0 -and $taskScriptPathPosition -gt $taskSetupCallPosition) 'task setup uses the current complete package path after relocation or in-place fallback'
     Assert-True ($source.Contains('The privacy settings may be applied, but the update task was not verified. Setup is partial; repair the task before relying on automatic reapplication.')) 'task failure uses the exact partial setup status'
     Assert-True ($source.Contains('Verify \myTech.Today\Install-OOShutUp10 in Task Scheduler')) 'partial setup includes the exact task identity for recovery'
-    Assert-True ($mainSource.Contains('$taskSetup = Invoke-OOShutUpTaskSetup') -and $mainSource.Contains('$installerOutcome = Get-OOShutUpInstallOutcome')) 'the normal flow consumes explicit task and installer outcomes'
+    Assert-True ($mainSource.Contains('$taskSetup = Invoke-OOShutUpTaskSetup') -and $mainSource.Contains('$installerOutcome = Get-OOShutUpInstallOutcome')) 'the normal flow consumes explicit task and configuration outcomes'
+    Assert-True ($source -notmatch '\$SettingsVerified|SettingsOutcome\s*=\s*''Verified''') 'native O&O exit results are not converted into settings verification'
+    Assert-True ($source.Contains('ReadbackState = ''Unavailable''') -and $source.Contains('SettingsReadback = $settingsReadback')) 'the installer reports that independent settings readback is unavailable'
     Assert-True ($mainSource.Contains('exit $installerOutcome.ExitCode')) 'the normal flow returns the computed complete, partial, or failed exit code'
     Assert-True ($mainSource.Contains('Write-OOShutUpInstallSummary -Outcome $installerOutcome')) 'the normal flow logs the summary from the installer outcome contract'
     Assert-True (-not $mainSource.Contains('=== Configuration Complete ===')) 'full-success wording is not unconditional in the normal flow'
@@ -729,11 +812,11 @@ try {
     $completeStatusPosition = $summaryFunctionSource.IndexOf('if ($Outcome.Status -eq ''Complete'')', [System.StringComparison]::Ordinal)
     $completeSummaryPosition = $summaryFunctionSource.IndexOf("Write-Log '=== Configuration Complete ===' -Level SUCCESS", [System.StringComparison]::Ordinal)
     $partialStatusPosition = $summaryFunctionSource.IndexOf('elseif ($Outcome.Status -eq ''Partial'')', [System.StringComparison]::Ordinal)
-    Assert-True ($completeStatusPosition -ge 0 -and $completeSummaryPosition -gt $completeStatusPosition -and $partialStatusPosition -gt $completeSummaryPosition) 'full-success wording is guarded by the verified complete outcome'
-    $noChangeRestartGatePosition = $mainSource.IndexOf('if (-not $script:OOShutUpLastRunChanged)', [System.StringComparison]::Ordinal)
+    Assert-True ($completeStatusPosition -ge 0 -and $completeSummaryPosition -gt $completeStatusPosition -and $partialStatusPosition -gt $completeSummaryPosition) 'complete wording is guarded by the computed complete outcome'
+    $noChangeRestartGatePosition = $mainSource.IndexOf("if (`$configurationOutcome.State -eq 'Changed')", [System.StringComparison]::Ordinal)
     $restartHandlerCallPosition = $mainSource.IndexOf('Invoke-OOShutUpRestart -NonInteractive:', [System.StringComparison]::Ordinal)
     $restartHandlerSource = [string](@($functionAsts | Where-Object { $_.Name -eq 'Invoke-OOShutUpRestart' })[0].Extent.Text)
-    Assert-True ($noChangeRestartGatePosition -ge 0 -and $restartHandlerCallPosition -gt $noChangeRestartGatePosition) 'the restart handler is called only after the no-change guard'
+    Assert-True ($noChangeRestartGatePosition -ge 0 -and $restartHandlerCallPosition -gt $noChangeRestartGatePosition) 'the restart handler is called only when O&O reports changed settings'
     Assert-True ($restartHandlerSource.Contains('Press Y to restart, N or Esc to defer') -and $restartHandlerSource.Contains('Restart-Computer -Force')) 'the guarded restart handler owns the confirmation prompt and explicit force command'
     $taskFunctionSource = ([string](@($functionAsts | Where-Object { $_.Name -eq 'New-WindowsUpdateScheduledTask' })[0].Extent.Text))
     $taskApprovalPosition = $taskFunctionSource.IndexOf('$currentApprovedProfile = Get-OOShutUpApprovedProfile', [System.StringComparison]::Ordinal)
@@ -765,18 +848,27 @@ try {
             }
         }
 
+        $changedConfigurationOutcome = New-OOShutUpConfigurationOutcome `
+            -State Changed `
+            -ExitCode 30 `
+            -Evidence 'Mock O&O exit code 30' `
+            -Message 'O&O reported changed settings.' `
+            -NextStep Proceed
         foreach ($scenario in @('Success', 'Failure', 'Exception')) {
             $script:MockInstallerTaskScenario = $scenario
             $taskSetupResult = Invoke-OOShutUpTaskSetup -ScriptPath 'C:\fixture\Install-OOShutUp10.ps1' -ApprovedProfileSha256 ('A' * 64) -ApprovedProfileManifestSha256 ('B' * 64)
-            $installResult = Get-OOShutUpInstallOutcome -SettingsVerified $true -RestorePointVerified $true -RestorePointOverrideUsed $false -TaskSetup $taskSetupResult
+            $installResult = Get-OOShutUpInstallOutcome -ConfigurationOutcome $changedConfigurationOutcome -RestorePointVerified $true -RestorePointOverrideUsed $false -TaskSetup $taskSetupResult
             $script:LogMessages.Clear()
             Write-OOShutUpInstallSummary -Outcome $installResult
             $summaryLog = [string]::Join([Environment]::NewLine, [string[]]$script:LogMessages.ToArray())
             if ($scenario -eq 'Success') {
                 Assert-Equal $true $taskSetupResult.Verified 'a true task creation and verification result is preserved'
-                Assert-Equal 0 $installResult.ExitCode 'verified settings and task return the success exit code'
-                Assert-Equal 'Complete' $installResult.Status 'verified settings and task report complete status'
+                Assert-Equal 0 $installResult.ExitCode 'O&O-reported settings and a verified task return the success exit code'
+                Assert-Equal 'Complete' $installResult.Status 'O&O-reported settings and a verified task report complete status'
                 Assert-Equal 'Verified' $installResult.TaskOutcome 'complete status identifies the task as verified'
+                Assert-Equal 'Changed' $installResult.SettingsOutcome 'the install outcome preserves the O&O-reported changed state'
+                Assert-Equal 'Unavailable' $installResult.SettingsReadback 'the install outcome does not claim independent settings readback'
+                Assert-True ($installResult.Summary.Contains('not independently read back') -and -not $installResult.Summary.Contains('privacy settings are verified')) 'the completion summary distinguishes O&O status from independent verification'
                 Assert-True ($installResult.Summary.Contains('\myTech.Today\Install-OOShutUp10') -and -not $installResult.Summary.Contains('partial')) 'success summary identifies the verified task'
                 Assert-True ($summaryLog.Contains('=== Configuration Complete ===') -and $summaryLog.Contains($installResult.Summary) -and -not $summaryLog.Contains('=== Setup Partial ===')) 'success logging agrees with the verified task outcome'
             }
@@ -785,7 +877,7 @@ try {
                 Assert-Equal 2 $installResult.ExitCode "$scenario task setup returns the distinct partial exit code"
                 Assert-Equal 'Partial' $installResult.Status "$scenario task setup reports partial status"
                 Assert-Equal 'Not verified' $installResult.TaskOutcome "$scenario task setup reports the task as unverified"
-                Assert-Equal $script:OOShutUpPartialSetupMessage $installResult.Summary "$scenario summary matches the required partial wording"
+                Assert-True ($installResult.Summary.Contains($script:OOShutUpPartialSetupMessage) -and $installResult.Summary.Contains('O&O reported that settings changed') -and $installResult.Summary.Contains('not independently read back')) "$scenario summary preserves the partial wording and identifies vendor-reported settings state"
                 Assert-True ($installResult.RecoveryMessage.Contains('\myTech.Today\Install-OOShutUp10') -and $installResult.RecoveryMessage.Contains('same-named tasks in other folders are left unchanged')) "$scenario recovery identifies the owned task and preserves unrelated tasks"
                 Assert-True (-not $summaryLog.Contains('=== Configuration Complete ===') -and $summaryLog.Contains('=== Setup Partial ===') -and $summaryLog.Contains($installResult.Summary) -and $summaryLog.Contains($installResult.RecoveryMessage)) "$scenario logging and recovery message agree with the partial task outcome"
             }
@@ -798,9 +890,39 @@ try {
         }
 
         $overrideSetupResult = [pscustomobject]@{ Verified = $true; ExceptionMessage = $null }
-        $overrideInstallResult = Get-OOShutUpInstallOutcome -SettingsVerified $true -RestorePointVerified $false -RestorePointOverrideUsed $true -TaskSetup $overrideSetupResult
+        $overrideInstallResult = Get-OOShutUpInstallOutcome -ConfigurationOutcome $changedConfigurationOutcome -RestorePointVerified $false -RestorePointOverrideUsed $true -TaskSetup $overrideSetupResult
         Assert-Equal 0 $overrideInstallResult.ExitCode 'an explicit restore point override still permits success when the task is verified'
         Assert-Equal 'Explicitly overridden' $overrideInstallResult.RestorePointOutcome 'the result retains the separate restore point outcome'
+
+        $unknownConfigurationOutcome = New-OOShutUpConfigurationOutcome `
+            -State Unknown `
+            -ExitCode 23 `
+            -Evidence 'Unrecognized O&O native exit code' `
+            -Message 'O&O returned an unrecognized exit code; review O&O Undo History and current settings before retrying.'
+        $unknownInstallResult = Get-OOShutUpInstallOutcome `
+            -ConfigurationOutcome $unknownConfigurationOutcome `
+            -RestorePointVerified $true `
+            -RestorePointOverrideUsed $false `
+            -TaskSetup $overrideSetupResult
+        Assert-Equal 'Unknown' $unknownInstallResult.SettingsOutcome 'unknown native status stays unknown in the installer outcome'
+        Assert-Equal 'Unavailable' $unknownInstallResult.SettingsReadback 'unknown status retains unavailable readback'
+        Assert-Equal 'Stop' $unknownConfigurationOutcome.NextStep 'unknown native status stops subsequent installer steps'
+        Assert-Equal 'Failed' $unknownInstallResult.Status 'unknown settings state cannot produce a complete installer outcome'
+        Assert-Equal 1 $unknownInstallResult.ExitCode 'unknown settings state returns failure rather than success'
+        Assert-True ($unknownInstallResult.Summary.Contains('Undo History') -and $unknownInstallResult.Summary.Contains('current settings') -and -not $unknownInstallResult.Summary.Contains('settings are verified')) 'unknown status gives actionable recovery without a verified label'
+
+        $failedConfigurationOutcome = New-OOShutUpConfigurationOutcome `
+            -State Failed `
+            -Evidence 'Pre-launch validation failure' `
+            -Message 'The approved profile could not be validated before launch.'
+        $failedInstallResult = Get-OOShutUpInstallOutcome `
+            -ConfigurationOutcome $failedConfigurationOutcome `
+            -RestorePointVerified $true `
+            -RestorePointOverrideUsed $false `
+            -TaskSetup $overrideSetupResult
+        Assert-Equal 'Failed' $failedInstallResult.SettingsOutcome 'pre-launch failure remains distinct from an unknown post-launch state'
+        Assert-Equal 'Failed' $failedInstallResult.Status 'a pre-launch failure cannot produce a complete installer result'
+        Assert-Equal 'Unavailable' $failedInstallResult.SettingsReadback 'pre-launch failure does not claim settings readback'
     }
     finally {
         Set-Item -Path Function:\New-WindowsUpdateScheduledTask -Value $savedTaskCreator
@@ -962,7 +1084,7 @@ try {
     Assert-Equal $true (Confirm-OOShutUpProfile -Profile $mixedScopeProfile -NonInteractive -ApprovedProfileSha256 $mixedScopeProfile.Sha256 -ApprovedProfileManifestSha256 $mixedScopeProfile.ManifestSha256) 'mixed profile can be approved for an interactive run with both digests'
     $startedBeforeSystemScopeBlock = $script:StartedPaths.Count
     $script:LogMessages.Clear()
-    Assert-Equal $false (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture -SystemReapply) 'SYSTEM reapplication rejects a profile containing current-user settings'
+    Assert-Equal 'Failed' (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture -SystemReapply).State 'SYSTEM reapplication rejects a profile containing current-user settings'
     Assert-Equal $startedBeforeSystemScopeBlock $script:StartedPaths.Count 'current-user scope is rejected before O&O launches'
     Assert-True ([string]::Join("`n", [string[]]$script:LogMessages.ToArray()).Contains($script:OOShutUpCurrentUserScopeFailureMessage)) 'current-user scope rejection explains the safe fallback'
 
@@ -973,35 +1095,50 @@ try {
     $startedBeforeDecline = $script:StartedPaths.Count
     $script:PromptDecision = 'NO'
     Assert-Equal $false (Confirm-OOShutUpProfile -Profile $approvedProfile) 'interactive NO rejects the reviewed profile'
-    Assert-Equal $false (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture) 'a rejected profile cannot be applied'
+    Assert-Equal 'Failed' (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture).State 'a rejected profile cannot be applied'
     Assert-Equal $startedBeforeDecline $script:StartedPaths.Count 'rejecting approval causes zero O&O launches'
 
     $script:PromptDecision = 'CANCEL'
     Assert-Equal $false (Confirm-OOShutUpProfile -Profile $approvedProfile) 'interactive CANCEL stops approval'
-    Assert-Equal $false (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture) 'a canceled profile cannot be applied'
+    Assert-Equal 'Failed' (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture).State 'a canceled profile cannot be applied'
     Assert-Equal $startedBeforeDecline $script:StartedPaths.Count 'canceling approval causes zero O&O launches'
 
     Assert-Equal $true (Confirm-OOShutUpProfile -Profile $approvedProfile -NonInteractive -ApprovedProfileSha256 $approvedProfile.Sha256 -ApprovedProfileManifestSha256 $approvedProfile.ManifestSha256) 'unattended approval accepts the exact profile and manifest digests'
-    Assert-Equal $true (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture) 'the exact unattended approval permits the mocked O&O launch'
+    Assert-Equal 'Unchanged' (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture).State 'the exact unattended approval permits the mocked O&O launch'
     Assert-Equal ($startedBeforeDecline + 1) $script:StartedPaths.Count 'an exact approved digest launches O&O once'
-    Assert-Equal $false $script:OOShutUpLastRunChanged 'O&O exit code zero records that no setting changed'
+    Assert-Equal 'Unchanged' $script:OOShutUpLastRunOutcome.State 'O&O exit code zero records an O&O-reported unchanged state'
+    Assert-Equal 'Unavailable' $script:OOShutUpLastRunOutcome.ReadbackState 'exit code zero does not imply independent settings readback'
+    Assert-Equal 'Proceed' $script:OOShutUpLastRunOutcome.NextStep 'the recognized unchanged report is represented separately from readback'
     Assert-True ([string]::Join("`n", [string[]]$script:LogMessages.ToArray()).Contains('O&O reported that no setting changes were needed')) 'O&O exit code zero reports a no-change result'
 
     $startedBeforeMissingApproval = $script:StartedPaths.Count
     $script:LogMessages.Clear()
     Assert-Equal $false (Confirm-OOShutUpProfile -Profile $approvedProfile -NonInteractive) 'unattended mode rejects a missing approval digest'
     Assert-True ([string]::Join("`n", [string[]]$script:LogMessages.ToArray()).Contains($script:OOShutUpApprovalFailureMessage)) 'missing unattended approval reports the required fallback'
-    Assert-Equal $false (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture) 'a missing unattended approval cannot be applied'
+    Assert-Equal 'Failed' (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture).State 'a missing unattended approval cannot be applied'
     Assert-Equal $startedBeforeMissingApproval $script:StartedPaths.Count 'missing approval causes zero O&O launches'
     Assert-Equal $false (Confirm-OOShutUpProfile -Profile $approvedProfile -NonInteractive -ApprovedProfileSha256 ('0' * 64) -ApprovedProfileManifestSha256 $approvedProfile.ManifestSha256) 'unattended mode rejects a stale profile digest'
-    Assert-Equal $false (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture) 'a stale unattended approval cannot be applied'
+    Assert-Equal 'Failed' (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture).State 'a stale unattended approval cannot be applied'
     Assert-Equal $startedBeforeMissingApproval $script:StartedPaths.Count 'stale approval causes zero O&O launches'
 
     $script:PromptDecision = 'YES'
     Assert-Equal $true (Confirm-OOShutUpProfile -Profile $approvedProfile) 'interactive approval can be accepted after rejected attempts'
     $script:MockExitCode = 30
-    Assert-Equal $true (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture) 'O&O exit code 30 succeeds through the mocked process boundary'
-    Assert-Equal $true $script:OOShutUpLastRunChanged 'O&O exit code 30 records that settings changed'
+    Assert-Equal 'Changed' (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture).State 'O&O exit code 30 is returned as an explicit changed outcome'
+    Assert-Equal 'Changed' $script:OOShutUpLastRunOutcome.State 'O&O exit code 30 records an O&O-reported changed state'
+    Assert-Equal 'Unavailable' $script:OOShutUpLastRunOutcome.ReadbackState 'exit code 30 does not imply independent settings readback'
+    Assert-Equal 'Proceed' $script:OOShutUpLastRunOutcome.NextStep 'a recognized O&O report can proceed without being called verified'
+    $script:MockExitCode = 0
+
+    $script:MockExitCode = 23
+    $script:LogMessages.Clear()
+    Assert-Equal 'Unknown' (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture).State 'an unrecognized nonzero exit does not proceed as a known settings outcome'
+    Assert-Equal 'Unknown' $script:OOShutUpLastRunOutcome.State 'an unrecognized nonzero exit remains unknown after possible partial changes'
+    Assert-Equal 23 $script:OOShutUpLastRunOutcome.ExitCode 'an unknown outcome preserves the exact native exit code'
+    Assert-Equal 'Unavailable' $script:OOShutUpLastRunOutcome.ReadbackState 'an unrecognized exit is not treated as readback'
+    $unknownExitLog = [string]::Join("`n", [string[]]$script:LogMessages.ToArray())
+    Assert-True ($unknownExitLog.Contains('O&O Undo History') -and $unknownExitLog.Contains('current settings') -and $unknownExitLog.Contains('no rollback was performed')) 'an unrecognized exit gives current-state and Undo History guidance without claiming rollback'
+    Assert-True (-not $unknownExitLog.Contains('Verified')) 'an unknown exit is never labelled Verified'
     $script:MockExitCode = 0
 
     $oldApprovedDigest = $approvedProfile.Sha256
@@ -1010,7 +1147,7 @@ try {
     Assert-True ($changedProfile.Sha256 -cne $oldApprovedDigest) 'a changed profile receives a new digest'
     $startedBeforeChangedDigest = $script:StartedPaths.Count
     Assert-Equal $false (Confirm-OOShutUpProfile -Profile $changedProfile -NonInteractive -ApprovedProfileSha256 $oldApprovedDigest -ApprovedProfileManifestSha256 $changedProfile.ManifestSha256) 'an approval for the prior profile does not authorize a changed profile'
-    Assert-Equal $false (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture) 'the changed profile cannot launch with its prior digest approval'
+    Assert-Equal 'Failed' (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture).State 'the changed profile cannot launch with its prior digest approval'
     Assert-Equal $startedBeforeChangedDigest $script:StartedPaths.Count 'a changed profile with a stale digest causes zero O&O launches'
 
     $script:PromptDecision = 'YES'
@@ -1029,7 +1166,7 @@ try {
         [System.Text.Encoding]::UTF8
     )
     $startedBeforeManifestTamper = $script:StartedPaths.Count
-    Assert-Equal $false (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture) 'scope metadata changed after approval cannot reach O&O'
+    Assert-Equal 'Failed' (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture).State 'scope metadata changed after approval cannot reach O&O'
     Assert-Equal $startedBeforeManifestTamper $script:StartedPaths.Count 'manifest tampering causes zero O&O process launches'
 
     Write-ApprovedProfileFixture -Content "# Reviewed fixture`r`nS003`t+`tExample setting`r`nM003;-`r`n" -AllowedSettingIds @('S003', 'M003')
@@ -1053,7 +1190,7 @@ try {
         $script:StartedArguments.Clear()
         $script:StartedWorkingDirectories.Clear()
         $script:LogMessages.Clear()
-        Assert-Equal $true (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture) 'configuration succeeds from an unrelated current directory'
+        Assert-Equal 'Unchanged' (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture).State 'configuration returns an O&O-reported unchanged state from an unrelated current directory'
     }
     finally {
         $script:SwapProfileBeforeMockOpen = $false
@@ -1091,7 +1228,7 @@ try {
     $startedBeforeSnapshotWriteFailure = $script:StartedPaths.Count
     $script:LogMessages.Clear()
     try {
-        Assert-Equal $false (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture) 'a denied protected snapshot write fails closed'
+        Assert-Equal 'Failed' (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture).State 'a denied protected snapshot write fails closed'
     }
     finally {
         Set-Item -Path Function:\Write-OOShutUpProfileSnapshotFile -Value $writeSnapshotFunction
@@ -1118,7 +1255,7 @@ try {
             $startProcessCallsBeforeSourceDigestFailure = $script:StartProcessCallCount
             $script:LogMessages.Clear()
             try {
-                Assert-Equal $false (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture) "a changed $($sourceDigestCase.Name) digest fails closed"
+                Assert-Equal 'Failed' (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture).State "a changed $($sourceDigestCase.Name) digest fails closed"
             }
             finally {
                 if ($sourceDigestCase.Name -eq 'source profile') {
@@ -1153,7 +1290,7 @@ try {
         $startProcessCallsBeforeCopiedDigestFailure = $script:StartProcessCallCount
         $script:LogMessages.Clear()
         try {
-            Assert-Equal $false (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture) "a copied $copiedDigestFileName digest mismatch fails closed"
+            Assert-Equal 'Failed' (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture).State "a copied $copiedDigestFileName digest mismatch fails closed"
         }
         finally {
             Set-Item -Path Function:\Write-OOShutUpProfileSnapshotFile -Value $writeSnapshotFunction
@@ -1184,7 +1321,7 @@ try {
         $startProcessCallsBeforeAclFailure = $script:StartProcessCallCount
         $script:LogMessages.Clear()
         try {
-            Assert-Equal $false (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture) "$($aclFailureCase.Name) fails closed"
+            Assert-Equal 'Failed' (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture).State "$($aclFailureCase.Name) fails closed"
         }
         finally {
             $script:MockAclFailurePath = $null
@@ -1196,12 +1333,29 @@ try {
     }
 
     $removeSnapshotFunction = (Get-Command -Name Remove-OOShutUpProfileSnapshot -CommandType Function).ScriptBlock
+    $script:MockStartProcessReturnsNull = $true
+    $startProcessCallsBeforeMissingResult = $script:StartProcessCallCount
+    $workingDirectoriesBeforeMissingResult = $script:StartedWorkingDirectories.Count
+    try {
+        Assert-Equal 'Unknown' (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture).State 'an absent Start-Process result leaves the settings outcome unknown'
+    }
+    finally {
+        $script:MockStartProcessReturnsNull = $false
+    }
+    Assert-Equal 'Unknown' $script:OOShutUpLastRunOutcome.State 'an absent process object is an unknown settings outcome'
+    Assert-Equal $null $script:OOShutUpLastRunOutcome.ExitCode 'an absent process object does not fabricate an exit code'
+    Assert-Equal ($startProcessCallsBeforeMissingResult + 1) $script:StartProcessCallCount 'the absent-result scenario reaches the process boundary once'
+    $missingResultSnapshotDirectory = [string]$script:StartedWorkingDirectories[$workingDirectoriesBeforeMissingResult]
+    Assert-True (Test-Path -LiteralPath $missingResultSnapshotDirectory -PathType Container) 'the absent-result scenario retains the protected profile snapshot'
+    Assert-True ($script:OOShutUpLastRunOutcome.Message.Contains('Undo History') -and $script:OOShutUpLastRunOutcome.Message.Contains('current settings')) 'an absent process result gives actionable state-inspection guidance'
+    & $removeSnapshotFunction -Directory $missingResultSnapshotDirectory
+
     $script:MockStartProcessFailure = $true
     $startProcessCallsBeforeUncertainLaunch = $script:StartProcessCallCount
     $workingDirectoriesBeforeUncertainLaunch = $script:StartedWorkingDirectories.Count
     $script:LogMessages.Clear()
     try {
-        Assert-Equal $false (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture) 'an unverified process-start outcome reports an incomplete result'
+        Assert-Equal 'Unknown' (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture).State 'an unverified process-start outcome reports an unknown result'
     }
     finally {
         $script:MockStartProcessFailure = $false
@@ -1210,6 +1364,9 @@ try {
     $uncertainSnapshotDirectory = [string]$script:StartedWorkingDirectories[$workingDirectoriesBeforeUncertainLaunch]
     Assert-True (Test-Path -LiteralPath $uncertainSnapshotDirectory -PathType Container) 'an uncertain launch retains its protected snapshot for diagnosis'
     Assert-True ([string]::Join("`n", [string[]]$script:LogMessages.ToArray()).Contains("The O&O launch outcome could not be verified. The protected profile snapshot was retained at '$uncertainSnapshotDirectory'")) 'an uncertain launch reports the retained snapshot path'
+    Assert-Equal 'Unknown' $script:OOShutUpLastRunOutcome.State 'an ambiguous process launch is not classified as a clean failure'
+    Assert-Equal 'Unavailable' $script:OOShutUpLastRunOutcome.ReadbackState 'an ambiguous process launch has no independent state readback'
+    Assert-True (-not $script:OOShutUpLastRunOutcome.Message.Contains('Verified')) 'an unknown process result is never labelled Verified'
     & $removeSnapshotFunction -Directory $uncertainSnapshotDirectory
 
     Set-Item -Path Function:\Remove-OOShutUpProfileSnapshot -Value {
@@ -1221,18 +1378,67 @@ try {
     $script:LogMessages.Clear()
     $script:MockExitCode = 30
     try {
-        Assert-Equal $false (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture) 'a snapshot cleanup failure returns an explicit incomplete result'
+        $cleanupFailureOutcome = Invoke-OOShutUpConfiguration -ExecutablePath $validFixture
+        Assert-Equal 'Changed' $cleanupFailureOutcome.State 'a snapshot cleanup failure preserves the explicit O&O-reported changed state'
     }
     finally {
         $script:MockExitCode = 0
         Set-Item -Path Function:\Remove-OOShutUpProfileSnapshot -Value $removeSnapshotFunction
     }
     Assert-Equal ($startedBeforeSnapshotCleanupFailure + 1) $script:StartedPaths.Count 'cleanup failure occurs only after the child received a protected snapshot'
-    Assert-Equal $true $script:OOShutUpLastRunChanged 'a cleanup failure preserves O&O exit code 30 as an applied-settings result'
+    Assert-Equal 'Changed' $script:OOShutUpLastRunOutcome.State 'a cleanup failure preserves O&O exit code 30 as a vendor-reported changed result'
+    Assert-Equal 'Stop' $script:OOShutUpLastRunOutcome.NextStep 'snapshot cleanup failure stops later installer work despite the reported changed state'
     Assert-Equal $false ([string]$script:OpenedProfilePaths[0] -eq $script:OOShutUpProfilePath) 'cleanup failure never passes the source profile path to O&O'
     $orphanedSnapshotDirectory = Split-Path -Parent ([string]$script:OpenedProfilePaths[0])
     Assert-True ([string]::Join("`n", [string[]]$script:LogMessages.ToArray()).Contains("remove '$orphanedSnapshotDirectory' manually")) 'cleanup failure reports the exact protected snapshot path for manual recovery'
     & $removeSnapshotFunction -Directory $orphanedSnapshotDirectory
+
+    $script:MockChildWaitScenario = 'timeout-boundary-race'
+    $script:MockExitCode = 30
+    $script:LogMessages.Clear()
+    $boundaryStartCount = $script:StartProcessCallCount
+    $boundaryResult = Invoke-OOShutUpConfiguration -ExecutablePath $validFixture
+    $boundaryProcess = $script:StartedProcessObjects[$script:StartedProcessObjects.Count - 1]
+    $boundarySnapshotDirectory = [string]$script:StartedWorkingDirectories[$script:StartedWorkingDirectories.Count - 1]
+    Assert-Equal 'Unknown' $boundaryResult.State 'a child that exits only during the timeout-boundary check remains unknown'
+    Assert-Equal 'Unknown' $script:OOShutUpLastRunOutcome.State 'the timeout-boundary race preserves an unknown settings outcome'
+    Assert-Equal ($boundaryStartCount + 1) $script:StartProcessCallCount 'the timeout-boundary scenario starts only its own O&O child'
+    Assert-Equal $true $boundaryProcess.HasExited 'the timeout-boundary mock confirms the exact child stopped after the wait expired'
+    Assert-Equal 0 $boundaryProcess.KillCalls 'timeout handling does not terminate the child by PID or process name'
+    Assert-True (Test-Path -LiteralPath $boundarySnapshotDirectory -PathType Container) 'the timeout-boundary result retains its snapshot for inspection'
+    Assert-True ([string]::Join("`n", [string[]]$script:LogMessages.ToArray()).Contains('O&O exceeded its 900-second wait limit')) 'the timeout-boundary result is explicitly reported as incomplete'
+    Assert-True ([string]::Join("`n", [string[]]$script:LogMessages.ToArray()).Contains('No success was reported')) 'the timeout-boundary result never reports success'
+
+    $startsBeforeBoundaryRetry = $script:StartProcessCallCount
+    $script:MockChildWaitScenario = 'fast-exit'
+    Assert-Equal 'Failed' (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture).State 'a retained timeout snapshot blocks retry until inspection'
+    Assert-Equal $startsBeforeBoundaryRetry $script:StartProcessCallCount 'a retained timeout snapshot prevents a second O&O child from starting'
+    Assert-True (Test-Path -LiteralPath $boundarySnapshotDirectory -PathType Container) 'a blocked retry preserves the original timeout snapshot'
+    & $removeSnapshotFunction -Directory $boundarySnapshotDirectory
+
+    $script:MockChildWaitScenario = 'still-running'
+    $script:LogMessages.Clear()
+    $runningStartCount = $script:StartProcessCallCount
+    $runningResult = Invoke-OOShutUpConfiguration -ExecutablePath $validFixture
+    $runningProcess = $script:StartedProcessObjects[$script:StartedProcessObjects.Count - 1]
+    $runningSnapshotDirectory = [string]$script:StartedWorkingDirectories[$script:StartedWorkingDirectories.Count - 1]
+    Assert-Equal 'Unknown' $runningResult.State 'a still-running O&O child returns an unknown timeout result'
+    Assert-Equal 'Unknown' $script:OOShutUpLastRunOutcome.State 'a still-running child cannot report a known settings state'
+    Assert-Equal ($runningStartCount + 1) $script:StartProcessCallCount 'the still-running scenario starts exactly one owned O&O child'
+    Assert-Equal $false $runningProcess.HasExited 'the controllable child remains alive after timeout'
+    Assert-Equal 0 $runningProcess.KillCalls 'the timeout does not kill any process or process tree'
+    Assert-True (Test-Path -LiteralPath $runningSnapshotDirectory -PathType Container) 'the still-running child retains the profile it may still read'
+    Assert-True ([string]::Join("`n", [string[]]$script:LogMessages.ToArray()).Contains('may still be reading its snapshot')) 'the timeout log identifies that the child may still read the retained snapshot'
+
+    $startsBeforeRunningRetry = $script:StartProcessCallCount
+    Assert-Equal 'Failed' (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture).State 'a still-running child requires inspection before retry'
+    Assert-Equal $startsBeforeRunningRetry $script:StartProcessCallCount 'the retained still-running snapshot prevents a queued reapplication'
+    Assert-Equal $false $runningProcess.HasExited 'the blocked retry does not affect the original child'
+    $runningProcess.HasExited = $true
+    & $removeSnapshotFunction -Directory $runningSnapshotDirectory
+    Assert-Equal $false (Test-Path -LiteralPath $runningSnapshotDirectory) 'the fixture snapshot is removed only after the mock confirms the child stopped'
+    $script:MockExitCode = 0
+    $script:MockChildWaitScenario = 'fast-exit'
 
     $script:StartedPaths.Clear()
     $script:StartedArguments.Clear()
@@ -1247,7 +1453,7 @@ try {
         Write-ApprovedProfileFixture -Content $case.Content -AllowedSettingIds $case.Allowed
         $startedBefore = $script:StartedPaths.Count
         Assert-Equal $null (Get-OOShutUpApprovedProfile) "$($case.Name) profile is rejected"
-        Assert-Equal $false (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture) "$($case.Name) profile prevents configuration"
+        Assert-Equal 'Failed' (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture).State "$($case.Name) profile prevents configuration"
         Assert-Equal $startedBefore $script:StartedPaths.Count "$($case.Name) profile causes no process launch"
     }
 
@@ -1265,8 +1471,27 @@ try {
     $startedBeforeUnknownScope = $script:StartedPaths.Count
     Assert-Equal $null (Get-OOShutUpApprovedProfile -RequireMachineScope) 'legacy metadata without explicit scope is rejected by the SYSTEM scope gate'
     Assert-True ([string]::Join("`n", [string[]]$script:LogMessages.ToArray()).Contains($script:OOShutUpUnknownScopeFailureMessage)) 'unknown scope logs the required exact fallback'
-    Assert-Equal $false (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture -SystemReapply) 'unknown scope prevents SYSTEM reapplication'
+    Assert-Equal 'Failed' (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture -SystemReapply).State 'unknown scope prevents SYSTEM reapplication'
     Assert-Equal $startedBeforeUnknownScope $script:StartedPaths.Count 'unknown scope causes zero O&O process launches'
+    $lookupBeforeAbsentScopeTask = $script:ScheduledTaskLookupCount
+    $registrationBeforeAbsentScopeTask = $script:TaskRegistrationCalls.Count
+    Assert-Equal $false (New-WindowsUpdateScheduledTask -ScriptPath (Join-Path $script:FixtureRoot 'unused-absent-scope.ps1') -ApprovedProfileSha256 ('0' * 64) -ApprovedProfileManifestSha256 ('0' * 64)) 'an absent scope claim blocks SYSTEM task registration'
+    Assert-Equal $lookupBeforeAbsentScopeTask $script:ScheduledTaskLookupCount 'an absent scope claim blocks before task lookup'
+    Assert-Equal $registrationBeforeAbsentScopeTask $script:TaskRegistrationCalls.Count 'an absent scope claim blocks before task registration'
+
+    Write-ApprovedProfileFixture -Content "S003`t+`r`n" -AllowedSettingIds @('S003')
+    $missingScopeEvidenceManifest = Get-Content -LiteralPath $script:OOShutUpProfileManifestPath -Raw | ConvertFrom-Json
+    $missingScopeEvidenceManifest.settingDetails[0].PSObject.Properties.Remove('scopeEvidence')
+    [System.IO.File]::WriteAllText(
+        $script:OOShutUpProfileManifestPath,
+        ($missingScopeEvidenceManifest | ConvertTo-Json -Depth 4),
+        [System.Text.Encoding]::UTF8
+    )
+    $lookupBeforeMissingEvidenceTask = $script:ScheduledTaskLookupCount
+    $registrationBeforeMissingEvidenceTask = $script:TaskRegistrationCalls.Count
+    Assert-Equal $false (New-WindowsUpdateScheduledTask -ScriptPath (Join-Path $script:FixtureRoot 'unused-missing-evidence.ps1') -ApprovedProfileSha256 ('0' * 64) -ApprovedProfileManifestSha256 ('0' * 64)) 'missing scope evidence blocks SYSTEM task registration'
+    Assert-Equal $lookupBeforeMissingEvidenceTask $script:ScheduledTaskLookupCount 'missing scope evidence blocks before task lookup'
+    Assert-Equal $registrationBeforeMissingEvidenceTask $script:TaskRegistrationCalls.Count 'missing scope evidence blocks before task registration'
 
     Write-ApprovedProfileFixture -Content "S003`t+`r`n" -AllowedSettingIds @('S003')
     $unknownScopeManifest = Get-Content -LiteralPath $script:OOShutUpProfileManifestPath -Raw | ConvertFrom-Json
@@ -1279,6 +1504,14 @@ try {
     $script:LogMessages.Clear()
     Assert-Equal $null (Get-OOShutUpApprovedProfile -RequireMachineScope) 'an unsupported scope value is rejected'
     Assert-True ([string]::Join("`n", [string[]]$script:LogMessages.ToArray()).Contains($script:OOShutUpUnknownScopeFailureMessage)) 'an unsupported scope value logs the required fallback'
+    $startedBeforeUnsupportedScope = $script:StartedPaths.Count
+    Assert-Equal 'Failed' (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture -SystemReapply).State 'an unsupported scope prevents SYSTEM reapplication'
+    Assert-Equal $startedBeforeUnsupportedScope $script:StartedPaths.Count 'an unsupported scope causes zero O&O process launches'
+    $lookupBeforeUnsupportedScopeTask = $script:ScheduledTaskLookupCount
+    $registrationBeforeUnsupportedScopeTask = $script:TaskRegistrationCalls.Count
+    Assert-Equal $false (New-WindowsUpdateScheduledTask -ScriptPath (Join-Path $script:FixtureRoot 'unused-unsupported-scope.ps1') -ApprovedProfileSha256 ('0' * 64) -ApprovedProfileManifestSha256 ('0' * 64)) 'an unsupported scope blocks SYSTEM task registration'
+    Assert-Equal $lookupBeforeUnsupportedScopeTask $script:ScheduledTaskLookupCount 'an unsupported scope blocks before task lookup'
+    Assert-Equal $registrationBeforeUnsupportedScopeTask $script:TaskRegistrationCalls.Count 'an unsupported scope blocks before task registration'
 
     Write-ApprovedProfileFixture -Content "S003`t+`r`n" -AllowedSettingIds @('S003')
     $manifestWithMismatchedImpactState = Get-Content -LiteralPath $script:OOShutUpProfileManifestPath -Raw | ConvertFrom-Json
@@ -1290,7 +1523,7 @@ try {
     )
     $startedBeforeMismatchedImpact = $script:StartedPaths.Count
     Assert-Equal $null (Get-OOShutUpApprovedProfile) 'impact metadata with a mismatched setting state is rejected'
-    Assert-Equal $false (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture) 'mismatched impact metadata prevents configuration'
+    Assert-Equal 'Failed' (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture).State 'mismatched impact metadata prevents configuration'
     Assert-Equal $startedBeforeMismatchedImpact $script:StartedPaths.Count 'mismatched impact metadata causes zero O&O launches'
 
     Write-ApprovedProfileFixture -Content "S003`t+`r`n" -AllowedSettingIds @('S003')
@@ -1303,27 +1536,27 @@ try {
     )
     $startedBeforeMissingImpact = $script:StartedPaths.Count
     Assert-Equal $null (Get-OOShutUpApprovedProfile) 'a manifest without reviewed impact details is rejected'
-    Assert-Equal $false (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture) 'missing impact details prevent configuration'
+    Assert-Equal 'Failed' (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture).State 'missing impact details prevent configuration'
     Assert-Equal $startedBeforeMissingImpact $script:StartedPaths.Count 'missing impact details cause zero O&O launches'
 
     Write-ApprovedProfileFixture -Content "S003`t+`r`n" -AllowedSettingIds @('S003')
     [System.IO.File]::AppendAllText($script:OOShutUpProfilePath, "M003`t-`r`n")
     $startedBeforeDigestMismatch = $script:StartedPaths.Count
     Assert-Equal $null (Get-OOShutUpApprovedProfile) 'a digest-mismatched profile is rejected'
-    Assert-Equal $false (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture) 'a digest mismatch prevents configuration'
+    Assert-Equal 'Failed' (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture).State 'a digest mismatch prevents configuration'
     Assert-Equal $startedBeforeDigestMismatch $script:StartedPaths.Count 'a digest mismatch causes no process launch'
 
     Write-ApprovedProfileFixture -Content "S003`t+`r`n" -AllowedSettingIds @('S003')
     [System.IO.File]::WriteAllText($script:OOShutUpProfileManifestPath, '{ invalid json')
     $startedBeforeMalformedManifest = $script:StartedPaths.Count
     Assert-Equal $null (Get-OOShutUpApprovedProfile) 'a malformed approval manifest is rejected'
-    Assert-Equal $false (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture) 'a malformed manifest prevents configuration'
+    Assert-Equal 'Failed' (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture).State 'a malformed manifest prevents configuration'
     Assert-Equal $startedBeforeMalformedManifest $script:StartedPaths.Count 'a malformed manifest causes no process launch'
 
     Remove-Item -LiteralPath $script:OOShutUpProfilePath -Force
     $startedBeforeMissingProfile = $script:StartedPaths.Count
     Assert-Equal $null (Get-OOShutUpApprovedProfile) 'a missing profile is rejected'
-    Assert-Equal $false (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture) 'a missing profile prevents configuration'
+    Assert-Equal 'Failed' (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture).State 'a missing profile prevents configuration'
     Assert-Equal $startedBeforeMissingProfile $script:StartedPaths.Count 'a missing profile causes no process launch'
 
     Write-ApprovedProfileFixture -Content "# Reviewed fixture`r`nS003`t+`r`nM003;-`r`n" -AllowedSettingIds @('S003', 'M003')
@@ -1484,6 +1717,7 @@ try {
         Assert-Equal 'PT2M' ([string]$trigger.Delay) 'scheduled task preserves its two-minute update delay'
         Assert-True ($triggerSubscriptionText.Contains('WindowsUpdateClient') -and $triggerSubscriptionText.Contains('EventID=19') -and -not $triggerSubscriptionText.Contains('EventID=20') -and -not $triggerSubscriptionText.Contains('EventID=43')) 'scheduled task triggers only on Windows Update installation success'
         Assert-Equal 'Queue' ([string]$taskXml.Task.Settings.MultipleInstancesPolicy) 'scheduled task queues successful-update triggers behind an active reapply'
+        Assert-Equal 'PT30M' ([string]$taskXml.Task.Settings.ExecutionTimeLimit) 'scheduled task has the explicit thirty-minute execution limit'
 
         $verifiedCurrentTask = New-MockScheduledTask -TaskName 'Install-OOShutUp10' -TaskPath '\myTech.Today\' -Xml $taskXml.OuterXml
         $taskVerifierParameters = @{
@@ -1497,7 +1731,12 @@ try {
             ApprovedOOSExecutablePath = $script:ManagedExecutablePath
             TrustedPowerShellPath = $expectedNativeInterpreterPath
         }
-        Assert-Equal $true (Test-WindowsUpdateTaskDefinition @taskVerifierParameters) 'task verification checks the canonical interpreter, success trigger, and queue policy'
+        Assert-Equal $true (Test-WindowsUpdateTaskDefinition @taskVerifierParameters) 'task verification checks the canonical interpreter, success trigger, queue policy, and execution limit'
+        $timespanTask = New-MockScheduledTask -TaskName 'Install-OOShutUp10' -TaskPath '\myTech.Today\' -Xml $taskXml.OuterXml
+        $timespanTask.Settings.ExecutionTimeLimit = [TimeSpan]::FromMinutes(30)
+        $taskVerifierParameters.Task = $timespanTask
+        Assert-Equal $true (Test-WindowsUpdateTaskDefinition @taskVerifierParameters) 'task verification accepts the ScheduledTasks TimeSpan representation of the configured limit'
+        $taskVerifierParameters.Task = $verifiedCurrentTask
 
         $bareInterpreterDocument = New-Object System.Xml.XmlDocument
         $bareInterpreterDocument.LoadXml($taskXml.OuterXml)
@@ -1568,6 +1807,19 @@ try {
         $ignoreNewTask = New-MockScheduledTask -TaskName 'Install-OOShutUp10' -TaskPath '\myTech.Today\' -Xml $ignoreNewDocument.OuterXml
         $taskVerifierParameters.Task = $ignoreNewTask
         Assert-Equal $false (Test-WindowsUpdateTaskDefinition @taskVerifierParameters) 'IgnoreNew is rejected as an unsafe current task definition'
+
+        $unboundedTaskDocument = New-Object System.Xml.XmlDocument
+        $unboundedTaskDocument.LoadXml($taskXml.OuterXml)
+        $unboundedLimitNode = $unboundedTaskDocument.SelectSingleNode("/*[local-name()='Task']/*[local-name()='Settings']/*[local-name()='ExecutionTimeLimit']")
+        [void]$unboundedLimitNode.ParentNode.RemoveChild($unboundedLimitNode)
+        $taskVerifierParameters.Task = New-MockScheduledTask -TaskName 'Install-OOShutUp10' -TaskPath '\myTech.Today\' -Xml $unboundedTaskDocument.OuterXml
+        Assert-Equal $false (Test-WindowsUpdateTaskDefinition @taskVerifierParameters) 'task verification rejects a missing execution limit'
+
+        $wrongLimitDocument = New-Object System.Xml.XmlDocument
+        $wrongLimitDocument.LoadXml($taskXml.OuterXml)
+        $wrongLimitDocument.SelectSingleNode("/*[local-name()='Task']/*[local-name()='Settings']/*[local-name()='ExecutionTimeLimit']").InnerText = 'PT0S'
+        $taskVerifierParameters.Task = New-MockScheduledTask -TaskName 'Install-OOShutUp10' -TaskPath '\myTech.Today\' -Xml $wrongLimitDocument.OuterXml
+        Assert-Equal $false (Test-WindowsUpdateTaskDefinition @taskVerifierParameters) 'task verification rejects an unlimited execution limit'
 
         $startAndSuccessDocument = New-Object System.Xml.XmlDocument
         $startAndSuccessDocument.LoadXml($taskXml.OuterXml)
@@ -1732,11 +1984,11 @@ try {
             $script:MockTaskSecurityDescriptorReplacementInjected = $false
             $script:LogMessages.Clear()
             $descriptorSetup = Invoke-OOShutUpTaskSetup -ScriptPath $taskScriptPath -ApprovedProfileSha256 $taskProfile.Sha256 -ApprovedProfileManifestSha256 $taskProfile.ManifestSha256
-            $descriptorOutcome = Get-OOShutUpInstallOutcome -SettingsVerified $true -RestorePointVerified $true -RestorePointOverrideUsed $false -TaskSetup $descriptorSetup
+            $descriptorOutcome = Get-OOShutUpInstallOutcome -ConfigurationOutcome $changedConfigurationOutcome -RestorePointVerified $true -RestorePointOverrideUsed $false -TaskSetup $descriptorSetup
             Assert-Equal $false $descriptorSetup.Verified "$descriptorFailure cannot produce verified task setup"
             Assert-Equal 'Partial' $descriptorOutcome.Status "$descriptorFailure cannot report Complete"
             Assert-Equal 2 $descriptorOutcome.ExitCode "$descriptorFailure returns the existing partial exit code"
-            Assert-Equal $script:OOShutUpPartialSetupMessage $descriptorOutcome.Summary "$descriptorFailure reports the existing partial summary instead of Complete"
+            Assert-True ($descriptorOutcome.Summary.Contains($script:OOShutUpPartialSetupMessage) -and $descriptorOutcome.Summary.Contains('O&O reported that settings changed') -and $descriptorOutcome.Summary.Contains('not independently read back')) "$descriptorFailure preserves the partial summary and vendor-reported settings detail"
             Assert-True ((@($script:LogMessages.ToArray()) -join [Environment]::NewLine).Contains($script:OOShutUpTaskSecurityDescriptorFailureMessage)) "$descriptorFailure uses the exact descriptor fallback"
             Assert-Equal $foreignTaskXml ([string]$script:TaskRegistry['\Backup\|Install-OOShutUp10'].Definition) "$descriptorFailure leaves the foreign same-named task unchanged"
             if ($descriptorFailure -eq 'UnexpectedOnFinal') {
@@ -1843,7 +2095,7 @@ try {
         $script:TaskRegistrationFailure = 'AccessDenied'
         $script:LogMessages.Clear()
         $deniedRegistrationSetup = Invoke-OOShutUpTaskSetup -ScriptPath $taskScriptPath -ApprovedProfileSha256 $taskProfile.Sha256 -ApprovedProfileManifestSha256 $taskProfile.ManifestSha256
-        $deniedRegistrationOutcome = Get-OOShutUpInstallOutcome -SettingsVerified $true -RestorePointVerified $true -RestorePointOverrideUsed $false -TaskSetup $deniedRegistrationSetup
+        $deniedRegistrationOutcome = Get-OOShutUpInstallOutcome -ConfigurationOutcome $changedConfigurationOutcome -RestorePointVerified $true -RestorePointOverrideUsed $false -TaskSetup $deniedRegistrationSetup
         Assert-Equal $false $deniedRegistrationSetup.Verified 'access denied during task registration is returned as unverified'
         Assert-Equal 2 $deniedRegistrationOutcome.ExitCode 'access denied during task registration yields the partial exit code'
         Assert-Equal $oldTaskXml ([string]$script:TaskRegistry['\myTech.Today\|Install-OOShutUp10'].Definition) 'denied candidate registration preserves the existing approved task'
@@ -1855,7 +2107,7 @@ try {
         $script:TaskUnregistrationCalls.Clear()
         $script:LogMessages.Clear()
         $retrySetup = Invoke-OOShutUpTaskSetup -ScriptPath $taskScriptPath -ApprovedProfileSha256 $taskProfile.Sha256 -ApprovedProfileManifestSha256 $taskProfile.ManifestSha256
-        $retryOutcome = Get-OOShutUpInstallOutcome -SettingsVerified $true -RestorePointVerified $true -RestorePointOverrideUsed $false -TaskSetup $retrySetup
+        $retryOutcome = Get-OOShutUpInstallOutcome -ConfigurationOutcome $changedConfigurationOutcome -RestorePointVerified $true -RestorePointOverrideUsed $false -TaskSetup $retrySetup
         Assert-Equal $true $retrySetup.Verified 'retry verifies the exact approved task after scheduler access is restored'
         Assert-Equal 0 $retryOutcome.ExitCode 'verified task retry returns the success exit code'
         Assert-True ($script:TaskRegistry['\myTech.Today\|Install-OOShutUp10'].Actions[0].Arguments.Contains($taskProfile.Sha256)) 'retry installs the approved profile digest at the owned path'
@@ -1888,8 +2140,21 @@ try {
         Assert-Equal $oldTaskXml ([string]$script:TaskRegistry['\myTech.Today\|Install-OOShutUp10'].Definition) 'queue-policy verification failure preserves the prior task definition'
         Assert-Equal 1 $script:TaskRegistrationCalls.Count 'queue-policy verification failure registers only a disabled candidate'
         Assert-Equal 1 $script:TaskUnregistrationCalls.Count 'queue-policy verification failure removes only the rejected candidate'
-        Assert-True ((@($script:LogMessages.ToArray()) -join [Environment]::NewLine).Contains('trigger, and queue settings')) 'queue-policy verification failure reports the exact rejected task criteria'
+        Assert-True ((@($script:LogMessages.ToArray()) -join [Environment]::NewLine).Contains('trigger, queue, and execution-time settings')) 'queue-policy verification failure reports the exact rejected task criteria'
         $script:FailStageQueuePolicyVerification = $false
+
+        $script:TaskRegistry.Clear()
+        $script:TaskRegistry['\myTech.Today\|Install-OOShutUp10'] = $oldTask
+        $script:TaskRegistrationCalls.Clear()
+        $script:TaskUnregistrationCalls.Clear()
+        $script:LogMessages.Clear()
+        $script:FailStageExecutionTimeLimitVerification = $true
+        Assert-Equal $false (New-WindowsUpdateScheduledTask -ScriptPath $taskScriptPath -ApprovedProfileSha256 $taskProfile.Sha256 -ApprovedProfileManifestSha256 $taskProfile.ManifestSha256) 'a candidate without the required bounded execution time is rejected'
+        Assert-Equal $oldTaskXml ([string]$script:TaskRegistry['\myTech.Today\|Install-OOShutUp10'].Definition) 'an invalid execution limit preserves the prior task definition'
+        Assert-Equal 1 $script:TaskRegistrationCalls.Count 'execution-limit verification failure registers only a disabled candidate'
+        Assert-Equal 1 $script:TaskUnregistrationCalls.Count 'execution-limit verification failure removes only the rejected candidate'
+        Assert-True ((@($script:LogMessages.ToArray()) -join [Environment]::NewLine).Contains('trigger, queue, and execution-time settings')) 'execution-limit verification failure reports the exact rejected task criteria'
+        $script:FailStageExecutionTimeLimitVerification = $false
 
         $script:TaskRegistry.Clear()
         $script:TaskRegistry['\myTech.Today\|Install-OOShutUp10'] = $oldTask
@@ -1933,18 +2198,20 @@ try {
     $approvedProfile = Get-OOShutUpApprovedProfile
     $script:PromptDecision = 'YES'
     Assert-Equal $true (Confirm-OOShutUpProfile -Profile $approvedProfile) 'the current profile is confirmed before configuration'
-    Assert-Equal $true (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture -SystemReapply) 'verified machine-only profile proceeds through the mocked SYSTEM reapplication call'
+    Assert-Equal 'Unchanged' (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture -SystemReapply).State 'machine-only profile returns the mocked O&O-reported state during SYSTEM reapplication'
     Assert-Equal 1 $script:StartedPaths.Count 'a verified payload starts once'
     Assert-Equal $validFixture ([string]$script:StartedPaths[0]) 'Start-Process receives the verified path'
+    Assert-Equal $false $script:StartedWaitFlags[0] 'Start-Process returns immediately so the explicit bounded child wait controls liveness'
+    Assert-Equal 900000 $script:MockChildWaitTimeoutMilliseconds 'the exact started child receives the fifteen-minute wait bound'
 
     foreach ($case in $invalidFixtures) {
         $fixture = Join-Path $script:FixtureRoot ($case.Name.Replace(' ', '-') + '.exe')
         $startedBefore = $script:StartedPaths.Count
-        Assert-Equal $false (Invoke-OOShutUpConfiguration -ExecutablePath $fixture) "$($case.Name) executable is not launched"
+        Assert-Equal 'Failed' (Invoke-OOShutUpConfiguration -ExecutablePath $fixture).State "$($case.Name) executable is not launched"
         Assert-Equal $startedBefore $script:StartedPaths.Count "$($case.Name) fixture makes zero process launches"
     }
     $startedBeforeEmpty = $script:StartedPaths.Count
-    Assert-Equal $false (Invoke-OOShutUpConfiguration -ExecutablePath $emptyFixture) 'empty executable is not launched'
+    Assert-Equal 'Failed' (Invoke-OOShutUpConfiguration -ExecutablePath $emptyFixture).State 'empty executable is not launched'
     Assert-Equal $startedBeforeEmpty $script:StartedPaths.Count 'empty fixture makes zero process launches'
 
     $oldTemp = $env:TEMP
@@ -1993,7 +2260,7 @@ try {
         Assert-Equal $null (Get-OOShutUpPath -ExpectedPath $systemTempExecutable) 'SYSTEM ReapplyOnly rejects an executable path that differs from the task-pinned managed file'
 
         $script:StartedPaths.Clear()
-        Assert-Equal $true (Invoke-OOShutUpConfiguration -ExecutablePath $systemResolvedPath -SystemReapply) 'SYSTEM reapplication uses the resolved managed executable through the mocked process boundary'
+        Assert-Equal 'Unchanged' (Invoke-OOShutUpConfiguration -ExecutablePath $systemResolvedPath -SystemReapply).State 'SYSTEM reapplication returns an explicit outcome through the mocked process boundary'
         Assert-Equal 1 $script:StartedPaths.Count 'SYSTEM reapplication starts one verified O&O payload'
         Assert-Equal $script:ManagedExecutablePath ([string]$script:StartedPaths[0]) 'the task reapplication path references the managed O&O executable'
 
@@ -2047,7 +2314,7 @@ try {
     }
 
     $script:StartedPaths.Clear()
-    Assert-Equal $true (Invoke-OOShutUpConfiguration -ExecutablePath $script:ManagedExecutablePath -SystemReapply) 'the preserved approved copy can be passed to the mocked process boundary'
+    Assert-Equal 'Unchanged' (Invoke-OOShutUpConfiguration -ExecutablePath $script:ManagedExecutablePath -SystemReapply).State 'the preserved approved copy can be passed to the mocked process boundary'
     Assert-Equal 1 $script:StartedPaths.Count 'the preserved approved copy launches exactly once through the mock'
     Assert-Equal $script:ManagedExecutablePath ([string]$script:StartedPaths[0]) 'the preserved approved copy is the launched path'
 

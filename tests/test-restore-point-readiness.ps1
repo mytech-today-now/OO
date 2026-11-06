@@ -33,7 +33,12 @@ $script:OOShutUpApprovalFailureMessage = 'The approved profile did not match the
 $script:OOShutUpApprovalConfirmed = $true
 $script:OOShutUpApprovedDigest = 'profile-digest'
 $script:OOShutUpApprovedManifestDigest = 'manifest-digest'
-$script:OOShutUpLastRunChanged = $false
+$script:OOShutUpLastRunOutcome = $null
+$script:OOShutUpChildTimeoutSeconds = 900
+$script:OOShutUpTaskExecutionTimeLimit = 'PT30M'
+$script:MockOOSChildExitRecorded = $false
+$script:MockOOSChildExitCode = 30
+$script:InstallPath = $null
 $script:OOShutUpMutationMutexName = "Global\myTech.Today.OOShutUp.RestorePointTest.$PID"
 $script:OOShutUpMutationLockTimeoutMilliseconds = 600000
 
@@ -303,8 +308,26 @@ function Start-Process {
     if ($script:MockStartProcessFailure) {
         throw 'Mocked Start-Process outcome could not be verified.'
     }
-    [void]$script:ConfigurationEvents.Add('process-exited')
-    return [pscustomobject]@{ ExitCode = 30 }
+    $process = [pscustomobject]@{
+        Id = 123
+        ExitCode = $script:MockOOSChildExitCode
+        HasExited = $false
+    }
+    $process | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value {
+        param([int]$Milliseconds = -1)
+
+        if ($Milliseconds -lt 0) {
+            return [bool]$this.HasExited
+        }
+        $this.HasExited = $true
+        if (-not $script:MockOOSChildExitRecorded) {
+            [void]$script:ConfigurationEvents.Add('process-exited')
+            $script:MockOOSChildExitRecorded = $true
+        }
+        return $true
+    } -Force
+    $script:MockOOSChildExitRecorded = $false
+    return $process
 }
 
 try {
@@ -333,6 +356,9 @@ try {
         'Open-OOShutUpMutationMutex',
         'Release-OOShutUpMutationMutex',
         'Invoke-WithOOShutUpMutationLock',
+        'Get-OOShutUpRetainedProfileSnapshots',
+        'Wait-OOShutUpChildProcess',
+        'New-OOShutUpConfigurationOutcome',
         'Test-RestorePointFrequencyStateEqual',
         'Restore-RestorePointFrequencyState',
         'Set-RestorePointFrequencyValue',
@@ -525,7 +551,7 @@ try {
         $eventsBeforeBlockedRestore = $script:ConfigurationEvents.Count
         $blockedResult = Invoke-OOShutUpConfigurationWithRestorePointGate -ExecutablePath 'C:\fixtures\OOSU10.exe'
         Assert-Equal $false $blockedResult.ConfigurationStarted "$scenario stops before configuration starts"
-        Assert-Equal $false $blockedResult.ConfigurationSucceeded "$scenario does not report configuration success"
+        Assert-Equal 'Failed' $blockedResult.ConfigurationOutcome.State "$scenario reports a pre-launch settings failure distinctly"
         Assert-Equal $callCountBeforeFailure $script:ProcessBoundaryCalls "$scenario never reaches Start-Process"
         Assert-Equal $eventsBeforeBlockedRestore $script:ConfigurationEvents.Count "$scenario never reaches profile validation or snapshot creation"
         $blockedMessages = [string]::Join("`n", [string[]]$script:LogMessages.ToArray())
@@ -550,7 +576,8 @@ try {
     $successResult = Invoke-OOShutUpConfigurationWithRestorePointGate -ExecutablePath 'C:\fixtures\OOSU10.exe'
     Assert-Equal $true $successResult.RestorePointVerified 'verified point status reaches the result'
     Assert-Equal $true $successResult.ConfigurationStarted 'verified point permits configuration'
-    Assert-Equal $true $successResult.ConfigurationSucceeded 'mocked O&O reports successful application'
+    Assert-Equal 'Changed' $successResult.ConfigurationOutcome.State 'exit code 30 is retained as an O&O-reported changed outcome'
+    Assert-Equal 'Unavailable' $successResult.ConfigurationOutcome.ReadbackState 'the mocked successful process does not imply independent settings readback'
     Assert-Equal ($callCountBeforeFailure + 1) $script:ProcessBoundaryCalls 'verified point reaches Start-Process exactly once'
     Assert-Equal 'restore-point-verified,profile-validation,snapshot-creation,snapshot-verification,process-start,process-exited,snapshot-removal' ([string]::Join(',', [string[]]$script:ConfigurationEvents.ToArray())) 'the production restore gate, profile validation, snapshot verification, process exit, and cleanup run in order'
     Assert-Equal 0 $script:ActiveProfileSnapshots.Count 'a completed O&O child removes its unique snapshot after process exit is known'
@@ -560,7 +587,7 @@ try {
     $profileValidationStartCount = $script:ProcessBoundaryCalls
     $profileValidationFailure = Invoke-OOShutUpConfigurationWithRestorePointGate -ExecutablePath 'C:\fixtures\OOSU10.exe'
     $script:OOShutUpApprovalConfirmed = $true
-    Assert-Equal $false $profileValidationFailure.ConfigurationSucceeded 'failed approved-profile validation reports configuration failure'
+    Assert-Equal 'Failed' $profileValidationFailure.ConfigurationOutcome.State 'failed profile validation is distinguished from an unknown child outcome'
     Assert-Equal $profileValidationStartCount $script:ProcessBoundaryCalls 'failed approved-profile validation never launches O&O'
     Assert-Equal 'restore-point-verified,profile-validation' ([string]::Join(',', [string[]]$script:ConfigurationEvents.ToArray())) 'profile validation must pass before snapshot creation can begin'
 
@@ -569,7 +596,7 @@ try {
         $script:ProfileSnapshotScenario = $snapshotFailureScenario
         $snapshotFailureStartCount = $script:ProcessBoundaryCalls
         $snapshotFailureResult = Invoke-OOShutUpConfigurationWithRestorePointGate -ExecutablePath 'C:\fixtures\OOSU10.exe'
-        Assert-Equal $false $snapshotFailureResult.ConfigurationSucceeded "$snapshotFailureScenario reports configuration failure"
+        Assert-Equal 'Failed' $snapshotFailureResult.ConfigurationOutcome.State "$snapshotFailureScenario is a known pre-launch failure"
         Assert-Equal $snapshotFailureStartCount $script:ProcessBoundaryCalls "$snapshotFailureScenario never launches O&O"
         Assert-True (-not $script:ConfigurationEvents.Contains('process-start')) "$snapshotFailureScenario does not bypass the snapshot boundary"
         Assert-Equal 0 $script:ActiveProfileSnapshots.Count "$snapshotFailureScenario leaves no unverified snapshot behind"
@@ -585,7 +612,8 @@ try {
     $uncertainStartCount = $script:ProcessBoundaryCalls
     $uncertainStartResult = Invoke-OOShutUpConfigurationWithRestorePointGate -ExecutablePath 'C:\fixtures\OOSU10.exe'
     $script:MockStartProcessFailure = $false
-    Assert-Equal $false $uncertainStartResult.ConfigurationSucceeded 'an uncertain Start-Process result fails closed'
+    Assert-Equal 'Unknown' $uncertainStartResult.ConfigurationOutcome.State 'a missing reliable process result remains unknown'
+    Assert-Equal 'Unavailable' $uncertainStartResult.ConfigurationOutcome.ReadbackState 'an unknown process result is not settings verification'
     Assert-Equal ($uncertainStartCount + 1) $script:ProcessBoundaryCalls 'the uncertain process-start scenario reaches Start-Process once'
     Assert-Equal 1 $script:ActiveProfileSnapshots.Count 'an uncertain process-start outcome retains its profile snapshot'
     Assert-True (-not $script:ConfigurationEvents.Contains('snapshot-removal')) 'an uncertain process-start outcome does not clean up the snapshot'
@@ -597,7 +625,7 @@ try {
     $script:ProfileSnapshotScenario = 'cleanup-failure'
     $cleanupFailureStartCount = $script:ProcessBoundaryCalls
     $cleanupFailureResult = Invoke-OOShutUpConfigurationWithRestorePointGate -ExecutablePath 'C:\fixtures\OOSU10.exe'
-    Assert-Equal $false $cleanupFailureResult.ConfigurationSucceeded 'snapshot cleanup failure reports an incomplete configuration result'
+    Assert-Equal 'Changed' $cleanupFailureResult.ConfigurationOutcome.State 'cleanup failure preserves the O&O-reported changed status separately from cleanup success'
     Assert-Equal ($cleanupFailureStartCount + 1) $script:ProcessBoundaryCalls 'snapshot cleanup failure happens after the child exits'
     Assert-Equal 1 $script:ActiveProfileSnapshots.Count 'snapshot cleanup failure leaves the snapshot available for recovery'
     Assert-True ([string]::Join("`n", [string[]]$script:LogMessages.ToArray()).Contains('The protected profile snapshot could not be removed after O&O exited')) 'snapshot cleanup failure reports that O&O has exited'
