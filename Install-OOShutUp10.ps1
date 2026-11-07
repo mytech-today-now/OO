@@ -26,6 +26,10 @@
     Explicitly permits Restart-Computer to force-close applications when a restart is confirmed.
     Unsaved work may be lost; use only when that risk is accepted.
 
+.PARAMETER DevelopmentMode
+    Explicitly permits a source checkout to run without a signed release package. This is a development-only path;
+    it warns before running and does not relocate the checkout or create a scheduled task.
+
 .PARAMETER ApprovedProfileSha256
     The exact SHA-256 digest of the reviewed O&O settings export approved for unattended use.
 
@@ -56,11 +60,14 @@
     Copyright      : (c) 2025 myTech.Today. All rights reserved.
     Prerequisite   : PowerShell 5.1+, Administrator privileges
 
-    Execution policy:
-    Prefer an organization-approved signed copy. The -ExecutionPolicy Bypass examples below are process-scoped
-    and must only be used when approved by your policy owner. MachinePolicy and UserPolicy Group Policy settings
-    take precedence; otherwise Process takes precedence over CurrentUser and LocalMachine. A blocked launch must
-    stop without changing stored policy. PowerShell policy blocks this script. No policy was changed; use an approved signed or process-scoped launch.
+    Source integrity:
+    Production releases require administrator-enforced MachinePolicy AllSigned, a valid Authenticode signature on this
+    script and its adjacent Install-OOShutUp10.release.psd1 manifest, matching SHA-256 metadata, and a signer
+    thumbprint configured outside this repository at HKLM\SOFTWARE\Policies\myTech.Today\OOShutUp10.
+    Use -DevelopmentMode only from a source checkout; that path warns and skips relocation and scheduled-task creation.
+    No signing key or production trust pin is stored in this repository.
+    MachinePolicy and UserPolicy Group Policy settings take precedence; otherwise Process takes precedence over CurrentUser and LocalMachine.
+    PowerShell policy blocks this production launch. No policy was changed; restore a trusted signed release or use -DevelopmentMode only from a source checkout.
 
     About myTech.Today:
     myTech.Today is a Chicagoland-based MSP and IT consulting firm specializing in
@@ -76,12 +83,16 @@
     - GitHub: https://github.com/mytech-today-now
 
 .EXAMPLE
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\Install-OOShutUp10.ps1"
-    Starts Windows PowerShell 5.1 with a process-scoped policy. Use only when approved by your policy owner.
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\Install-OOShutUp10.ps1" -DevelopmentMode
+    Runs an explicitly selected development checkout in Windows PowerShell 5.1. It may apply the reviewed profile but does not register a task.
 
 .EXAMPLE
-    pwsh.exe -NoProfile -ExecutionPolicy Bypass -File ".\Install-OOShutUp10.ps1"
-    Starts PowerShell 7 with a process-scoped policy. Use only when approved by your policy owner.
+    pwsh.exe -NoProfile -ExecutionPolicy Bypass -File ".\Install-OOShutUp10.ps1" -DevelopmentMode
+    Runs an explicitly selected development checkout. It may apply the reviewed profile but does not relocate or register a task.
+
+.EXAMPLE
+    pwsh.exe -NoProfile -ExecutionPolicy AllSigned -File ".\Install-OOShutUp10.ps1"
+    Starts a production release after organization-enforced policy and release trust metadata have been provisioned.
 
 .EXAMPLE
     .\Install-OOShutUp10.ps1
@@ -125,8 +136,275 @@ param(
     [switch]$ProfileApprovalConfirmed,
 
     [Parameter(Mandatory = $false)]
-    [switch]$AllowWithoutRestorePoint
+    [switch]$AllowWithoutRestorePoint,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$DevelopmentMode
 )
+
+# Keep the release gate self-contained and before any repository helper is loaded. The production trust roots are
+# provisioned by the machine administrator, not stored in this checkout.
+function Get-OOShutUpTrustedReleaseSignerThumbprint {
+    [CmdletBinding()]
+    param()
+
+    $registryView = if ([System.Environment]::Is64BitOperatingSystem) {
+        [Microsoft.Win32.RegistryView]::Registry64
+    }
+    else {
+        [Microsoft.Win32.RegistryView]::Default
+    }
+    $baseKey = $null
+    $policyKey = $null
+    try {
+        $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+            [Microsoft.Win32.RegistryHive]::LocalMachine,
+            $registryView
+        )
+        $policyKey = $baseKey.OpenSubKey('SOFTWARE\Policies\myTech.Today\OOShutUp10', $false)
+        if ($null -eq $policyKey) {
+            throw 'The machine release signer policy is not configured.'
+        }
+
+        $thumbprint = [string]$policyKey.GetValue(
+            'TrustedReleaseSignerThumbprint',
+            $null,
+            [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames
+        )
+        $thumbprint = $thumbprint -replace '\s', ''
+        if ($thumbprint -notmatch '^[A-Fa-f0-9]{40}$') {
+            throw 'The machine release signer policy is missing or malformed.'
+        }
+
+        return $thumbprint.ToUpperInvariant()
+    }
+    finally {
+        if ($null -ne $policyKey) { $policyKey.Dispose() }
+        if ($null -ne $baseKey) { $baseKey.Dispose() }
+    }
+}
+
+function Test-OOShutUpEnforcedAllSignedPolicy {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param()
+
+    try {
+        $policies = @(Get-ExecutionPolicy -List -ErrorAction Stop)
+        $machinePolicy = @($policies | Where-Object { [string]$_.Scope -eq 'MachinePolicy' }) | Select-Object -First 1
+        return ($null -ne $machinePolicy -and [string]$machinePolicy.ExecutionPolicy -eq 'AllSigned')
+    }
+    catch {
+        return $false
+    }
+
+    return $false
+}
+
+function Test-OOShutUpMachineTrustedPublisher {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Thumbprint
+    )
+
+    $store = $null
+    try {
+        $store = [System.Security.Cryptography.X509Certificates.X509Store]::new(
+            [System.Security.Cryptography.X509Certificates.StoreName]::TrustedPublisher,
+            [System.Security.Cryptography.X509Certificates.StoreLocation]::LocalMachine
+        )
+        $store.Open(
+            [System.Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly -bor
+            [System.Security.Cryptography.X509Certificates.OpenFlags]::OpenExistingOnly
+        )
+        $expectedThumbprint = ($Thumbprint -replace '\s', '').ToUpperInvariant()
+        foreach ($certificate in $store.Certificates) {
+            $actualThumbprint = ([string]$certificate.Thumbprint -replace '\s', '').ToUpperInvariant()
+            if ([string]::Equals($actualThumbprint, $expectedThumbprint, [System.StringComparison]::Ordinal)) {
+                return $true
+            }
+        }
+    }
+    catch {
+        return $false
+    }
+    finally {
+        if ($null -ne $store) { $store.Close() }
+    }
+
+    return $false
+}
+
+function Test-OOShutUpSourceCheckout {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ScriptPath
+    )
+
+    try {
+        $directory = [System.IO.Path]::GetDirectoryName([System.IO.Path]::GetFullPath($ScriptPath))
+        while (-not [string]::IsNullOrWhiteSpace($directory)) {
+            $gitMarker = Join-Path $directory '.git'
+            if ([System.IO.Directory]::Exists($gitMarker) -or [System.IO.File]::Exists($gitMarker)) {
+                return $true
+            }
+
+            $parent = [System.IO.Directory]::GetParent($directory)
+            if ($null -eq $parent -or [string]::Equals($parent.FullName, $directory, [System.StringComparison]::OrdinalIgnoreCase)) {
+                break
+            }
+            $directory = $parent.FullName
+        }
+    }
+    catch {
+        return $false
+    }
+
+    return $false
+}
+
+function Test-OOShutUpSourceIntegrity {
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ScriptPath,
+
+        [Parameter(Mandatory = $false)]
+        [string]$ReleaseManifestPath = (Join-Path (Split-Path -Parent $ScriptPath) 'Install-OOShutUp10.release.psd1'),
+
+        [Parameter(Mandatory = $false)]
+        [switch]$DevelopmentMode,
+
+        [Parameter(Mandatory = $false)]
+        [switch]$ReapplyOnly
+    )
+
+    if ($DevelopmentMode) {
+        if ($ReapplyOnly) {
+            return [pscustomobject]@{
+                Allowed = $false
+                Mode = 'Rejected'
+                Message = 'Development mode cannot run the scheduled-task reapplication entry point. No machine changes were started.'
+            }
+        }
+        if (-not (Test-OOShutUpSourceCheckout -ScriptPath $ScriptPath)) {
+            return [pscustomobject]@{
+                Allowed = $false
+                Mode = 'Rejected'
+                Message = 'Development mode is available only for a Git source checkout. No machine changes were started.'
+            }
+        }
+
+        return [pscustomobject]@{
+            Allowed = $true
+            Mode = 'Development'
+            Message = 'Development mode: this source checkout is not authenticated as a production release. Profile application may change system state; relocation and scheduled-task registration are disabled.'
+        }
+    }
+
+    if (-not (Test-OOShutUpEnforcedAllSignedPolicy)) {
+        return [pscustomobject]@{
+            Allowed = $false
+            Mode = 'Rejected'
+            Message = 'Production launch requires administrator-enforced MachinePolicy AllSigned. No machine changes were started; configure the organization policy or use the explicit source-checkout development path.'
+        }
+    }
+
+    try {
+        if (-not (Test-Path -LiteralPath $ScriptPath -PathType Leaf)) {
+            throw 'The installer source file is missing.'
+        }
+        if (-not (Test-Path -LiteralPath $ReleaseManifestPath -PathType Leaf)) {
+            throw 'The signed release manifest is missing.'
+        }
+
+        $trustedThumbprint = Get-OOShutUpTrustedReleaseSignerThumbprint
+        if (-not (Test-OOShutUpMachineTrustedPublisher -Thumbprint $trustedThumbprint)) {
+            throw 'The configured release signer is not present in LocalMachine Trusted Publishers.'
+        }
+        $manifestSignature = Get-AuthenticodeSignature -FilePath $ReleaseManifestPath -ErrorAction Stop
+        if ($manifestSignature.Status -ne 'Valid' -or $null -eq $manifestSignature.SignerCertificate) {
+            throw 'The release manifest signature is missing or invalid.'
+        }
+        $manifestThumbprint = ([string]$manifestSignature.SignerCertificate.Thumbprint -replace '\s', '').ToUpperInvariant()
+        if (-not [string]::Equals($manifestThumbprint, $trustedThumbprint, [System.StringComparison]::Ordinal)) {
+            throw 'The release manifest publisher does not match the administrator-configured signer.'
+        }
+
+        $releaseManifest = Import-PowerShellDataFile -Path $ReleaseManifestPath -ErrorAction Stop
+        if ($releaseManifest -isnot [System.Collections.IDictionary]) {
+            throw 'The release manifest has an unsupported format.'
+        }
+        $manifestKeys = @($releaseManifest.Keys | ForEach-Object { [string]$_ })
+        $requiredManifestKeys = @('schemaVersion', 'scriptFile', 'scriptSha256')
+        if ($manifestKeys.Count -ne $requiredManifestKeys.Count) {
+            throw 'The release manifest has unexpected or missing metadata.'
+        }
+        foreach ($key in $requiredManifestKeys) {
+            if ($manifestKeys -cnotcontains $key) {
+                throw 'The release manifest has unexpected or missing metadata.'
+            }
+        }
+        if ($releaseManifest.schemaVersion -isnot [int] -and $releaseManifest.schemaVersion -isnot [long]) {
+            throw 'The release manifest schema version is invalid.'
+        }
+        if ([long]$releaseManifest.schemaVersion -ne 1 -or
+            [string]$releaseManifest.scriptFile -cne [System.IO.Path]::GetFileName($ScriptPath) -or
+            [string]$releaseManifest.scriptSha256 -notmatch '^[A-Fa-f0-9]{64}$') {
+            throw 'The release manifest does not describe this installer source.'
+        }
+
+        $scriptSignature = Get-AuthenticodeSignature -FilePath $ScriptPath -ErrorAction Stop
+        if ($scriptSignature.Status -ne 'Valid' -or $null -eq $scriptSignature.SignerCertificate) {
+            throw 'The installer source signature is missing or invalid.'
+        }
+        $scriptThumbprint = ([string]$scriptSignature.SignerCertificate.Thumbprint -replace '\s', '').ToUpperInvariant()
+        if (-not [string]::Equals($scriptThumbprint, $trustedThumbprint, [System.StringComparison]::Ordinal) -or
+            -not [string]::Equals($scriptThumbprint, $manifestThumbprint, [System.StringComparison]::Ordinal)) {
+            throw 'The installer source publisher does not match the signed manifest and administrator-configured signer.'
+        }
+
+        $scriptDigest = (Get-FileHash -LiteralPath $ScriptPath -Algorithm SHA256 -ErrorAction Stop).Hash
+        if (-not [string]::Equals(
+            $scriptDigest,
+            [string]$releaseManifest.scriptSha256,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )) {
+            throw 'The installer source digest does not match the signed release manifest.'
+        }
+
+        return [pscustomobject]@{
+            Allowed = $true
+            Mode = 'Production'
+            Message = 'The signed release manifest and installer source were verified.'
+        }
+    }
+    catch {
+        return [pscustomobject]@{
+            Allowed = $false
+            Mode = 'Rejected'
+            Message = "Production source integrity validation failed: $($_.Exception.Message) No machine changes were started; restore a complete publisher-signed release package or use the explicit source-checkout development path."
+        }
+    }
+}
+
+$script:OOShutUpSourceIntegrityResult = Test-OOShutUpSourceIntegrity `
+    -ScriptPath $PSCommandPath `
+    -DevelopmentMode:$DevelopmentMode `
+    -ReapplyOnly:$ReapplyOnly
+if (-not $script:OOShutUpSourceIntegrityResult.Allowed) {
+    Write-Host $script:OOShutUpSourceIntegrityResult.Message -ForegroundColor Red
+    exit 1
+}
+if ($script:OOShutUpSourceIntegrityResult.Mode -eq 'Development') {
+    Write-Warning $script:OOShutUpSourceIntegrityResult.Message
+}
+$script:OOShutUpReleaseManifestFileName = 'Install-OOShutUp10.release.psd1'
 
 # PowerShell 7+ Version Check - myTech.Today standard
 $script:PS7ContinueOnPS51 = $true  # Allow running on PS 5.1 with warning
@@ -487,7 +765,8 @@ function Get-ScriptRelocationPackageTarget {
 
     $profilePath = Join-Path $ProfileDirectory 'ooshutup10.cfg'
     $manifestPath = Join-Path $ProfileDirectory 'ooshutup10.approval.json'
-    foreach ($path in @($CurrentScriptPath, $profilePath, $manifestPath)) {
+    $releaseManifestPath = Join-Path (Split-Path -Parent $CurrentScriptPath) $script:OOShutUpReleaseManifestFileName
+    foreach ($path in @($CurrentScriptPath, $profilePath, $manifestPath, $releaseManifestPath)) {
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
             throw "The relocation package source file is missing: $path"
         }
@@ -497,6 +776,7 @@ function Get-ScriptRelocationPackageTarget {
         Script   = (Get-FileHash -LiteralPath $CurrentScriptPath -Algorithm SHA256 -ErrorAction Stop).Hash
         Profile  = (Get-FileHash -LiteralPath $profilePath -Algorithm SHA256 -ErrorAction Stop).Hash
         Manifest = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256 -ErrorAction Stop).Hash
+        ReleaseManifest = (Get-FileHash -LiteralPath $releaseManifestPath -Algorithm SHA256 -ErrorAction Stop).Hash
     }
     if ($ApprovedProfileSha256 -notmatch '^[A-Fa-f0-9]{64}$' -or
         $ApprovedProfileManifestSha256 -notmatch '^[A-Fa-f0-9]{64}$' -or
@@ -505,7 +785,7 @@ function Get-ScriptRelocationPackageTarget {
         throw 'The relocation profile source no longer matches both approved SHA-256 digests.'
     }
 
-    $packageMaterial = '{0}:{1}:{2}' -f $digests.Script, $digests.Profile, $digests.Manifest
+    $packageMaterial = '{0}:{1}:{2}:{3}' -f $digests.Script, $digests.Profile, $digests.Manifest, $digests.ReleaseManifest
     $sha256 = [System.Security.Cryptography.SHA256]::Create()
     try {
         $packageId = ([System.BitConverter]::ToString(
@@ -547,8 +827,9 @@ function Test-ScriptRelocationPackage {
             Script   = Join-Path $PackageRoot $ScriptFileName
             Profile  = Join-Path (Join-Path $PackageRoot 'profiles') 'ooshutup10.cfg'
             Manifest = Join-Path (Join-Path $PackageRoot 'profiles') 'ooshutup10.approval.json'
+            ReleaseManifest = Join-Path $PackageRoot $script:OOShutUpReleaseManifestFileName
         }
-        foreach ($key in @('Script', 'Profile', 'Manifest')) {
+        foreach ($key in @('Script', 'Profile', 'Manifest', 'ReleaseManifest')) {
             $path = [string]$filePaths[$key]
             if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or
                 -not (Test-SystemTaskTargetAcl -ScriptPath $path)) {
@@ -623,6 +904,10 @@ function Remove-ScriptRelocationStage {
     if ([System.IO.File]::Exists($scriptPath)) {
         [System.IO.File]::Delete($scriptPath)
     }
+    $releaseManifestPath = Join-Path $StageRoot $script:OOShutUpReleaseManifestFileName
+    if ([System.IO.File]::Exists($releaseManifestPath)) {
+        [System.IO.File]::Delete($releaseManifestPath)
+    }
     [System.IO.Directory]::Delete($StageRoot, $false)
 }
 
@@ -672,8 +957,9 @@ function Install-ScriptRelocationPackage {
             Script   = $CurrentScriptPath
             Profile  = Join-Path $ProfileDirectory 'ooshutup10.cfg'
             Manifest = Join-Path $ProfileDirectory 'ooshutup10.approval.json'
+            ReleaseManifest = Join-Path (Split-Path -Parent $CurrentScriptPath) $script:OOShutUpReleaseManifestFileName
         }
-        foreach ($key in @('Script', 'Profile', 'Manifest')) {
+        foreach ($key in @('Script', 'Profile', 'Manifest', 'ReleaseManifest')) {
             $sourcePath = [string]$sourcePaths[$key]
             if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
                 throw "The relocation source file is missing: $sourcePath"
@@ -691,8 +977,9 @@ function Install-ScriptRelocationPackage {
         Copy-Item -LiteralPath $CurrentScriptPath -Destination (Join-Path $stageRoot $ScriptFileName) -Force -ErrorAction Stop
         Copy-Item -LiteralPath (Join-Path $ProfileDirectory 'ooshutup10.cfg') -Destination (Join-Path $stageProfileDirectory 'ooshutup10.cfg') -Force -ErrorAction Stop
         Copy-Item -LiteralPath (Join-Path $ProfileDirectory 'ooshutup10.approval.json') -Destination (Join-Path $stageProfileDirectory 'ooshutup10.approval.json') -Force -ErrorAction Stop
+        Copy-Item -LiteralPath $sourcePaths.ReleaseManifest -Destination (Join-Path $stageRoot $script:OOShutUpReleaseManifestFileName) -Force -ErrorAction Stop
 
-        foreach ($key in @('Script', 'Profile', 'Manifest')) {
+        foreach ($key in @('Script', 'Profile', 'Manifest', 'ReleaseManifest')) {
             $sourcePath = [string]$sourcePaths[$key]
             $sourceDigest = (Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256 -ErrorAction Stop).Hash
             if (-not [string]::Equals(
@@ -3120,7 +3407,7 @@ function Test-WindowsUpdateTaskDefinition {
         $canonicalScriptPath = [System.IO.Path]::GetFullPath($ScriptPath)
         $arguments = [string]$actions[0].Arguments
         $canonicalExecutablePath = [System.IO.Path]::GetFullPath($ApprovedOOSExecutablePath)
-        $expectedArguments = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -ReapplyOnly -SkipRelocate -NonInteractive -ApprovedOOSExecutablePath "{1}" -ApprovedProfileSha256 {2} -ApprovedProfileManifestSha256 {3}' -f $canonicalScriptPath, $canonicalExecutablePath, $ApprovedProfileSha256, $ApprovedProfileManifestSha256
+        $expectedArguments = '-NoProfile -ExecutionPolicy AllSigned -WindowStyle Hidden -File "{0}" -ReapplyOnly -SkipRelocate -NonInteractive -ApprovedOOSExecutablePath "{1}" -ApprovedProfileSha256 {2} -ApprovedProfileManifestSha256 {3}' -f $canonicalScriptPath, $canonicalExecutablePath, $ApprovedProfileSha256, $ApprovedProfileManifestSha256
         $expectedWorkingDirectory = [System.IO.Path]::GetDirectoryName($canonicalScriptPath)
         if (-not [string]::Equals($arguments, $expectedArguments, [System.StringComparison]::Ordinal) -or
             -not [string]::Equals([string]$actions[0].WorkingDirectory, $expectedWorkingDirectory, [System.StringComparison]::OrdinalIgnoreCase)) {
@@ -3694,7 +3981,7 @@ function New-WindowsUpdateScheduledTask {
         $exec.AppendChild($command) | Out-Null
 
         $arguments = $xml.CreateElement("Arguments")
-        $arguments.InnerText = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$ScriptPath`" -ReapplyOnly -SkipRelocate -NonInteractive -ApprovedOOSExecutablePath `"$approvedOOSExecutablePath`" -ApprovedProfileSha256 $ApprovedProfileSha256 -ApprovedProfileManifestSha256 $ApprovedProfileManifestSha256"
+        $arguments.InnerText = "-NoProfile -ExecutionPolicy AllSigned -WindowStyle Hidden -File `"$ScriptPath`" -ReapplyOnly -SkipRelocate -NonInteractive -ApprovedOOSExecutablePath `"$approvedOOSExecutablePath`" -ApprovedProfileSha256 $ApprovedProfileSha256 -ApprovedProfileManifestSha256 $ApprovedProfileManifestSha256"
         $exec.AppendChild($arguments) | Out-Null
 
         $workingDirectory = $xml.CreateElement("WorkingDirectory")
@@ -4240,19 +4527,27 @@ try {
     if ([string]::IsNullOrEmpty($currentPath)) {
         $currentPath = $MyInvocation.MyCommand.Path
     }
-    $relocationTarget = Get-ScriptRelocationPackageTarget `
-        -CurrentScriptPath $currentPath `
-        -ProfileDirectory $script:OOShutUpProfileDirectory `
-        -ScriptFileName $ScriptFileName `
-        -PackageContainer $script:DefaultScriptPackageContainer `
-        -ApprovedProfileSha256 $script:OOShutUpApprovedDigest `
-        -ApprovedProfileManifestSha256 $script:OOShutUpApprovedManifestDigest
-    $DefaultScriptRoot = $relocationTarget.Root
-    $DefaultScriptPath = $relocationTarget.ScriptPath
-    $script:OOShutUpRelocationPackageDigests = $relocationTarget.Digests
+    if ($DevelopmentMode) {
+        $DefaultScriptRoot = Split-Path -Parent $currentPath
+        $DefaultScriptPath = $currentPath
+        $script:OOShutUpRelocationPackageDigests = $null
+        Write-Log 'Development mode keeps execution in the source checkout; no release package will be staged.' -Level WARNING
+    }
+    else {
+        $relocationTarget = Get-ScriptRelocationPackageTarget `
+            -CurrentScriptPath $currentPath `
+            -ProfileDirectory $script:OOShutUpProfileDirectory `
+            -ScriptFileName $ScriptFileName `
+            -PackageContainer $script:DefaultScriptPackageContainer `
+            -ApprovedProfileSha256 $script:OOShutUpApprovedDigest `
+            -ApprovedProfileManifestSha256 $script:OOShutUpApprovedManifestDigest
+        $DefaultScriptRoot = $relocationTarget.Root
+        $DefaultScriptPath = $relocationTarget.ScriptPath
+        $script:OOShutUpRelocationPackageDigests = $relocationTarget.Digests
+    }
 
     # Step 0: Ensure script is running from default location (unless SkipRelocate is set)
-    if (-not $SkipRelocate) {
+    if (-not $DevelopmentMode -and -not $SkipRelocate) {
         Update-ScriptProgress -PercentComplete 5 -Status "Initializing..." -CurrentOperation "Checking script location"
 
         if (-not [string]::Equals(
@@ -4387,10 +4682,19 @@ try {
     Update-ScriptProgress -PercentComplete 85 -Status "Step 5 of 5: Creating Scheduled Task" -CurrentOperation "Setting up automatic reapplication after Windows updates"
     Write-Log "Step 5: Creating scheduled task for post-Windows Update execution..." -Level INFO
     # Bind the task to the same running package that passed profile validation, including when relocation failed.
-    $taskSetup = Invoke-OOShutUpTaskSetup `
-        -ScriptPath $currentScriptPath `
-        -ApprovedProfileSha256 $approvedProfile.Sha256 `
-        -ApprovedProfileManifestSha256 $approvedProfile.ManifestSha256
+    if ($DevelopmentMode) {
+        Write-Log 'Development mode does not register a scheduled task for unsigned checkout code.' -Level WARNING
+        $taskSetup = [pscustomobject]@{
+            Verified = $false
+            ExceptionMessage = $null
+        }
+    }
+    else {
+        $taskSetup = Invoke-OOShutUpTaskSetup `
+            -ScriptPath $currentScriptPath `
+            -ApprovedProfileSha256 $approvedProfile.Sha256 `
+            -ApprovedProfileManifestSha256 $approvedProfile.ManifestSha256
+    }
     $installerOutcome = Get-OOShutUpInstallOutcome `
         -ConfigurationOutcome $configurationOutcome `
         -RestorePointVerified $restorePointVerified `

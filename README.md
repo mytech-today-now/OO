@@ -93,7 +93,11 @@ This PowerShell automation script is developed and maintained by **myTech.Today*
 
 ## Overview
 
-This PowerShell script automates the installation and configuration of **O&O ShutUp10++** using a reviewed settings profile supplied with the script package.
+This repository contains an installer framework for **O&O ShutUp10++**. It can apply settings only when an owner-reviewed profile, approval manifest, and required scope evidence have been supplied.
+
+### Clean-checkout profile availability
+
+**Configuration is unavailable from a clean checkout.** This repository currently ships no reviewed settings profile: the `profiles/` directory contains only `README.md`, with no `ooshutup10.cfg`, `ooshutup10.approval.json`, or per-setting scope-evidence records. In the explicit source-checkout development path, the installer rejects the missing profile pair before relocation, restore-point work, registry changes, O&O launch, or scheduled-task registration. No default settings are included or implied. See [profiles/README.md](profiles/README.md) for owner-review and disposable-VM requirements.
 
 ## Features
 
@@ -133,9 +137,44 @@ This PowerShell script automates the installation and configuration of **O&O Shu
 
 ## Execution Policy and Safe Launch
 
-Do not change the stored `CurrentUser` or `LocalMachine` execution policy to run this installer. Prefer an organization-approved signed copy and follow your organization's launch policy. If your policy owner approves a process-scoped launch for this unsigned or local copy, the `-ExecutionPolicy Bypass` examples below apply only to the new PowerShell process; they do not change stored policy values.
+Do not change the stored `CurrentUser` or `LocalMachine` execution policy to run this installer. Production runs require organization-enforced `AllSigned` policy at `MachinePolicy`. The launcher and scheduled task request `AllSigned`, and the installer checks that machine policy is active before loading repository helpers or starting machine work.
 
-On Windows, `MachinePolicy` and `UserPolicy` Group Policy settings take precedence. When neither is set, precedence is `Process`, then `CurrentUser`, then `LocalMachine`. A process-scoped launch cannot override Group Policy. Execution policy is a safety feature, not a security boundary. See [Microsoft's execution policy documentation](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_execution_policies).
+On Windows, `MachinePolicy` and `UserPolicy` Group Policy settings take precedence. When neither is set, precedence is `Process`, then `CurrentUser`, then `LocalMachine`; a process-scoped launch cannot override Group Policy. Execution policy alone is not a complete application-control boundary, so production deployments must protect the launcher and PowerShell execution path with the organization's application-control policy as well. See [Microsoft's execution policy documentation](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_execution_policies).
+
+### Production source integrity
+
+Before profile validation, relocation, registry work, restore-point work, O&O launch, or task changes, a production run requires all of the following:
+
+- An administrator-enforced `MachinePolicy` of `AllSigned`.
+- A valid Authenticode signature on `Install-OOShutUp10.ps1` and the adjacent `Install-OOShutUp10.release.psd1` manifest, signed by the same certificate.
+- The signer thumbprint to match `HKLM\SOFTWARE\Policies\myTech.Today\OOShutUp10\TrustedReleaseSignerThumbprint`.
+- A manifest with exactly `schemaVersion`, `scriptFile`, and `scriptSha256` fields whose digest matches the script bytes.
+
+The organization provisions the policy registry value and code-signing certificate outside this repository, and protects them with managed Windows policy. The certificate chain must be trusted and its public certificate must be in the machine's Trusted Publishers store. Release automation signs the script first, computes its SHA-256 over the final signed bytes, writes the manifest, then signs the manifest. The scheduled task uses the same signed release package and trust checks. The release manifest is copied and ACL-checked with the script during relocation. No private key or maintained release hash belongs in the repository.
+
+The release manifest is a PowerShell data file with exactly these fields:
+
+```powershell
+@{
+    schemaVersion = 1
+    scriptFile = 'Install-OOShutUp10.ps1'
+    scriptSha256 = '<64 hexadecimal characters for the final signed script>'
+}
+```
+
+This checkout does not include a signed release manifest, signing certificate, or machine trust policy. `install.bat` therefore fails closed when launched from this checkout. For local development only, run the source checkout directly with `-DevelopmentMode`; it verifies a `.git` marker and warns that the source is not release-authenticated. That path may still apply the reviewed profile, but it never relocates the checkout or registers a scheduled task:
+
+```powershell
+pwsh.exe -NoProfile -ExecutionPolicy Bypass -File ".\Install-OOShutUp10.ps1" -DevelopmentMode
+```
+
+Windows PowerShell 5.1 can use the same development-only flow:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\Install-OOShutUp10.ps1" -DevelopmentMode
+```
+
+Use that development path only on a disposable test machine with a harmless approved profile. It exits with partial setup because no task was registered.
 
 ## Usage
 
@@ -151,7 +190,7 @@ Run the script as Administrator in CMD:
 <drive>:\path\to\script\install.bat
 ```
 
-The batch wrapper starts PowerShell 7 (`pwsh`) with `-ExecutionPolicy Bypass` for that child process. Use it only when your organization's policy permits that launch. The wrapper does not change stored policy values, and Group Policy can still block the launch.
+The batch wrapper starts PowerShell 7 (`pwsh`) with `-ExecutionPolicy AllSigned`. A production launch also requires the signed release package and organization-managed trust settings described above. An unsigned checkout is not a production package.
 
 If PowerShell 7 is missing, an interactive launch calls WinGet without agreement-acceptance flags so WinGet can show its source and package terms. A launch with redirected input fails closed unless you separately reviewed both agreements and set `MYTECH_ACCEPT_WINGET_AGREEMENTS=YES`. When set on a launch that needs WinGet, this variable passes both acceptance flags and skips those WinGet prompts:
 
@@ -163,17 +202,19 @@ set "MYTECH_ACCEPT_WINGET_AGREEMENTS="
 
 The consent variable is independent of the selected package. Without it, unattended installation stops before WinGet runs. Agreement rejection is not retried, and WinGet's native failure code is returned. If a non-agreement WinGet failure leaves package state uncertain, inspect it first with `winget list --id Microsoft.PowerShell --exact`; if removal is appropriate, uninstall it manually with `winget uninstall --id Microsoft.PowerShell --exact --source winget`. The launcher does not automatically remove a package.
 
-To launch directly from an elevated CMD prompt, use the engine approved for your environment. These process-scoped examples work with Windows PowerShell 5.1 and PowerShell 7, respectively:
+For a configured production release, launch directly from an elevated CMD prompt with the engine approved for your environment:
 
 ```cmd
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<drive>:\path\to\script\Install-OOShutUp10.ps1"
+powershell.exe -NoProfile -ExecutionPolicy AllSigned -File "<drive>:\path\to\script\Install-OOShutUp10.ps1"
 ```
 
 ```cmd
-pwsh.exe -NoProfile -ExecutionPolicy Bypass -File "<drive>:\path\to\script\Install-OOShutUp10.ps1"
+pwsh.exe -NoProfile -ExecutionPolicy AllSigned -File "<drive>:\path\to\script\Install-OOShutUp10.ps1"
 ```
 
 ### What Happens During Installation
+
+These steps run only after an owner-reviewed profile pair passes validation. A clean checkout stops at the profile check described above.
 
 1. ✅ Validates the selected profile and confirms the impact summary
 2. ✅ Checks if O&O ShutUp10++ is already installed and downloads it if needed
@@ -235,7 +276,7 @@ The task triggers only on Windows Update Client **event ID 19** (installation su
 - **Delay**: 2 minutes after the successful installation event
 - **Overlapping runs**: Queued and run sequentially
 - **Execution**: Hidden PowerShell window (no user interaction)
-- **Command**: the canonical absolute Windows PowerShell 5.1 executable under `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`, followed by `-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "<ScriptPath>" -ReapplyOnly -SkipRelocate -NonInteractive -ApprovedOOSExecutablePath "<ManagedOOSPath>" -ApprovedProfileSha256 "<PinnedProfileSHA256>" -ApprovedProfileManifestSha256 "<PinnedManifestSHA256>"`
+- **Command**: the canonical absolute Windows PowerShell 5.1 executable under `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`, followed by `-NoProfile -ExecutionPolicy AllSigned -WindowStyle Hidden -File "<ScriptPath>" -ReapplyOnly -SkipRelocate -NonInteractive -ApprovedOOSExecutablePath "<ManagedOOSPath>" -ApprovedProfileSha256 "<PinnedProfileSHA256>" -ApprovedProfileManifestSha256 "<PinnedManifestSHA256>"`
 - **Working directory**: the directory containing `<ScriptPath>`
 
 Before creating or replacing the task, the installer confirms the Windows PowerShell file is in the expected system directory, has Microsoft Windows PowerShell product metadata, a valid Microsoft Windows Authenticode signature, and protected system ACLs. A 32-bit caller on 64-bit Windows checks the native binary through `Sysnative`, then stores its canonical `System32` path in the task. The verifier repeats these checks and requires the task action to match that exact path.
@@ -355,7 +396,7 @@ If the lookup fails, the task is absent, or multiple matches are returned, the c
 
 ### Initial Installation Flow
 
-1. Validate the profile and show its impact summary. A rejection or cancellation stops before relocation or system changes.
+1. Verify the signed PowerShell source and release manifest, then validate the profile and show its impact summary. An untrusted source, rejection, or cancellation stops before relocation or system changes.
 2. Check for O&O ShutUp10++ and download it from the official source if needed.
 3. Attempt a system restore point.
 4. Apply the approved profile quietly.
@@ -443,16 +484,16 @@ Before applying the profile, the script attempts to create a Windows restore poi
 
 If the launch is blocked, stop. Do not change a stored execution policy or retry with a broader scope. Use this guidance:
 
-> PowerShell policy blocks this script. No policy was changed; use an approved signed or process-scoped launch.
+> PowerShell policy blocks this production launch. No policy was changed; restore a trusted signed release or use -DevelopmentMode only from a source checkout.
 
-If Group Policy blocks the script, contact your administrator for an approved signed script or launch method. A process-scoped option cannot override Group Policy.
+For production, stop and contact your administrator for the complete signed release package and managed trust settings. Do not retry a production package with `Bypass`. For a source checkout on a disposable test machine, use the explicitly documented `-DevelopmentMode` command; it may apply the approved profile and does not create a scheduled task.
 
 ### Path Contains Special Characters Error
 
-If you get an ampersand error, use the call operator:
+If you get an ampersand error in a source checkout, use the call operator and explicit development mode:
 
 ```powershell
-& "Q:\_kyle\temp_documents\GitHub\PowerShellScripts\OO\Install-OOShutUp10.ps1"
+& "Q:\_kyle\temp_documents\GitHub\PowerShellScripts\OO\Install-OOShutUp10.ps1" -DevelopmentMode
 ```
 
 ### Scheduled Task Not Triggering

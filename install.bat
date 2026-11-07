@@ -79,7 +79,7 @@ echo.
 echo [INFO] Running O^&O ShutUp10 Installer...
 echo.
 
-pwsh -NoProfile -ExecutionPolicy Bypass -File "%~dp0Install-OOShutUp10.ps1" %*
+pwsh -NoProfile -ExecutionPolicy AllSigned -File "%~dp0Install-OOShutUp10.ps1" %*
 set "INSTALLER_EXIT_CODE=!ERRORLEVEL!"
 
 echo.
@@ -89,6 +89,8 @@ if "!INSTALLER_EXIT_CODE!"=="0" (
     echo [WARN] Setup is partial. Repair the update task before relying on automatic reapplication.
 ) else (
     echo [ERROR] Installer failed with exit code !INSTALLER_EXIT_CODE!.
+    echo Production launch requires an authorized signed release package and organization-enforced AllSigned policy.
+    echo For a Git source checkout only, see README.md for the explicit -DevelopmentMode command.
 )
 
 pause

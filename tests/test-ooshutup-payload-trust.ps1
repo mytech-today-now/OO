@@ -25,6 +25,12 @@ $script:SnapshotFailureProfile = $null
 $script:DownloadScenario = 'valid'
 $script:DownloadCount = 0
 $script:SignatureCallCount = 0
+$script:ReleaseSignatureByPath = @{}
+$script:MockTrustedReleaseSignerThumbprint = 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+$script:MockEnforcedExecutionPolicy = 'AllSigned'
+$script:MockUserExecutionPolicy = 'Undefined'
+$script:MockMachineTrustedPublisher = $true
+$script:OOShutUpReleaseManifestFileName = 'Install-OOShutUp10.release.psd1'
 $script:MockExitCode = 0
 $script:MockChildWaitScenario = 'fast-exit'
 $script:MockChildWaitTimeoutMilliseconds = 0
@@ -101,6 +107,16 @@ function Assert-Equal {
     $script:AssertionCount++
 }
 
+function Assert-InvalidProfileStopsBeforeTaskMutation {
+    param([string]$Name)
+
+    $lookupsBefore = $script:ScheduledTaskLookupCount
+    $registrationsBefore = $script:TaskRegistrationCalls.Count
+    Assert-Equal $false (New-WindowsUpdateScheduledTask -ScriptPath (Join-Path $script:FixtureRoot 'unused-invalid-profile.ps1') -ApprovedProfileSha256 ('0' * 64) -ApprovedProfileManifestSha256 ('0' * 64)) "$Name profile pair blocks task setup"
+    Assert-Equal $lookupsBefore $script:ScheduledTaskLookupCount "$Name profile pair blocks before task lookup"
+    Assert-Equal $registrationsBefore $script:TaskRegistrationCalls.Count "$Name profile pair blocks before task registration"
+}
+
 function Test-WindowsUpdateClientProviderMetadata {
     try {
         $events = @((Get-WinEvent -ListProvider 'Microsoft-Windows-WindowsUpdateClient' -ErrorAction Stop).Events)
@@ -136,11 +152,28 @@ function Write-TestPayload {
 }
 
 function New-MockSigner {
-    param([string]$Name)
+    param(
+        [string]$Name,
+        [string]$Thumbprint = 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+    )
 
-    $certificate = [pscustomobject]@{ SimpleName = $Name }
+    $certificate = [pscustomobject]@{ SimpleName = $Name; Thumbprint = $Thumbprint }
     $certificate | Add-Member -MemberType ScriptMethod -Name GetNameInfo -Value { return $this.SimpleName } -Force
     return $certificate
+}
+
+function Get-ExecutionPolicy {
+    [CmdletBinding()]
+    param([switch]$List)
+
+    if (-not $List) {
+        return $script:MockEnforcedExecutionPolicy
+    }
+
+    return @(
+        [pscustomobject]@{ Scope = 'MachinePolicy'; ExecutionPolicy = $script:MockEnforcedExecutionPolicy }
+        [pscustomobject]@{ Scope = 'UserPolicy'; ExecutionPolicy = $script:MockUserExecutionPolicy }
+    )
 }
 
 function Write-Log {
@@ -176,6 +209,10 @@ function Get-AuthenticodeSignature {
     param([string]$FilePath)
 
     $script:SignatureCallCount++
+    $canonicalPath = [System.IO.Path]::GetFullPath($FilePath)
+    if ($script:ReleaseSignatureByPath.ContainsKey($canonicalPath)) {
+        return $script:ReleaseSignatureByPath[$canonicalPath]
+    }
     if ([string]$FilePath -match '(?i)\\WindowsPowerShell\\v1\.0\\powershell\.exe$') {
         if ($script:MockWindowsPowerShellSignatureMode -eq 'WrongPublisher') {
             return [pscustomobject]@{ Status = 'Valid'; SignerCertificate = (New-MockSigner 'Other Publisher') }
@@ -603,13 +640,37 @@ try {
     Assert-Equal 0 @($parseErrors).Count 'the installer parses in the active PowerShell engine'
 
     $source = Get-Content -LiteralPath $scriptPath -Raw
+    $readmeSource = Get-Content -LiteralPath (Join-Path $repoRoot 'README.md') -Raw
     $installerBatchSource = Get-Content -LiteralPath (Join-Path $repoRoot 'install.bat') -Raw
+    $startupIntegrityIndex = $source.IndexOf('$script:OOShutUpSourceIntegrityResult = Test-OOShutUpSourceIntegrity', [System.StringComparison]::Ordinal)
+    $startupFailureCheckIndex = $source.IndexOf('if (-not $script:OOShutUpSourceIntegrityResult.Allowed)', $startupIntegrityIndex, [System.StringComparison]::Ordinal)
+    $startupFailureExitIndex = if ($startupFailureCheckIndex -ge 0) { $source.IndexOf('exit 1', $startupFailureCheckIndex, [System.StringComparison]::Ordinal) } else { -1 }
+    $repositoryHelperLoadIndex = $source.IndexOf('. (Join-Path $script:_RepoRoot', [System.StringComparison]::Ordinal)
+    $mainScriptStart = $source.IndexOf('#region Main Script', [System.StringComparison]::Ordinal)
+    Assert-True ($startupIntegrityIndex -gt 0 -and $startupFailureCheckIndex -gt $startupIntegrityIndex -and $startupFailureExitIndex -gt $startupFailureCheckIndex -and $startupFailureExitIndex -lt $repositoryHelperLoadIndex -and $mainScriptStart -gt $repositoryHelperLoadIndex) 'untrusted source exits before repository helpers, relocation, or the main installer flow'
+    foreach ($protectedOperation in @(
+        'function Get-ScriptRelocationPackageTarget',
+        'function Set-RestorePointFrequencyRawValue',
+        'function Install-OOShutUp',
+        'function Invoke-OOShutUpConfigurationWithRestorePointGate',
+        'function Invoke-OOShutUpTaskSetup',
+        'Register-ScheduledTask -TaskName'
+    )) {
+        $protectedOperationIndex = $source.IndexOf($protectedOperation, [System.StringComparison]::Ordinal)
+        Assert-True ($protectedOperationIndex -gt $startupFailureExitIndex) "the integrity failure exit precedes $protectedOperation"
+    }
+    Assert-True ($source.Contains("'SOFTWARE\Policies\myTech.Today\OOShutUp10'") -and $source.Contains("'TrustedReleaseSignerThumbprint'")) 'the production signing trust pin is read from the external machine policy key'
+    Assert-True ($source.Contains('X509Store') -and $source.Contains('StoreName]::TrustedPublisher') -and $source.Contains('StoreLocation]::LocalMachine')) 'production validation requires the pinned signer in the machine Trusted Publishers store'
+    Assert-True ($source.Contains('Import-PowerShellDataFile -Path $ReleaseManifestPath') -and $source.Contains('Get-AuthenticodeSignature -FilePath $ReleaseManifestPath') -and $source.Contains('Get-AuthenticodeSignature -FilePath $ScriptPath')) 'production validation checks signed release metadata and the script signature'
+    Assert-True ($source.Contains('if (-not $DevelopmentMode -and -not $SkipRelocate)') -and $source.Contains('Development mode does not register a scheduled task')) 'development mode avoids relocation and scheduled-task registration'
+    Assert-True ($installerBatchSource.Contains('-ExecutionPolicy AllSigned') -and $installerBatchSource -notmatch '-ExecutionPolicy Bypass') 'the batch production launcher requests signed scripts'
     Assert-True ($source.Contains('$DownloadUrl = "https://dl5.oo-software.com/files/ooshutup10/OOSU10.exe"')) 'the official vendor download URL is preserved'
     $versionPolicy = '$MinimumOOShutUpVersion = [version]' + [char]39 + '3.6.1135' + [char]39
     Assert-True ($source.Contains($versionPolicy)) 'the supported version floor is explicit'
     Assert-True ($source.Contains('Get-AuthenticodeSignature -FilePath $Path')) 'Authenticode is checked before accepting a payload'
     Assert-True ($source.Contains('The O&O download could not be authenticated. No executable was started; verify the vendor signature before retrying.')) 'the required authentication fallback is present'
     Assert-True ($source.Contains('The approved settings profile is missing or invalid. No privacy settings were applied; place the reviewed profile in the configured directory.')) 'the required profile fallback is present'
+    Assert-True ($readmeSource.Contains('Configuration is unavailable from a clean checkout.') -and $readmeSource.Contains('the `profiles/` directory contains only `README.md`') -and $readmeSource.Contains('No default settings are included or implied.')) 'the README clearly labels the clean-checkout profile blocker'
     Assert-True ($source.Contains('The task profile contains settings with unknown user scope. Reapplication was skipped; review the profile scope before retrying.')) 'unknown scope has the required fail-closed status'
     Assert-True ($source.Contains('The SYSTEM task target ACL could not be verified. No task was registered; move the script to a protected path and retry.')) 'the required task ACL fallback is present'
     Assert-True ($installerBatchSource.Contains('set "INSTALLER_EXIT_CODE=!ERRORLEVEL!"') -and $installerBatchSource.Contains('exit /b !INSTALLER_EXIT_CODE!')) 'the batch wrapper preserves the PowerShell installer exit code'
@@ -619,6 +680,22 @@ try {
     Assert-True ($source.Contains('The task security descriptor could not be verified. No new task was enabled; inspect task permissions before retrying.')) 'task descriptor failures use the exact required fallback'
     Assert-True ($source.Contains("O:BAG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)")) 'the task descriptor allowlist is explicit for SYSTEM and Administrators'
     Assert-True ($source.Contains('-RequireMachineScope:$ReapplyOnly')) 'ReapplyOnly validates machine scope before later work'
+    $mainScriptStart = $source.IndexOf('#region Main Script', [System.StringComparison]::Ordinal)
+    Assert-True ($mainScriptStart -ge 0) 'the main installer entry point exists'
+    $mainScriptSource = $source.Substring($mainScriptStart)
+    $profileValidationIndex = $mainScriptSource.IndexOf('$approvedProfile = Get-OOShutUpApprovedProfile', [System.StringComparison]::Ordinal)
+    $missingProfileGuardIndex = $mainScriptSource.IndexOf('if ($null -eq $approvedProfile)', [System.StringComparison]::Ordinal)
+    $missingProfileExitIndex = if ($missingProfileGuardIndex -ge 0) { $mainScriptSource.IndexOf('exit 1', $missingProfileGuardIndex, [System.StringComparison]::Ordinal) } else { -1 }
+    Assert-True ($profileValidationIndex -ge 0 -and $missingProfileGuardIndex -gt $profileValidationIndex -and $missingProfileExitIndex -gt $missingProfileGuardIndex) 'the main entry point exits when profile validation fails'
+    foreach ($sideEffectMarker in @(
+        'Get-ScriptRelocationPackageTarget',
+        'Install-OOShutUp',
+        'Invoke-OOShutUpConfigurationWithRestorePointGate',
+        'Invoke-OOShutUpTaskSetup'
+    )) {
+        $sideEffectIndex = $mainScriptSource.IndexOf($sideEffectMarker, [System.StringComparison]::Ordinal)
+        Assert-True ($sideEffectIndex -gt $missingProfileExitIndex) "the main entry point defers $sideEffectMarker until after profile validation"
+    }
     Assert-True ($source.Contains('Scope declarations and evidence references are reviewer claims; the validator does not authenticate their source or observe registry changes.')) 'interactive approval states the limits of scope and evidence validation'
     Assert-True ($source.Contains('Before approving a SYSTEM profile, verify every setting against current O&O information and its disposable two-account registry record. Omit any entry with unconfirmed scope.')) 'interactive approval requires current product and two-account evidence review'
     Assert-True ($source.Contains("Join-Path `$PSScriptRoot 'profiles'")) 'the profile package path is rooted beside the script'
@@ -632,6 +709,11 @@ try {
     Assert-True ($source -notmatch '(?m)Start-Process[^\r\n]*-Wait') 'the O&O child is started without an unbounded Start-Process wait'
 
     $requiredFunctions = @(
+        'Get-OOShutUpTrustedReleaseSignerThumbprint',
+        'Test-OOShutUpEnforcedAllSignedPolicy',
+        'Test-OOShutUpMachineTrustedPublisher',
+        'Test-OOShutUpSourceCheckout',
+        'Test-OOShutUpSourceIntegrity',
         'New-OOShutUpMutationMutex',
         'Open-OOShutUpMutationMutex',
         'Release-OOShutUpMutationMutex',
@@ -689,6 +771,146 @@ try {
         Assert-True ($null -ne $functionAst) "the $name function exists"
         . ([scriptblock]::Create($functionAst.Extent.Text))
     }
+
+    function Get-OOShutUpTrustedReleaseSignerThumbprint {
+        if ([string]$script:MockTrustedReleaseSignerThumbprint -notmatch '^[A-Fa-f0-9]{40}$') {
+            throw 'The mocked machine release signer policy is missing or malformed.'
+        }
+        return ([string]$script:MockTrustedReleaseSignerThumbprint).ToUpperInvariant()
+    }
+
+    function Test-OOShutUpMachineTrustedPublisher {
+        param([string]$Thumbprint)
+        return [bool]$script:MockMachineTrustedPublisher
+    }
+
+    function Write-ReleaseManifestFixture {
+        param(
+            [Parameter(Mandatory = $true)]
+            [string]$Path,
+
+            [Parameter(Mandatory = $true)]
+            [string]$ScriptDigest
+        )
+
+        $manifestText = @"
+@{
+    schemaVersion = 1
+    scriptFile = 'Install-OOShutUp10.ps1'
+    scriptSha256 = '$ScriptDigest'
+}
+"@
+        [System.IO.File]::WriteAllText($Path, $manifestText, (New-Object System.Text.UTF8Encoding($false)))
+    }
+
+    $releaseFixtureRoot = Join-Path $script:FixtureRoot 'release-integrity'
+    [System.IO.Directory]::CreateDirectory($releaseFixtureRoot) | Out-Null
+    [System.IO.Directory]::CreateDirectory((Join-Path $releaseFixtureRoot '.git')) | Out-Null
+    $releaseScriptPath = Join-Path $releaseFixtureRoot 'Install-OOShutUp10.ps1'
+    $releaseManifestPath = Join-Path $releaseFixtureRoot 'Install-OOShutUp10.release.psd1'
+    [System.IO.File]::WriteAllText($releaseScriptPath, 'trusted installer fixture', (New-Object System.Text.UTF8Encoding($false)))
+    $releaseScriptDigest = (Get-FileHash -LiteralPath $releaseScriptPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    Write-ReleaseManifestFixture -Path $releaseManifestPath -ScriptDigest $releaseScriptDigest
+    $releaseSignerThumbprint = 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+    $releaseSigner = New-MockSigner -Name 'Approved Release Publisher' -Thumbprint $releaseSignerThumbprint
+    $script:ReleaseSignatureByPath[[System.IO.Path]::GetFullPath($releaseScriptPath)] = [pscustomobject]@{
+        Status = 'Valid'
+        SignerCertificate = $releaseSigner
+    }
+    $script:ReleaseSignatureByPath[[System.IO.Path]::GetFullPath($releaseManifestPath)] = [pscustomobject]@{
+        Status = 'Valid'
+        SignerCertificate = $releaseSigner
+    }
+    $script:MockTrustedReleaseSignerThumbprint = $releaseSignerThumbprint
+    $script:MockMachineTrustedPublisher = $true
+    $script:MockEnforcedExecutionPolicy = 'AllSigned'
+
+    $trustedRelease = Test-OOShutUpSourceIntegrity -ScriptPath $releaseScriptPath
+    Assert-Equal $true $trustedRelease.Allowed 'a signed source and matching signed manifest from the configured publisher pass'
+    Assert-Equal 'Production' $trustedRelease.Mode 'a trusted release is classified as production'
+
+    $signatureCallsBeforeUnsigned = $script:SignatureCallCount
+    $script:ReleaseSignatureByPath[[System.IO.Path]::GetFullPath($releaseScriptPath)] = [pscustomobject]@{
+        Status = 'NotSigned'
+        SignerCertificate = $null
+    }
+    $unsignedRelease = Test-OOShutUpSourceIntegrity -ScriptPath $releaseScriptPath -ReleaseManifestPath $releaseManifestPath
+    Assert-Equal $false $unsignedRelease.Allowed 'an unsigned installer source is rejected'
+    Assert-True ($unsignedRelease.Message.Contains('signature is missing or invalid')) 'unsigned source rejection explains the failed signature check'
+    Assert-True ($script:SignatureCallCount -gt $signatureCallsBeforeUnsigned) 'unsigned fixture reaches only signature validation'
+
+    [System.IO.File]::WriteAllText($releaseScriptPath, 'modified installer fixture', (New-Object System.Text.UTF8Encoding($false)))
+    $script:ReleaseSignatureByPath[[System.IO.Path]::GetFullPath($releaseScriptPath)] = [pscustomobject]@{
+        Status = 'HashMismatch'
+        SignerCertificate = $releaseSigner
+    }
+    $modifiedRelease = Test-OOShutUpSourceIntegrity -ScriptPath $releaseScriptPath -ReleaseManifestPath $releaseManifestPath
+    Assert-Equal $false $modifiedRelease.Allowed 'a modified installer source with a broken Authenticode signature is rejected'
+
+    [System.IO.File]::WriteAllText($releaseScriptPath, 'trusted installer fixture', (New-Object System.Text.UTF8Encoding($false)))
+    $wrongPublisher = New-MockSigner -Name 'Wrong Release Publisher' -Thumbprint ('B' * 40)
+    $script:ReleaseSignatureByPath[[System.IO.Path]::GetFullPath($releaseScriptPath)] = [pscustomobject]@{
+        Status = 'Valid'
+        SignerCertificate = $wrongPublisher
+    }
+    $wrongPublisherRelease = Test-OOShutUpSourceIntegrity -ScriptPath $releaseScriptPath -ReleaseManifestPath $releaseManifestPath
+    Assert-Equal $false $wrongPublisherRelease.Allowed 'a valid signature from the wrong publisher is rejected'
+    Assert-True ($wrongPublisherRelease.Message.Contains('publisher does not match')) 'wrong-publisher rejection identifies the trust mismatch'
+
+    $script:ReleaseSignatureByPath[[System.IO.Path]::GetFullPath($releaseScriptPath)] = [pscustomobject]@{
+        Status = 'Valid'
+        SignerCertificate = $releaseSigner
+    }
+    $missingManifestPath = Join-Path $releaseFixtureRoot 'missing.release.psd1'
+    $missingManifest = Test-OOShutUpSourceIntegrity -ScriptPath $releaseScriptPath -ReleaseManifestPath $missingManifestPath
+    Assert-Equal $false $missingManifest.Allowed 'a missing release manifest is rejected'
+    Assert-True ($missingManifest.Message.Contains('release manifest is missing')) 'missing manifest rejection is actionable'
+
+    [System.IO.File]::WriteAllText($releaseManifestPath, "@{`r`n schemaVersion = 1`r`n", (New-Object System.Text.UTF8Encoding($false)))
+    $script:ReleaseSignatureByPath[[System.IO.Path]::GetFullPath($releaseManifestPath)] = [pscustomobject]@{
+        Status = 'HashMismatch'
+        SignerCertificate = $releaseSigner
+    }
+    $tamperedManifest = Test-OOShutUpSourceIntegrity -ScriptPath $releaseScriptPath -ReleaseManifestPath $releaseManifestPath
+    Assert-Equal $false $tamperedManifest.Allowed 'tampered signed release metadata is rejected'
+
+    Write-ReleaseManifestFixture -Path $releaseManifestPath -ScriptDigest ('0' * 64)
+    $script:ReleaseSignatureByPath[[System.IO.Path]::GetFullPath($releaseManifestPath)] = [pscustomobject]@{
+        Status = 'Valid'
+        SignerCertificate = $releaseSigner
+    }
+    $corruptDigest = Test-OOShutUpSourceIntegrity -ScriptPath $releaseScriptPath -ReleaseManifestPath $releaseManifestPath
+    Assert-Equal $false $corruptDigest.Allowed 'signed but mismatched release digest metadata is rejected'
+
+    Write-ReleaseManifestFixture -Path $releaseManifestPath -ScriptDigest $releaseScriptDigest
+    $script:MockTrustedReleaseSignerThumbprint = ''
+    $missingTrustPin = Test-OOShutUpSourceIntegrity -ScriptPath $releaseScriptPath -ReleaseManifestPath $releaseManifestPath
+    Assert-Equal $false $missingTrustPin.Allowed 'missing external signer trust metadata is rejected'
+    $script:MockTrustedReleaseSignerThumbprint = $releaseSignerThumbprint
+
+    $script:MockMachineTrustedPublisher = $false
+    $missingMachinePublisher = Test-OOShutUpSourceIntegrity -ScriptPath $releaseScriptPath -ReleaseManifestPath $releaseManifestPath
+    Assert-Equal $false $missingMachinePublisher.Allowed 'a signer missing from LocalMachine Trusted Publishers is rejected'
+    $script:MockMachineTrustedPublisher = $true
+
+    $script:MockEnforcedExecutionPolicy = 'RemoteSigned'
+    $script:MockUserExecutionPolicy = 'AllSigned'
+    $signatureCallsBeforePolicyFailure = $script:SignatureCallCount
+    $unenforcedPolicy = Test-OOShutUpSourceIntegrity -ScriptPath $releaseScriptPath -ReleaseManifestPath $releaseManifestPath
+    Assert-Equal $false $unenforcedPolicy.Allowed 'UserPolicy AllSigned without machine-enforced AllSigned is rejected'
+    Assert-Equal $signatureCallsBeforePolicyFailure $script:SignatureCallCount 'missing machine policy fails before signature or package operations'
+    $script:MockEnforcedExecutionPolicy = 'AllSigned'
+    $script:MockUserExecutionPolicy = 'Undefined'
+
+    $developmentRelease = Test-OOShutUpSourceIntegrity -ScriptPath $releaseScriptPath -DevelopmentMode
+    Assert-Equal $true $developmentRelease.Allowed 'explicit development mode is available inside a Git source checkout'
+    Assert-Equal 'Development' $developmentRelease.Mode 'an unsigned source checkout is clearly classified as development'
+    $nonCheckoutScript = Join-Path $script:FixtureRoot 'outside-checkout.ps1'
+    [System.IO.File]::WriteAllText($nonCheckoutScript, 'untrusted fixture', (New-Object System.Text.UTF8Encoding($false)))
+    $developmentOutsideCheckout = Test-OOShutUpSourceIntegrity -ScriptPath $nonCheckoutScript -DevelopmentMode
+    Assert-Equal $false $developmentOutsideCheckout.Allowed 'development mode is refused outside a Git source checkout'
+    $developmentReapply = Test-OOShutUpSourceIntegrity -ScriptPath $releaseScriptPath -DevelopmentMode -ReapplyOnly
+    Assert-Equal $false $developmentReapply.Allowed 'development mode cannot be used by the unattended task entry point'
 
     $childWaitSource = [string](@($functionAsts | Where-Object { $_.Name -eq 'Wait-OOShutUpChildProcess' })[0].Extent.Text)
     $configurationSource = [string](@($functionAsts | Where-Object { $_.Name -eq 'Invoke-OOShutUpConfigurationCore' })[0].Extent.Text)
@@ -1514,6 +1736,7 @@ try {
         Assert-Equal $null (Get-OOShutUpApprovedProfile) "$($case.Name) profile is rejected"
         Assert-Equal 'Failed' (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture).State "$($case.Name) profile prevents configuration"
         Assert-Equal $startedBefore $script:StartedPaths.Count "$($case.Name) profile causes no process launch"
+        Assert-InvalidProfileStopsBeforeTaskMutation -Name $case.Name
     }
 
     Write-ApprovedProfileFixture -Content "S003`t+`r`n" -AllowedSettingIds @('S003')
@@ -1649,6 +1872,7 @@ try {
     Assert-Equal $null (Get-OOShutUpApprovedProfile) 'a digest-mismatched profile is rejected'
     Assert-Equal 'Failed' (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture).State 'a digest mismatch prevents configuration'
     Assert-Equal $startedBeforeDigestMismatch $script:StartedPaths.Count 'a digest mismatch causes no process launch'
+    Assert-InvalidProfileStopsBeforeTaskMutation -Name 'digest-mismatched'
 
     Write-ApprovedProfileFixture -Content "S003`t+`r`n" -AllowedSettingIds @('S003')
     [System.IO.File]::WriteAllText($script:OOShutUpProfileManifestPath, '{ invalid json')
@@ -1656,12 +1880,22 @@ try {
     Assert-Equal $null (Get-OOShutUpApprovedProfile) 'a malformed approval manifest is rejected'
     Assert-Equal 'Failed' (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture).State 'a malformed manifest prevents configuration'
     Assert-Equal $startedBeforeMalformedManifest $script:StartedPaths.Count 'a malformed manifest causes no process launch'
+    Assert-InvalidProfileStopsBeforeTaskMutation -Name 'malformed manifest'
 
     Remove-Item -LiteralPath $script:OOShutUpProfilePath -Force
     $startedBeforeMissingProfile = $script:StartedPaths.Count
     Assert-Equal $null (Get-OOShutUpApprovedProfile) 'a missing profile is rejected'
     Assert-Equal 'Failed' (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture).State 'a missing profile prevents configuration'
     Assert-Equal $startedBeforeMissingProfile $script:StartedPaths.Count 'a missing profile causes no process launch'
+    Assert-InvalidProfileStopsBeforeTaskMutation -Name 'missing profile'
+
+    Write-ApprovedProfileFixture -Content "S003`t+`r`n" -AllowedSettingIds @('S003')
+    Remove-Item -LiteralPath $script:OOShutUpProfileManifestPath -Force
+    $startedBeforeMissingManifest = $script:StartedPaths.Count
+    Assert-Equal $null (Get-OOShutUpApprovedProfile) 'a missing approval manifest is rejected'
+    Assert-Equal 'Failed' (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture).State 'a missing manifest prevents configuration'
+    Assert-Equal $startedBeforeMissingManifest $script:StartedPaths.Count 'a missing manifest causes no process launch'
+    Assert-InvalidProfileStopsBeforeTaskMutation -Name 'missing manifest'
 
     Write-ApprovedProfileFixture -Content "# Reviewed fixture`r`nS003`t+`r`nM003;-`r`n" -AllowedSettingIds @('S003', 'M003')
 

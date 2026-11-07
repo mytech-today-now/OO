@@ -139,7 +139,7 @@ try {
     $testBatch = $testBatch.Replace('net session >nul 2>&1', 'call net session >nul 2>&1')
     $testBatch = [System.Text.RegularExpressions.Regex]::Replace($testBatch, '(?m)^    winget install ', '    call winget install ')
     $testBatch = $testBatch.Replace('powershell -Command ', 'call powershell -Command ')
-    $testBatch = $testBatch.Replace('pwsh -NoProfile -ExecutionPolicy Bypass -File', 'call pwsh -NoProfile -ExecutionPolicy Bypass -File')
+    $testBatch = $testBatch.Replace('pwsh -NoProfile -ExecutionPolicy AllSigned -File', 'call pwsh -NoProfile -ExecutionPolicy AllSigned -File')
     [System.IO.File]::WriteAllText($batchPath, $testBatch, [System.Text.Encoding]::ASCII)
 
     $fakeCommands = @{

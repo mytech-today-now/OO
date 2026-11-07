@@ -62,7 +62,7 @@ $batchPath = Join-Path $repoRoot 'install.bat'
 $readme = [System.IO.File]::ReadAllText($readmePath)
 $installer = [System.IO.File]::ReadAllText($installerPath)
 $batch = [System.IO.File]::ReadAllText($batchPath)
-$fallback = 'PowerShell policy blocks this script. No policy was changed; use an approved signed or process-scoped launch.'
+$fallback = 'PowerShell policy blocks this production launch. No policy was changed; restore a trusted signed release or use -DevelopmentMode only from a source checkout.'
 
 $instructionExtensions = @('.md', '.ps1', '.bat', '.cmd', '.sh', '.html', '.txt')
 $directoryStack = New-Object System.Collections.Stack
@@ -109,11 +109,11 @@ Assert-True ($readme.Contains('MachinePolicy` and `UserPolicy`') -and $readme.Co
 Assert-True ($installer.Contains('MachinePolicy and UserPolicy Group Policy settings') -and $installer.Contains('Process takes precedence over CurrentUser and LocalMachine')) 'script help explains execution-policy precedence'
 Assert-True ($readme.Contains('powershell.exe -NoProfile -ExecutionPolicy Bypass -File')) 'README documents the Windows PowerShell 5.1 process-scoped launch'
 Assert-True ($readme.Contains('pwsh.exe -NoProfile -ExecutionPolicy Bypass -File')) 'README documents the PowerShell 7 process-scoped launch'
-Assert-True ($readme.Contains('Use it only when your organization''s policy permits that launch')) 'README makes process-scoped launch conditional on policy approval'
+Assert-True ($readme.Contains('That path may still apply the reviewed profile') -and $readme.Contains('never relocates the checkout or registers a scheduled task')) 'README labels the mutation and task limits of development mode'
 Assert-True ($installer.Contains('powershell.exe -NoProfile -ExecutionPolicy Bypass -File')) 'script help documents the Windows PowerShell 5.1 process-scoped launch'
 Assert-True ($installer.Contains('pwsh.exe -NoProfile -ExecutionPolicy Bypass -File')) 'script help documents the PowerShell 7 process-scoped launch'
-Assert-True ($installer.Contains('must only be used when approved by your policy owner')) 'script help makes process-scoped launch conditional on policy approval'
-Assert-True ($batch -match '(?im)^pwsh -NoProfile -ExecutionPolicy Bypass -File ') 'batch wrapper uses a process-scoped PowerShell 7 launch'
+Assert-True ($installer.Contains('Development mode is available only for a Git source checkout') -and $installer.Contains('does not relocate the checkout or create a scheduled task')) 'script help limits unsigned execution to explicit checkout development mode'
+Assert-True ($batch -match '(?im)^pwsh -NoProfile -ExecutionPolicy AllSigned -File ') 'batch wrapper requires signed scripts for production launch'
 
 $windowsPowerShell = Get-Command powershell.exe -ErrorAction SilentlyContinue
 $powerShell7 = Get-Command pwsh.exe -ErrorAction SilentlyContinue
@@ -201,7 +201,7 @@ try {
         Assert-Equal 0 $batchProcess.ExitCode "install.bat exits successfully with the fake pwsh child ($batchOutput)"
         Assert-True (Test-Path -LiteralPath $batchCapturePath) 'install.bat invoked the fake pwsh launcher instead of the installer'
         $batchArguments = [System.IO.File]::ReadAllText($batchCapturePath)
-        Assert-True ($batchArguments.Contains('-NoProfile -ExecutionPolicy Bypass -File')) 'install.bat passes process-scoped Bypass to its fake PowerShell 7 child'
+        Assert-True ($batchArguments.Contains('-NoProfile -ExecutionPolicy AllSigned -File')) 'install.bat passes AllSigned to its fake PowerShell 7 child'
         Assert-True ($batchArguments.Contains('Install-OOShutUp10.ps1')) 'install.bat forwards the installer path to the fake PowerShell 7 child'
     }
     finally {
