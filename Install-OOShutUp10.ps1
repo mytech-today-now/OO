@@ -15,8 +15,9 @@
     6. Offer a graceful, cancellable restart only when O&O reports changed settings; force requires -ForceRestart
 
 .PARAMETER ReapplyOnly
-    If specified, only reapplies privacy settings without installation or task creation.
-    This is used by the scheduled task after Windows updates.
+    If specified, only reapplies the approved privacy settings without installation or task creation.
+    The scheduled task uses this after Windows Update success events. An administrator can also run it once
+    from the installed signed release to recover after a missed event or unavailable scheduled task.
 
 .PARAMETER NonInteractive
     Suppresses prompts only when both approved profile and manifest SHA-256 digests match. Redirected or unavailable
@@ -100,7 +101,7 @@
 
 .EXAMPLE
     .\Install-OOShutUp10.ps1 -ReapplyOnly
-    Only reapplies privacy settings (used by scheduled task)
+    Runs one approved-profile reapplication without installing O&O, creating a task, or restarting Windows.
 
 .LINK
     https://mytech.today
@@ -4578,7 +4579,7 @@ try {
     if ($ReapplyOnly) {
         Write-Log "=== O&O ShutUp10++ Post-Windows Update Reapplication ===" -Level INFO
         Write-Log " " -Level INFO
-        Write-Log "Running in ReapplyOnly mode (triggered by Windows Update)" -Level INFO
+        Write-Log "Running in ReapplyOnly mode (scheduled or operator initiated)" -Level INFO
 
         # Get executable path
         $exePath = Get-OOShutUpPath -ExpectedPath $ApprovedOOSExecutablePath

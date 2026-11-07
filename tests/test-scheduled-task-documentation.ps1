@@ -168,6 +168,16 @@ Assert-True ($readme.Contains('Do not remove a legacy or same-named task based o
 Assert-True ($readme.Contains('This removes only the registration')) 'README explains the removal effect'
 $historySection = Get-MarkdownSection -Heading 'Task History'
 Assert-True ($historySection.Contains(('`{0}`' -f $taskFullPath))) 'Task Scheduler history instructions name the exact registered task path'
+$reapplySection = Get-MarkdownSection -Heading 'Reapply Settings Only (Scheduled Task and Manual Recovery)'
+$manualRecoveryBlock = Get-FirstPowerShellBlock -Heading 'Reapply Settings Only (Scheduled Task and Manual Recovery)'
+$manualRecoveryCode = $manualRecoveryBlock.ToString()
+Assert-True ($reapplySection.Contains('If the success event was missed or Task Scheduler is unavailable')) 'README identifies the manual recovery conditions'
+Assert-True ($reapplySection.Contains('one operator-requested run, with no automatic retry')) 'README bounds recovery to one operator-requested run'
+Assert-True ($reapplySection.Contains('does not repair or verify the scheduled task')) 'README states the limit of manual recovery'
+Assert-True ($manualRecoveryCode.Contains('-ReapplyOnly')) 'manual recovery invokes only the guarded ReapplyOnly path'
+Assert-True ($manualRecoveryCode -notmatch '(?i)\b(Get|Start|Register|Unregister)-ScheduledTask\b') 'manual recovery does not depend on Task Scheduler commands'
+Assert-True ($readme.Contains('There is no startup or periodic trigger and no automatic retry')) 'README states the task has no automatic reconciliation trigger'
+Assert-True ($readme.Contains('The task does not coalesce distinct event records.')) 'README describes duplicate successful event behavior accurately'
 
 $commandCounts = @{
     'Get-ScheduledTask' = 0

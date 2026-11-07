@@ -121,6 +121,7 @@ This repository contains an installer framework for **O&O ShutUp10++**. It can a
 - **Automatically creates a scheduled task** that runs after Windows updates
 - Reapplies the approved profile after Windows Update reports a successful installation
 - Triggers only on Windows Update Client event 19, with a two-minute delay
+- Provides a one-shot `-ReapplyOnly` operator command if the event or scheduled task was missed; no startup or periodic retry is configured
 - Queues overlapping reapplications so a later successful update is not discarded
 
 ### ✅ **Comprehensive Logging**
@@ -237,15 +238,19 @@ The default restart does not use `Restart-Computer -Force`, so Windows and appli
 
 `-NonInteractive` always skips restarting, including when `-ForceRestart` is supplied.
 
-### Reapply Settings Only (Used by Scheduled Task)
+### Reapply Settings Only (Scheduled Task and Manual Recovery)
 
-The script can also run in "ReapplyOnly" mode, which only reapplies privacy settings without installation or task creation:
+`-ReapplyOnly` reuses the approved-profile, machine-scope, digest, and managed-executable checks, then runs O&O once and exits. It does not install O&O, register or change a scheduled task, or request a restart.
+
+If the success event was missed or Task Scheduler is unavailable, an administrator can run one manual recovery from the installed signed release. Open an interactive elevated PowerShell 5.1 window in that release directory and run:
 
 ```powershell
 .\Install-OOShutUp10.ps1 -ReapplyOnly
 ```
 
-This mode is automatically used by the scheduled task after Windows updates.
+The command validates the current profile and asks for approval when an interactive approval is needed. If approval is declined or a validation fails, no O&O process is started. Do not use a source checkout or `-DevelopmentMode` for this recovery path. A redirected console is treated as non-interactive and requires both exact approved profile and manifest SHA-256 digests.
+
+This is one operator-requested run, with no automatic retry. The shared mutation lock waits at most ten minutes; the O&O child wait is limited to fifteen minutes. If either bound is reached, inspect the status, logs, O&O Undo History, and current settings before retrying. Check Task Scheduler history first when it is available so a successful event-triggered run is not repeated unnecessarily. This command does not repair or verify the scheduled task; rerun the installer and verify the exact task separately when Task Scheduler is available.
 
 ## Scheduled Task Details
 
@@ -270,12 +275,14 @@ Reapplies the approved O&O ShutUp10++ profile after successful Windows Update in
 ### Trigger Events
 The task triggers only on Windows Update Client **event ID 19** (installation successful). Event ID 20 (installation failure) and event ID 43 (installation started) do not trigger reapplication.
 
+There is no startup or periodic trigger and no automatic retry if event 19 is not delivered or the task is disabled or unavailable. Use the one-shot manual recovery above in that case. Duplicate event 19 records can queue separate reapplications; the task serializes them, and the shared machine-wide mutation lock prevents overlapping O&O runs. The task does not coalesce distinct event records.
+
 ### Execution Details
 - **Runs as**: SYSTEM account
 - **Privileges**: Highest available
 - **Delay**: 2 minutes after the successful installation event
 - **Overlapping runs**: Queued and run sequentially
-- **Execution**: Hidden PowerShell window (no user interaction)
+- **Execution**: Hidden PowerShell window (`-NonInteractive`, exact profile and manifest digests, no prompt or restart under SYSTEM)
 - **Command**: the canonical absolute Windows PowerShell 5.1 executable under `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`, followed by `-NoProfile -ExecutionPolicy AllSigned -WindowStyle Hidden -File "<ScriptPath>" -ReapplyOnly -SkipRelocate -NonInteractive -ApprovedOOSExecutablePath "<ManagedOOSPath>" -ApprovedProfileSha256 "<PinnedProfileSHA256>" -ApprovedProfileManifestSha256 "<PinnedManifestSHA256>"`
 - **Working directory**: the directory containing `<ScriptPath>`
 

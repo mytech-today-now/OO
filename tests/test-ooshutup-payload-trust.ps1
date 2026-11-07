@@ -502,7 +502,9 @@ function Invoke-MockUpdateTaskSchedule {
 
         [int]$ActiveRunEndSeconds = 0,
 
-        [int]$EventOccurredAtSeconds = 10
+        [int]$EventOccurredAtSeconds = 10,
+
+        [int]$ReapplyDurationSeconds = 1500
     )
 
     $trigger = $TaskDefinition.SelectSingleNode("/*[local-name()='Task']/*[local-name()='Triggers']/*[local-name()='EventTrigger']")
@@ -512,6 +514,7 @@ function Invoke-MockUpdateTaskSchedule {
     $policyNode = $TaskDefinition.SelectSingleNode("/*[local-name()='Task']/*[local-name()='Settings']/*[local-name()='MultipleInstancesPolicy']")
     $policy = [string]$policyNode.InnerText
     $runs = New-Object System.Collections.ArrayList
+    $nextAvailableSeconds = $ActiveRunEndSeconds
 
     foreach ($eventId in $EventIds) {
         if ($configuredEventIds -notcontains $eventId) {
@@ -519,14 +522,15 @@ function Invoke-MockUpdateTaskSchedule {
         }
 
         $startSeconds = $EventOccurredAtSeconds + $delaySeconds
-        if ($startSeconds -lt $ActiveRunEndSeconds) {
+        if ($startSeconds -lt $nextAvailableSeconds) {
             if ($policy -ne 'Queue') {
                 continue
             }
-            $startSeconds = $ActiveRunEndSeconds
+            $startSeconds = $nextAvailableSeconds
         }
 
         [void]$runs.Add([pscustomobject]@{ EventId = $eventId; StartSeconds = $startSeconds; ActiveRunEventId = $ActiveRunEventId })
+        $nextAvailableSeconds = $startSeconds + $ReapplyDurationSeconds
     }
 
     return @($runs.ToArray())
@@ -680,6 +684,7 @@ try {
     Assert-True ($source.Contains('The task security descriptor could not be verified. No new task was enabled; inspect task permissions before retrying.')) 'task descriptor failures use the exact required fallback'
     Assert-True ($source.Contains("O:BAG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)")) 'the task descriptor allowlist is explicit for SYSTEM and Administrators'
     Assert-True ($source.Contains('-RequireMachineScope:$ReapplyOnly')) 'ReapplyOnly validates machine scope before later work'
+    Assert-True ($readmeSource.Contains('one-shot `-ReapplyOnly` operator command') -and $readmeSource.Contains('There is no startup or periodic trigger')) 'the README documents the bounded manual recovery path and the absence of automatic reconciliation'
     $mainScriptStart = $source.IndexOf('#region Main Script', [System.StringComparison]::Ordinal)
     Assert-True ($mainScriptStart -ge 0) 'the main installer entry point exists'
     $mainScriptSource = $source.Substring($mainScriptStart)
@@ -1018,6 +1023,12 @@ try {
     Assert-True ($reapplyStart -ge 0 -and $reapplyPathPosition -gt $reapplyStart) 'SYSTEM ReapplyOnly resolves the executable through the managed-path lookup'
     Assert-True ($mainSource.Contains('Get-OOShutUpPath -ExpectedPath $ApprovedOOSExecutablePath')) 'SYSTEM ReapplyOnly validates the exact executable path pinned in the task action'
     Assert-True ($source.Contains('The approved O&O executable path is unavailable to the scheduled task. Reapplication was skipped; restore the verified machine copy.') -and $mainSource.Contains('$script:OOShutUpManagedPathFailureMessage')) 'SYSTEM ReapplyOnly reports the exact managed-copy recovery instruction'
+    $reapplyBranchEnd = $mainSource.IndexOf('# Normal installation mode', $reapplyStart, [System.StringComparison]::Ordinal)
+    $reapplyBranch = $mainSource.Substring($reapplyStart, $reapplyBranchEnd - $reapplyStart)
+    Assert-Equal 1 ([regex]::Matches($reapplyBranch, 'Invoke-OOShutUpConfiguration -ExecutablePath \$exePath -SystemReapply').Count) 'one ReapplyOnly invocation makes at most one bounded reapply per operator command'
+    Assert-True ($reapplyBranch -notmatch '(?i)\b(Get|Start|Register|Unregister)-ScheduledTask\b') 'manual ReapplyOnly recovery does not depend on Task Scheduler availability'
+    Assert-True ($reapplyBranch -notmatch '(?i)Invoke-OOShutUpTaskSetup|Invoke-OOShutUpRestart|\bwhile\s*\(|\bfor\s*\(') 'ReapplyOnly recovery creates no task, requests no restart, and adds no retry loop'
+    Assert-True ($reapplyBranch.Contains('exit 0')) 'successful ReapplyOnly recovery exits before normal installation and restart handling'
     foreach ($mutationMarker in @(
         'Invoke-ScriptRelocation -CurrentScriptPath',
         'Invoke-OOShutUpConfigurationWithRestorePointGate',
@@ -2060,6 +2071,7 @@ try {
         Assert-True ($taskLog.Contains('S-1-5-18') -and $taskLog.Contains($taskProfile.Sha256) -and $taskLog.Contains($taskProfile.ManifestSha256)) 'task logging records principal and digests without setting values'
         Assert-True ($taskLog.Contains('installation-success event 19') -and $taskLog.Contains('queued sequentially')) 'task logging records the success-only serialized reapply policy'
         $trigger = $taskXml.Task.Triggers.EventTrigger
+        Assert-Equal 1 $taskXml.Task.Triggers.ChildNodes.Count 'scheduled task has no startup or periodic reconciliation trigger'
         $triggerSubscriptionText = [string]$trigger.Subscription
         Assert-Equal 'true' ([string]$trigger.Enabled) 'scheduled task preserves its enabled Windows Update event trigger'
         Assert-Equal 'PT2M' ([string]$trigger.Delay) 'scheduled task preserves its two-minute update delay'
@@ -2080,6 +2092,15 @@ try {
             TrustedPowerShellPath = $expectedNativeInterpreterPath
         }
         Assert-Equal $true (Test-WindowsUpdateTaskDefinition @taskVerifierParameters) 'task verification checks the canonical interpreter, success trigger, queue policy, and execution limit'
+
+        $extraTriggerDocument = New-Object System.Xml.XmlDocument
+        $extraTriggerDocument.LoadXml($taskXml.OuterXml)
+        $extraTriggerParent = $extraTriggerDocument.SelectSingleNode("/*[local-name()='Task']/*[local-name()='Triggers']")
+        $secondTrigger = $extraTriggerDocument.ImportNode($extraTriggerParent.FirstChild, $true)
+        [void]$extraTriggerParent.AppendChild($secondTrigger)
+        $taskVerifierParameters.Task = New-MockScheduledTask -TaskName 'Install-OOShutUp10' -TaskPath '\myTech.Today\' -Xml $extraTriggerDocument.OuterXml
+        Assert-Equal $false (Test-WindowsUpdateTaskDefinition @taskVerifierParameters) 'task verification rejects unapproved additional or reconciliation triggers'
+
         $timespanTask = New-MockScheduledTask -TaskName 'Install-OOShutUp10' -TaskPath '\myTech.Today\' -Xml $taskXml.OuterXml
         $timespanTask.Settings.ExecutionTimeLimit = [TimeSpan]::FromMinutes(30)
         $taskVerifierParameters.Task = $timespanTask
@@ -2177,11 +2198,21 @@ try {
         Assert-Equal $false (Test-WindowsUpdateTaskDefinition @taskVerifierParameters) 'the old start-and-success trigger is rejected as a current task definition'
 
         $noEventRuns = @(Invoke-MockUpdateTaskSchedule -TaskDefinition $taskXml -EventIds @())
+        $successEventRuns = @(Invoke-MockUpdateTaskSchedule -TaskDefinition $taskXml -EventIds @(19))
         $failureEventRuns = @(Invoke-MockUpdateTaskSchedule -TaskDefinition $taskXml -EventIds @(20))
         $startEventRuns = @(Invoke-MockUpdateTaskSchedule -TaskDefinition $taskXml -EventIds @(43))
         Assert-Equal 0 $noEventRuns.Count 'no Windows Update event leaves the task idle'
+        Assert-Equal 1 $successEventRuns.Count 'one successful Windows Update event produces one reapply'
+        Assert-Equal 19 $successEventRuns[0].EventId 'the scheduled reapply is tied to installation success'
+        Assert-Equal 130 $successEventRuns[0].StartSeconds 'a successful event keeps its two-minute delay'
         Assert-Equal 0 $failureEventRuns.Count 'a Windows Update installation failure does not start or report a successful reapply'
         Assert-Equal 0 $startEventRuns.Count 'an installation-start event does not start an early reapply'
+
+        $duplicateEventRuns = @(Invoke-MockUpdateTaskSchedule -TaskDefinition $taskXml -EventIds @(19, 19))
+        Assert-Equal 2 $duplicateEventRuns.Count 'two delivered success events each retain one bounded queued run'
+        Assert-Equal 19 $duplicateEventRuns[0].EventId 'the first duplicate-event run uses the success trigger'
+        Assert-Equal 19 $duplicateEventRuns[1].EventId 'the second duplicate-event run uses the success trigger'
+        Assert-True ($duplicateEventRuns[1].StartSeconds -ge ($duplicateEventRuns[0].StartSeconds + 1500)) 'duplicate-event runs are queued without overlapping the bounded mutation wait and O&O child wait'
 
         foreach ($runDurationAfterSuccess in @(119, 120, 121)) {
             $activeRunEndSeconds = 10 + $runDurationAfterSuccess
@@ -2543,11 +2574,11 @@ try {
     }
 
     $script:StartedPaths.Clear()
-    $approvedProfile = Get-OOShutUpApprovedProfile
+    $approvedProfile = Get-OOShutUpApprovedProfile -RequireMachineScope
     $script:PromptDecision = 'YES'
     Assert-Equal $true (Confirm-OOShutUpProfile -Profile $approvedProfile) 'the current profile is confirmed before configuration'
-    Assert-Equal 'Unchanged' (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture -SystemReapply).State 'machine-only profile returns the mocked O&O-reported state during SYSTEM reapplication'
-    Assert-Equal 1 $script:StartedPaths.Count 'a verified payload starts once'
+    Assert-Equal 'Unchanged' (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture -SystemReapply).State 'a one-shot operator recovery after a missed event reuses machine-only profile validation and reports no change'
+    Assert-Equal 1 $script:StartedPaths.Count 'the one-shot recovery starts one verified payload'
     Assert-Equal $validFixture ([string]$script:StartedPaths[0]) 'Start-Process receives the verified path'
     Assert-Equal $false $script:StartedWaitFlags[0] 'Start-Process returns immediately so the explicit bounded child wait controls liveness'
     Assert-Equal 900000 $script:MockChildWaitTimeoutMilliseconds 'the exact started child receives the fifteen-minute wait bound'
