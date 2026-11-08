@@ -477,6 +477,18 @@ $script:OOShutUpTaskExecutionTimeLimit = 'PT30M'
 $script:OOShutUpApprovedDigest = $null
 $script:OOShutUpApprovedManifestDigest = $null
 $script:OOShutUpLastRunOutcome = $null
+$script:OOShutUpRunId = [guid]::NewGuid().ToString('N')
+$script:OOShutUpLogDirectoryPath = $null
+$script:OOShutUpLogFilePath = $null
+$script:OOShutUpLogLockFilePath = $null
+$script:OOShutUpLogMaxBytes = 1048576
+$script:OOShutUpLogRetainedFileCount = 3
+$script:OOShutUpLogReady = $false
+$script:OOShutUpLogWriteFailed = $false
+$script:OOShutUpLogStage = 'Startup'
+$script:OOShutUpLogErrorCategory = 'None'
+$script:OOShutUpLogNativeResult = $null
+$script:OOShutUpLogOutcome = 'InProgress'
 $script:OOShutUpRestartDeferredMessage = 'Restart was deferred. Setup status remains unchanged; save your work and restart when ready.'
 $script:OOShutUpRestartPromptUnavailableMessage = 'No interactive restart prompt is available. Configuration status is retained; restart manually when convenient.'
 $script:OOShutUpRestartPromptTimeoutSeconds = 60
@@ -489,7 +501,430 @@ $OOShutUpPayloadFailureMessage = 'The O&O download could not be authenticated. N
 
 #region Local Logging
 
-# Keep logging packaged with this privileged script; never evaluate remote text.
+function Get-OOShutUpLogDirectoryPath {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param()
+
+    $commonApplicationData = [System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::CommonApplicationData)
+    if ([string]::IsNullOrWhiteSpace($commonApplicationData)) {
+        throw 'The machine-wide application data directory is unavailable.'
+    }
+
+    return (Join-Path $commonApplicationData 'myTech.Today-OOShutUp10\Logs')
+}
+
+function Set-OOShutUpProtectedLogAcl {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $false)]
+        [switch]$Directory
+    )
+
+    $systemSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
+    $administratorsSid = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')
+    if ($Directory) {
+        $security = New-Object System.Security.AccessControl.DirectorySecurity
+        $security.SetAccessRuleProtection($true, $false)
+        $security.SetOwner($administratorsSid)
+        $inheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+        [void]$security.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
+            $systemSid,
+            [System.Security.AccessControl.FileSystemRights]::FullControl,
+            $inheritance,
+            [System.Security.AccessControl.PropagationFlags]::None,
+            [System.Security.AccessControl.AccessControlType]::Allow
+        ))
+        [void]$security.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
+            $administratorsSid,
+            [System.Security.AccessControl.FileSystemRights]::FullControl,
+            $inheritance,
+            [System.Security.AccessControl.PropagationFlags]::None,
+            [System.Security.AccessControl.AccessControlType]::Allow
+        ))
+    }
+    else {
+        $security = New-Object System.Security.AccessControl.FileSecurity
+        $security.SetAccessRuleProtection($true, $false)
+        $security.SetOwner($administratorsSid)
+        [void]$security.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
+            $systemSid,
+            [System.Security.AccessControl.FileSystemRights]::FullControl,
+            [System.Security.AccessControl.AccessControlType]::Allow
+        ))
+        [void]$security.AddAccessRule([System.Security.AccessControl.FileSystemAccessRule]::new(
+            $administratorsSid,
+            [System.Security.AccessControl.FileSystemRights]::FullControl,
+            [System.Security.AccessControl.AccessControlType]::Allow
+        ))
+    }
+
+    Set-Acl -LiteralPath $Path -AclObject $security -ErrorAction Stop
+}
+
+function Test-OOShutUpProtectedLogAcl {
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter(Mandatory = $false)]
+        [switch]$Directory
+    )
+
+    try {
+        $security = Get-Acl -LiteralPath $Path -ErrorAction Stop
+        if (-not $security.AreAccessRulesProtected -or
+            $security.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne 'S-1-5-32-544') {
+            return $false
+        }
+
+        $rules = @($security.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+        if ($rules.Count -ne 2) {
+            return $false
+        }
+
+        $expectedSids = @('S-1-5-18', 'S-1-5-32-544')
+        foreach ($rule in $rules) {
+            if ($rule.IdentityReference.Value -notin $expectedSids -or
+                $rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow -or
+                $rule.IsInherited -or
+                $rule.FileSystemRights -ne [System.Security.AccessControl.FileSystemRights]::FullControl) {
+                return $false
+            }
+
+            if ($Directory) {
+                $expectedInheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+                if ($rule.InheritanceFlags -ne $expectedInheritance) {
+                    return $false
+                }
+            }
+            elseif ($rule.InheritanceFlags -ne [System.Security.AccessControl.InheritanceFlags]::None) {
+                return $false
+            }
+        }
+
+        $actualSids = [string]::Join(',', [string[]]@($rules | ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique))
+        $expectedSidList = [string]::Join(',', [string[]]@($expectedSids | Sort-Object))
+        return [string]::Equals($actualSids, $expectedSidList, [System.StringComparison]::Ordinal)
+    }
+    catch {
+        return $false
+    }
+}
+
+function Initialize-OOShutUpLogDirectory {
+    [CmdletBinding()]
+    param()
+
+    $commonApplicationData = [System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::CommonApplicationData)
+    $directoryPath = [System.IO.Path]::GetFullPath((Get-OOShutUpLogDirectoryPath))
+    $basePath = [System.IO.Path]::GetFullPath($commonApplicationData).TrimEnd([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar)
+    $prefix = $basePath + [System.IO.Path]::DirectorySeparatorChar
+    if (-not $directoryPath.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw 'The diagnostic log path is outside the machine-wide application data directory.'
+    }
+
+    $relativePath = $directoryPath.Substring($prefix.Length)
+    $currentPath = $basePath
+    foreach ($component in @($relativePath -split '[\\/]')) {
+        if ([string]::IsNullOrWhiteSpace($component) -or $component -in @('.', '..')) {
+            throw 'The diagnostic log directory path is invalid.'
+        }
+
+        $currentPath = Join-Path $currentPath $component
+        if (-not [System.IO.Directory]::Exists($currentPath)) {
+            [void][System.IO.Directory]::CreateDirectory($currentPath)
+        }
+        if (([System.IO.File]::GetAttributes($currentPath) -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'The diagnostic log directory contains a reparse point.'
+        }
+
+        Set-OOShutUpProtectedLogAcl -Path $currentPath -Directory
+        if (-not (Test-OOShutUpProtectedLogAcl -Path $currentPath -Directory)) {
+            throw 'The diagnostic log directory ACL could not be verified.'
+        }
+    }
+
+    $script:OOShutUpLogDirectoryPath = $directoryPath
+    $script:OOShutUpLogFilePath = Join-Path $directoryPath 'Install-OOShutUp10.jsonl'
+    $script:OOShutUpLogLockFilePath = Join-Path $directoryPath 'OOShutUp10Log.lock'
+}
+
+function Open-OOShutUpLogWriterLock {
+    [CmdletBinding()]
+    [OutputType([System.IO.FileStream])]
+    param(
+        [Parameter(Mandatory = $false)]
+        [ValidateRange(1, 120000)]
+        [int]$TimeoutMilliseconds = 30000
+    )
+
+    if (-not [System.IO.File]::Exists($script:OOShutUpLogLockFilePath)) {
+        try {
+            $newLock = [System.IO.File]::Open($script:OOShutUpLogLockFilePath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+            $newLock.Dispose()
+        }
+        catch [System.IO.IOException] {
+            if (-not [System.IO.File]::Exists($script:OOShutUpLogLockFilePath)) {
+                throw
+            }
+        }
+    }
+
+    if (([System.IO.File]::GetAttributes($script:OOShutUpLogLockFilePath) -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw 'The diagnostic log lock is a reparse point.'
+    }
+    if (-not (Test-OOShutUpProtectedLogAcl -Path $script:OOShutUpLogLockFilePath)) {
+        Set-OOShutUpProtectedLogAcl -Path $script:OOShutUpLogLockFilePath
+        if (-not (Test-OOShutUpProtectedLogAcl -Path $script:OOShutUpLogLockFilePath)) {
+            throw 'The diagnostic log lock ACL could not be verified.'
+        }
+    }
+
+    $timer = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($true) {
+        try {
+            return [System.IO.File]::Open($script:OOShutUpLogLockFilePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+        }
+        catch [System.IO.IOException] {
+            if ($timer.Elapsed.TotalMilliseconds -ge $TimeoutMilliseconds) {
+                throw 'The diagnostic log writer lock timed out.'
+            }
+            Start-Sleep -Milliseconds 50
+        }
+    }
+}
+
+function Set-OOShutUpLogStage {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('Startup', 'ProfileValidation', 'ProfileApproval', 'Relocation', 'PayloadInstall', 'RestorePoint', 'ProfileSnapshot', 'OOSProcessLaunch', 'OOSProcessWait', 'OOSProcessResult', 'TaskSetup', 'Completion')]
+        [string]$Stage
+    )
+
+    $script:OOShutUpLogStage = $Stage
+    $script:OOShutUpLogErrorCategory = 'None'
+    $script:OOShutUpLogNativeResult = $null
+    if ($script:OOShutUpLogOutcome -ne 'Complete') {
+        $script:OOShutUpLogOutcome = 'InProgress'
+    }
+}
+
+function Set-OOShutUpLogErrorCategory {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('None', 'ProfileRejected', 'Timeout', 'DiskFull', 'AccessDenied', 'PayloadRejected', 'TaskScheduler', 'RestorePoint', 'ProcessFailure', 'LoggingFailure', 'UnexpectedFailure')]
+        [string]$Category,
+
+        [Parameter(Mandatory = $false)]
+        [object]$NativeResult
+    )
+
+    $script:OOShutUpLogErrorCategory = $Category
+    if ($PSBoundParameters.ContainsKey('NativeResult')) {
+        if ($null -eq $NativeResult) {
+            $script:OOShutUpLogNativeResult = $null
+        }
+        elseif ($NativeResult -is [byte] -or $NativeResult -is [int16] -or $NativeResult -is [int32] -or $NativeResult -is [int64]) {
+            $script:OOShutUpLogNativeResult = [int64]$NativeResult
+        }
+        else {
+            throw 'Only a numeric native result can be recorded.'
+        }
+    }
+}
+
+function Set-OOShutUpLogOutcome {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('InProgress', 'Complete', 'Partial', 'Failed', 'Unknown')]
+        [string]$Outcome
+    )
+
+    $script:OOShutUpLogOutcome = $Outcome
+}
+
+function Initialize-OOShutUpLogFile {
+    [CmdletBinding()]
+    param()
+
+    Initialize-OOShutUpLogDirectory
+    $lockStream = Open-OOShutUpLogWriterLock
+    try {
+        $logPaths = @($script:OOShutUpLogFilePath) + @(1..$script:OOShutUpLogRetainedFileCount | ForEach-Object { '{0}.{1}' -f $script:OOShutUpLogFilePath, $_ })
+        foreach ($path in $logPaths) {
+            if (-not [System.IO.File]::Exists($path)) {
+                continue
+            }
+
+            if (([System.IO.File]::GetAttributes($path) -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw 'A diagnostic log file is a reparse point.'
+            }
+            if ((New-Object System.IO.FileInfo($path)).Length -gt $script:OOShutUpLogMaxBytes) {
+                [System.IO.File]::Delete($path)
+                continue
+            }
+
+            Set-OOShutUpProtectedLogAcl -Path $path
+            if (-not (Test-OOShutUpProtectedLogAcl -Path $path)) {
+                throw 'A diagnostic log file ACL could not be verified.'
+            }
+        }
+
+        if (-not [System.IO.File]::Exists($script:OOShutUpLogFilePath)) {
+            $stream = [System.IO.File]::Open($script:OOShutUpLogFilePath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+            $stream.Dispose()
+            Set-OOShutUpProtectedLogAcl -Path $script:OOShutUpLogFilePath
+            if (-not (Test-OOShutUpProtectedLogAcl -Path $script:OOShutUpLogFilePath)) {
+                throw 'The diagnostic log file ACL could not be verified.'
+            }
+        }
+    }
+    finally {
+        $lockStream.Dispose()
+    }
+}
+
+function Invoke-OOShutUpLogRotation {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [int]$NextRecordBytes
+    )
+
+    if ($NextRecordBytes -le 0 -or $NextRecordBytes -gt $script:OOShutUpLogMaxBytes) {
+        throw 'The diagnostic record exceeds the configured log size limit.'
+    }
+
+    if (-not [System.IO.File]::Exists($script:OOShutUpLogFilePath)) {
+        $currentLength = 0
+    }
+    else {
+        $currentLength = (New-Object System.IO.FileInfo($script:OOShutUpLogFilePath)).Length
+    }
+    if ($currentLength -gt $script:OOShutUpLogMaxBytes) {
+        [System.IO.File]::Delete($script:OOShutUpLogFilePath)
+        $currentLength = 0
+    }
+    if ($currentLength + $NextRecordBytes -le $script:OOShutUpLogMaxBytes) {
+        if (-not [System.IO.File]::Exists($script:OOShutUpLogFilePath)) {
+            $stream = [System.IO.File]::Open($script:OOShutUpLogFilePath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+            $stream.Dispose()
+            Set-OOShutUpProtectedLogAcl -Path $script:OOShutUpLogFilePath
+            if (-not (Test-OOShutUpProtectedLogAcl -Path $script:OOShutUpLogFilePath)) {
+                throw 'The new diagnostic log file ACL could not be verified.'
+            }
+        }
+        return
+    }
+
+    for ($index = $script:OOShutUpLogRetainedFileCount; $index -ge 1; $index--) {
+        $targetPath = '{0}.{1}' -f $script:OOShutUpLogFilePath, $index
+        $sourcePath = if ($index -eq 1) { $script:OOShutUpLogFilePath } else { '{0}.{1}' -f $script:OOShutUpLogFilePath, ($index - 1) }
+        if ([System.IO.File]::Exists($targetPath)) {
+            [System.IO.File]::Delete($targetPath)
+        }
+        if ([System.IO.File]::Exists($sourcePath)) {
+            [System.IO.File]::Move($sourcePath, $targetPath)
+        }
+    }
+
+    $stream = [System.IO.File]::Open($script:OOShutUpLogFilePath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+    $stream.Dispose()
+    Set-OOShutUpProtectedLogAcl -Path $script:OOShutUpLogFilePath
+    if (-not (Test-OOShutUpProtectedLogAcl -Path $script:OOShutUpLogFilePath)) {
+        throw 'The rotated diagnostic log file ACL could not be verified.'
+    }
+}
+
+function Write-OOShutUpAuditRecord {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('INFO', 'SUCCESS', 'WARNING', 'ERROR')]
+        [string]$Level,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('Startup', 'ProfileValidation', 'ProfileApproval', 'Relocation', 'PayloadInstall', 'RestorePoint', 'ProfileSnapshot', 'OOSProcessLaunch', 'OOSProcessWait', 'OOSProcessResult', 'TaskSetup', 'Completion')]
+        [string]$Stage,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('None', 'ProfileRejected', 'Timeout', 'DiskFull', 'AccessDenied', 'PayloadRejected', 'TaskScheduler', 'RestorePoint', 'ProcessFailure', 'LoggingFailure', 'UnexpectedFailure')]
+        [string]$ErrorCategory,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('InProgress', 'Complete', 'Partial', 'Failed', 'Unknown')]
+        [string]$Outcome,
+
+        [Parameter(Mandatory = $false)]
+        [object]$NativeResult
+    )
+
+    $safeNativeResult = $null
+    if ($null -ne $NativeResult) {
+        if ($NativeResult -isnot [byte] -and $NativeResult -isnot [int16] -and $NativeResult -isnot [int32] -and $NativeResult -isnot [int64]) {
+            throw 'Only a numeric native result can be recorded.'
+        }
+        $safeNativeResult = [int64]$NativeResult
+    }
+
+    $profileDigest = if ([string]$script:OOShutUpApprovedDigest -match '^[A-Fa-f0-9]{64}$') { ([string]$script:OOShutUpApprovedDigest).ToUpperInvariant() } else { $null }
+    $manifestDigest = if ([string]$script:OOShutUpApprovedManifestDigest -match '^[A-Fa-f0-9]{64}$') { ([string]$script:OOShutUpApprovedManifestDigest).ToUpperInvariant() } else { $null }
+    $record = [ordered]@{
+        timestampUtc = [System.DateTime]::UtcNow.ToString('o')
+        runId = [string]$script:OOShutUpRunId
+        stage = $Stage
+        level = $Level
+        errorCategory = $ErrorCategory
+        nativeResult = $safeNativeResult
+        approvedDigests = [ordered]@{
+            profileSha256 = $profileDigest
+            manifestSha256 = $manifestDigest
+        }
+        outcome = $Outcome
+    }
+    $line = (ConvertTo-Json -InputObject ([pscustomobject]$record) -Compress -Depth 4) + "`r`n"
+    $encoding = New-Object System.Text.UTF8Encoding($false)
+    $bytes = $encoding.GetBytes($line)
+    $lockStream = Open-OOShutUpLogWriterLock
+    try {
+        Invoke-OOShutUpLogRotation -NextRecordBytes $bytes.Length
+
+        if (-not [System.IO.File]::Exists($script:OOShutUpLogFilePath)) {
+            $newLog = [System.IO.File]::Open($script:OOShutUpLogFilePath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+            $newLog.Dispose()
+        }
+        if (([System.IO.File]::GetAttributes($script:OOShutUpLogFilePath) -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'The diagnostic log file became a reparse point.'
+        }
+        Set-OOShutUpProtectedLogAcl -Path $script:OOShutUpLogFilePath
+        if (-not (Test-OOShutUpProtectedLogAcl -Path $script:OOShutUpLogFilePath)) {
+            throw 'The diagnostic log file ACL could not be verified.'
+        }
+
+        $stream = [System.IO.File]::Open($script:OOShutUpLogFilePath, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+        try {
+            $stream.Write($bytes, 0, $bytes.Length)
+            $stream.Flush($true)
+        }
+        finally {
+            $stream.Dispose()
+        }
+    }
+    finally {
+        $lockStream.Dispose()
+    }
+}
+
+# Keep console messages for interactive use, but persist only allowlisted structured fields.
 function Write-Log {
     param(
         [Parameter(Mandatory = $true)]
@@ -501,7 +936,45 @@ function Write-Log {
     )
 
     $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    Write-Host "[$timestamp] [$Level] $Message"
+    try {
+        if (-not $script:OOShutUpLogReady -or $script:OOShutUpLogWriteFailed) {
+            throw 'The protected diagnostic logger is unavailable.'
+        }
+
+        $recordOutcome = [string]$script:OOShutUpLogOutcome
+        if ($Level -eq 'ERROR' -and $recordOutcome -eq 'InProgress') {
+            $recordOutcome = 'Failed'
+        }
+        $errorCategory = [string]$script:OOShutUpLogErrorCategory
+        if ($Level -eq 'ERROR' -and $errorCategory -eq 'None') {
+            $errorCategory = 'UnexpectedFailure'
+        }
+
+        Write-OOShutUpAuditRecord `
+            -Level $Level `
+            -Stage $script:OOShutUpLogStage `
+            -ErrorCategory $errorCategory `
+            -Outcome $recordOutcome `
+            -NativeResult $script:OOShutUpLogNativeResult
+    }
+    catch {
+        $script:OOShutUpLogWriteFailed = $true
+        $script:OOShutUpLogReady = $false
+        $script:OOShutUpLogErrorCategory = 'LoggingFailure'
+        $script:OOShutUpLogOutcome = 'Failed'
+        try {
+            Write-Host "[$timestamp] [ERROR] Protected application logging is unavailable; this run will return failure. Details suppressed." -ForegroundColor Red
+        }
+        catch {
+        }
+        return
+    }
+
+    try {
+        Write-Host "[$timestamp] [$Level] $Message"
+    }
+    catch {
+    }
 }
 
 #endregion
@@ -726,18 +1199,64 @@ function Update-ScriptProgress {
 function Initialize-LogFile {
     <#
     .SYNOPSIS
-        Initializes the packaged local logger for this script.
+        Initializes the protected machine-wide structured logger for this script.
     #>
     param()
 
     try {
-        Write-Log -Message 'Packaged local console logger initialized.' -Level INFO
+        $script:OOShutUpLogReady = $false
+        $script:OOShutUpLogWriteFailed = $false
+        Set-OOShutUpLogStage -Stage Startup
+        Initialize-OOShutUpLogFile
+        $script:OOShutUpLogReady = $true
+        Write-Log -Message 'Protected application log initialized.' -Level INFO
+        if ($script:OOShutUpLogWriteFailed) {
+            return $false
+        }
         return $true
     }
     catch {
-        Write-Host "Trusted logging validation failed. No configuration changes were started; use the packaged local logger and review the logged stage." -ForegroundColor Red
+        $script:OOShutUpLogReady = $false
+        $script:OOShutUpLogWriteFailed = $true
+        Write-Host 'Protected application logging could not be initialized. No configuration changes were started; check machine-wide log directory access.' -ForegroundColor Red
         return $false
     }
+}
+
+function Get-OOShutUpTerminalExitCode {
+    [CmdletBinding()]
+    [OutputType([int])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('Complete', 'Partial', 'Failed', 'Unknown')]
+        [string]$Outcome,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateRange(0, 255)]
+        [int]$ExitCode
+    )
+
+    if ($script:OOShutUpLogWriteFailed -or -not $script:OOShutUpLogReady) {
+        Write-Host 'Protected application logging failed; the run cannot return success. Details suppressed.' -ForegroundColor Red
+        return 1
+    }
+
+    Set-OOShutUpLogStage -Stage Completion
+    Set-OOShutUpLogOutcome -Outcome $Outcome
+    Set-OOShutUpLogErrorCategory -Category $(if ($Outcome -eq 'Failed') { 'UnexpectedFailure' } else { 'None' })
+    $level = switch -Exact ($Outcome) {
+        'Complete' { 'SUCCESS' }
+        'Partial' { 'WARNING' }
+        'Failed' { 'ERROR' }
+        default { 'WARNING' }
+    }
+    Write-Log -Message 'Run outcome recorded.' -Level $level
+    if ($script:OOShutUpLogWriteFailed) {
+        Write-Host 'Protected application logging failed; the run cannot return success. Details suppressed.' -ForegroundColor Red
+        return 1
+    }
+
+    return $ExitCode
 }
 
 #endregion
@@ -2565,6 +3084,7 @@ function Invoke-OOShutUpConfigurationCore {
         -Message 'Configuration stopped before an O&O exit result was available.'
     $snapshot = $null
     $stage = 'checking for a retained profile snapshot'
+    Set-OOShutUpLogStage -Stage ProfileValidation
     $launchAttempted = $false
     $processWaitResult = $null
 
@@ -2585,6 +3105,7 @@ function Invoke-OOShutUpConfigurationCore {
         if (-not $script:OOShutUpApprovalConfirmed -or
             -not [string]::Equals($script:OOShutUpApprovedDigest, $approvedProfile.Sha256, [System.StringComparison]::OrdinalIgnoreCase) -or
             -not [string]::Equals($script:OOShutUpApprovedManifestDigest, $approvedProfile.ManifestSha256, [System.StringComparison]::OrdinalIgnoreCase)) {
+            Set-OOShutUpLogErrorCategory -Category ProfileRejected
             Write-Log $script:OOShutUpApprovalFailureMessage -Level ERROR
             return $script:OOShutUpLastRunOutcome
         }
@@ -2597,6 +3118,7 @@ function Invoke-OOShutUpConfigurationCore {
         }
 
         $stage = 'protected profile snapshot'
+        Set-OOShutUpLogStage -Stage ProfileSnapshot
         $snapshot = New-OOShutUpProfileSnapshot -Profile $approvedProfile
 
         # O&O ShutUp10++ command line arguments:
@@ -2608,6 +3130,7 @@ function Invoke-OOShutUpConfigurationCore {
         $arguments = '/quiet /nosrp "{0}"' -f $snapshot.Path
         $profileWorkingDirectory = $snapshot.Directory
         $stage = 'O&O process launch'
+        Set-OOShutUpLogStage -Stage OOSProcessLaunch
         $launchAttempted = $true
         $processInfo = Start-Process -FilePath $ExecutablePath -ArgumentList $arguments -WorkingDirectory $profileWorkingDirectory -PassThru -NoNewWindow
         if ($null -eq $processInfo -or
@@ -2618,6 +3141,7 @@ function Invoke-OOShutUpConfigurationCore {
         }
 
         $stage = 'waiting for the O&O child process'
+        Set-OOShutUpLogStage -Stage OOSProcessWait
         Write-Log ("Waiting up to {0} seconds for the O&O child process." -f $script:OOShutUpChildTimeoutSeconds) -Level INFO
         $processWaitResult = Wait-OOShutUpChildProcess -Process $processInfo -TimeoutSeconds $script:OOShutUpChildTimeoutSeconds
         if ($null -eq $processWaitResult -or $null -eq $processWaitResult.PSObject.Properties['State']) {
@@ -2625,6 +3149,8 @@ function Invoke-OOShutUpConfigurationCore {
         }
     }
     catch {
+        Set-OOShutUpLogErrorCategory -Category ProcessFailure
+        Set-OOShutUpLogOutcome -Outcome $(if ($launchAttempted) { 'Unknown' } else { 'Failed' })
         Write-Log ("Error during {0}: {1}" -f $stage, $_.Exception.Message) -Level ERROR
         if ($launchAttempted) {
             $script:OOShutUpLastRunOutcome = New-OOShutUpConfigurationOutcome `
@@ -2658,6 +3184,9 @@ function Invoke-OOShutUpConfigurationCore {
     }
 
     if ($processWaitResult.State -ne 'Completed') {
+        Set-OOShutUpLogStage -Stage OOSProcessWait
+        Set-OOShutUpLogErrorCategory -Category Timeout
+        Set-OOShutUpLogOutcome -Outcome Unknown
         $processIdForInspection = 'unknown'
         try {
             $processIdForInspection = [string]$processInfo.Id
@@ -2687,6 +3216,8 @@ function Invoke-OOShutUpConfigurationCore {
     }
 
     $processExitCode = [int]$processWaitResult.ExitCode
+    Set-OOShutUpLogStage -Stage OOSProcessResult
+    Set-OOShutUpLogErrorCategory -Category None -NativeResult $processExitCode
     if ($processExitCode -eq 30) {
         $script:OOShutUpLastRunOutcome = New-OOShutUpConfigurationOutcome `
             -State Changed `
@@ -2740,6 +3271,8 @@ function Invoke-OOShutUpConfigurationCore {
         return $script:OOShutUpLastRunOutcome
     }
     else {
+        Set-OOShutUpLogErrorCategory -Category ProcessFailure -NativeResult $processExitCode
+        Set-OOShutUpLogOutcome -Outcome Unknown
         Write-Log "O&O ShutUp10++ exited with unexpected code: $processExitCode" -Level WARNING
         Write-Log $script:OOShutUpLastRunOutcome.Message -Level WARNING
         return $script:OOShutUpLastRunOutcome
@@ -4501,6 +5034,9 @@ try {
         exit 1
     }
 
+    Set-OOShutUpLogStage -Stage Startup
+    Write-Log ("Protected application log: {0}" -f $script:OOShutUpLogFilePath) -Level INFO
+
     # Treat redirected or unavailable console input as unattended before profile approval can prompt.
     if (-not $NonInteractive -and -not (Test-OOShutUpInteractiveInput)) {
         $NonInteractive = $true
@@ -4508,12 +5044,16 @@ try {
     }
 
     # Validate the reviewed profile before relocation, registry changes, restore points, task changes, or O&O launch.
+    Set-OOShutUpLogStage -Stage ProfileValidation
     $approvedProfile = Get-OOShutUpApprovedProfile -RequireMachineScope:$ReapplyOnly
     if ($null -eq $approvedProfile) {
-        exit 1
+        Set-OOShutUpLogErrorCategory -Category ProfileRejected
+        Write-Log 'Profile validation failed; no configuration changes were started.' -Level ERROR
+        exit (Get-OOShutUpTerminalExitCode -Outcome Failed -ExitCode 1)
     }
     Write-Log ("Validated approved settings profile version {0} for O&O file version range {1} (profile SHA-256 {2}; manifest SHA-256 {3}; {4} settings). Setting values are omitted from logs." -f $approvedProfile.Version, $approvedProfile.OOShutUpVersionRange, $approvedProfile.Sha256, $approvedProfile.ManifestSha256, $approvedProfile.SettingCount) -Level INFO
 
+    Set-OOShutUpLogStage -Stage ProfileApproval
     $profileApprovalAccepted = Confirm-OOShutUpProfile `
         -Profile $approvedProfile `
         -ApprovedProfileSha256 $ApprovedProfileSha256 `
@@ -4521,9 +5061,13 @@ try {
         -NonInteractive:$NonInteractive `
         -ProfileApprovalConfirmed:$ProfileApprovalConfirmed
     if (-not $profileApprovalAccepted) {
-        exit 1
+        Set-OOShutUpLogErrorCategory -Category ProfileRejected
+        Write-Log 'Profile approval was not granted; no configuration changes were started.' -Level ERROR
+        exit (Get-OOShutUpTerminalExitCode -Outcome Failed -ExitCode 1)
     }
+    Write-Log 'Profile approval was accepted.' -Level INFO
 
+    Set-OOShutUpLogStage -Stage Relocation
     $currentPath = $PSCommandPath
     if ([string]::IsNullOrEmpty($currentPath)) {
         $currentPath = $MyInvocation.MyCommand.Path
@@ -4582,16 +5126,19 @@ try {
         Write-Log "Running in ReapplyOnly mode (scheduled or operator initiated)" -Level INFO
 
         # Get executable path
+        Set-OOShutUpLogStage -Stage PayloadInstall
         $exePath = Get-OOShutUpPath -ExpectedPath $ApprovedOOSExecutablePath
         if (-not $exePath) {
+            Set-OOShutUpLogErrorCategory -Category PayloadRejected
             Write-Log $script:OOShutUpManagedPathFailureMessage -Level ERROR
-            exit 1
+            exit (Get-OOShutUpTerminalExitCode -Outcome Failed -ExitCode 1)
         }
 
         Write-Log "Using O&O ShutUp10++ at: $exePath" -Level INFO
 
         # Apply the validated profile
         Write-Log "Reapplying the approved privacy settings profile..." -Level INFO
+        Set-OOShutUpLogStage -Stage ProfileValidation
         $configurationOutcome = Invoke-OOShutUpConfiguration -ExecutablePath $exePath -SystemReapply
 
         if ($configurationOutcome.State -eq 'Changed' -and $configurationOutcome.NextStep -eq 'Proceed') {
@@ -4601,22 +5148,24 @@ try {
             Write-Log 'O&O reported that no settings needed restoration after Windows Update. Settings were not independently read back.' -Level INFO
         }
         else {
+            Set-OOShutUpLogOutcome -Outcome $(if ($configurationOutcome.State -eq 'Unknown') { 'Unknown' } else { 'Failed' })
             Write-Log $configurationOutcome.Message -Level ERROR
             Write-Log 'Review O&O Undo History and current settings before retrying. No rollback was performed.' -Level ERROR
-            exit 1
+            exit (Get-OOShutUpTerminalExitCode -Outcome $(if ($configurationOutcome.State -eq 'Unknown') { 'Unknown' } else { 'Failed' }) -ExitCode 1)
         }
 
-        exit 0
+        exit (Get-OOShutUpTerminalExitCode -Outcome Complete -ExitCode 0)
     }
 
     # Normal installation mode
     Write-Log "=== O&O ShutUp10++ Automated Installation and Configuration ===" -Level INFO
     Write-Log " " -Level INFO
     Write-Log "Script Location: $DefaultScriptPath" -Level INFO
-    Write-Log "Log Location: console output (packaged local logger)" -Level INFO
+    Write-Log ("Log Location: {0}" -f $script:OOShutUpLogFilePath) -Level INFO
     Write-Log " " -Level INFO
 
     # Step 1: Check if already installed
+    Set-OOShutUpLogStage -Stage PayloadInstall
     Update-ScriptProgress -PercentComplete 15 -Status "Step 1 of 5: Checking Installation" -CurrentOperation "Checking if O&O ShutUp10++ is already installed"
     Write-Log "Step 1: Checking if O&O ShutUp10++ is already installed..." -Level INFO
     $isInstalled = Test-OOShutUpInstalled
@@ -4626,13 +5175,14 @@ try {
 
         # Step 2: Download the application
         Update-ScriptProgress -PercentComplete 20 -Status "Step 1 of 5: Installing Application" -CurrentOperation "Downloading O&O ShutUp10++"
+        Set-OOShutUpLogStage -Stage PayloadInstall
         Write-Log "Step 2: Downloading O&O ShutUp10++..." -Level INFO
         $downloadSuccess = Install-OOShutUp
 
         if (-not $downloadSuccess) {
             Write-Progress -Activity "O&O ShutUp10++ Installation and Configuration" -Completed
             Write-Log "Failed to download O&O ShutUp10++. Exiting." -Level ERROR
-            exit 1
+            exit (Get-OOShutUpTerminalExitCode -Outcome Failed -ExitCode 1)
         }
     }
     else {
@@ -4644,13 +5194,15 @@ try {
     $exePath = Get-OOShutUpPath
     if (-not $exePath) {
         Write-Progress -Activity "O&O ShutUp10++ Installation and Configuration" -Completed
+        Set-OOShutUpLogErrorCategory -Category PayloadRejected
         Write-Log "Could not locate O&O ShutUp10++ executable. Exiting." -Level ERROR
-        exit 1
+        exit (Get-OOShutUpTerminalExitCode -Outcome Failed -ExitCode 1)
     }
 
     Write-Log "Using O&O ShutUp10++ at: $exePath" -Level INFO
 
     # Step 2: Prepare System Restore. The temporary frequency value is applied and restored inside New-SystemRestorePoint.
+    Set-OOShutUpLogStage -Stage RestorePoint
     Update-ScriptProgress -PercentComplete 30 -Status "Step 2 of 5: Preparing System Restore" -CurrentOperation "Detecting the Windows volume and checking restore-point readiness"
     Write-Log "Step 2: Preparing Windows System Restore..." -Level INFO
 
@@ -4665,7 +5217,7 @@ try {
 
     if (-not $configurationResult.ConfigurationStarted) {
         Write-Progress -Activity "O&O ShutUp10++ Installation and Configuration" -Completed
-        exit 1
+        exit (Get-OOShutUpTerminalExitCode -Outcome Failed -ExitCode 1)
     }
 
     $configurationOutcome = $configurationResult.ConfigurationOutcome
@@ -4676,10 +5228,11 @@ try {
         if ($configurationOutcome.State -eq 'Unknown') {
             Write-Log 'Review O&O Undo History and current settings before retrying. No rollback was performed.' -Level ERROR
         }
-        exit 1
+        exit (Get-OOShutUpTerminalExitCode -Outcome $(if ($configurationOutcome.State -eq 'Unknown') { 'Unknown' } else { 'Failed' }) -ExitCode 1)
     }
 
     # Step 5: Create scheduled task for post-Windows Update execution
+    Set-OOShutUpLogStage -Stage TaskSetup
     Update-ScriptProgress -PercentComplete 85 -Status "Step 5 of 5: Creating Scheduled Task" -CurrentOperation "Setting up automatic reapplication after Windows updates"
     Write-Log "Step 5: Creating scheduled task for post-Windows Update execution..." -Level INFO
     # Bind the task to the same running package that passed profile validation, including when relocation failed.
@@ -4803,12 +5356,14 @@ try {
 
     # Exit 0 requires a recognized O&O-reported state, an acceptable restore-point outcome, and a verified update task.
     # This script does not independently read back the configured Windows settings.
-    exit $installerOutcome.ExitCode
+    exit (Get-OOShutUpTerminalExitCode -Outcome $installerOutcome.Status -ExitCode $installerOutcome.ExitCode)
 }
 catch {
     Write-Progress -Activity "O&O ShutUp10++ Installation and Configuration" -Completed
+    Set-OOShutUpLogErrorCategory -Category UnexpectedFailure
+    Set-OOShutUpLogOutcome -Outcome Failed
     Write-Log "An unexpected error occurred: $($_.Exception.Message)" -Level ERROR
-    exit 1
+    exit (Get-OOShutUpTerminalExitCode -Outcome Failed -ExitCode 1)
 }
 finally {
     # Keep the last approved portable executable in place for subsequent runs and recovery.

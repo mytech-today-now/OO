@@ -10,6 +10,7 @@ $script:OOShutUpRestartDeferredMessage = 'Restart was deferred. Setup status rem
 $script:OOShutUpRestartPromptUnavailableMessage = 'No interactive restart prompt is available. Configuration status is retained; restart manually when convenient.'
 $script:OOShutUpRestartPromptTimeoutSeconds = 60
 $script:OOShutUpRestartSaveWindowSeconds = 60
+$script:OOShutUpReleaseManifestFileName = 'Install-OOShutUp10.release.psd1'
 
 function Assert-True {
     param([bool]$Condition, [string]$Message)
@@ -334,9 +335,11 @@ try {
         $profileRoot = Join-Path $sourceRoot 'profiles'
         [System.IO.Directory]::CreateDirectory($profileRoot) | Out-Null
         $sourceScriptPath = Join-Path $sourceRoot 'Install-OOShutUp10.ps1'
+        $sourceReleaseManifestPath = Join-Path $sourceRoot $script:OOShutUpReleaseManifestFileName
         $sourceProfilePath = Join-Path $profileRoot 'ooshutup10.cfg'
         $sourceManifestPath = Join-Path $profileRoot 'ooshutup10.approval.json'
         [System.IO.File]::WriteAllText($sourceScriptPath, "script-$Name")
+        [System.IO.File]::WriteAllText($sourceReleaseManifestPath, "release-manifest-$Name")
         [System.IO.File]::WriteAllText($sourceProfilePath, "profile-$Name")
         [System.IO.File]::WriteAllText($sourceManifestPath, "manifest-$Name")
 
@@ -354,6 +357,7 @@ try {
         $previousProfiles = Join-Path $previousRoot 'profiles'
         [System.IO.Directory]::CreateDirectory($previousProfiles) | Out-Null
         [System.IO.File]::WriteAllText((Join-Path $previousRoot 'Install-OOShutUp10.ps1'), "previous-script-$Name")
+        [System.IO.File]::WriteAllText((Join-Path $previousRoot $script:OOShutUpReleaseManifestFileName), "previous-release-manifest-$Name")
         [System.IO.File]::WriteAllText((Join-Path $previousProfiles 'ooshutup10.cfg'), "previous-profile-$Name")
         [System.IO.File]::WriteAllText((Join-Path $previousProfiles 'ooshutup10.approval.json'), "previous-manifest-$Name")
         [System.IO.File]::WriteAllText((Join-Path $previousRoot 'retained.marker'), "previous-release-$Name")
@@ -450,8 +454,8 @@ try {
         -ScriptFileName 'Install-OOShutUp10.ps1' `
         -ProfileDirectory $successfulScenario.ProfileDirectory `
         -ExpectedDigests $successfulScenario.Target.Digests
-    Assert-Equal $true $successfulPromotion 'the verified three-file package is promoted successfully'
-    Assert-True (Test-ScriptRelocationPackage -PackageRoot $successfulScenario.Target.Root -ScriptFileName 'Install-OOShutUp10.ps1' -ExpectedDigests $successfulScenario.Target.Digests) 'the active release contains the matching script, cfg, manifest, and ACL checks'
+    Assert-Equal $true $successfulPromotion 'the verified four-file package is promoted successfully'
+    Assert-True (Test-ScriptRelocationPackage -PackageRoot $successfulScenario.Target.Root -ScriptFileName 'Install-OOShutUp10.ps1' -ExpectedDigests $successfulScenario.Target.Digests) 'the active release contains the matching script, release manifest, cfg, profile manifest, and ACL checks'
     Assert-Equal $successfulScenario.PreviousSnapshot (Get-RelocationTreeSnapshot -Root $successfulScenario.PreviousRoot) 'a successful new release leaves the prior complete package byte-for-byte intact'
     Assert-Equal 0 @([System.IO.Directory]::GetDirectories([System.IO.Path]::GetDirectoryName($successfulScenario.Target.Root), '.stage-*')).Count 'successful promotion leaves no active staging directory'
 
@@ -491,13 +495,13 @@ try {
     Assert-Equal 0 $script:RelocationCopyCount 'an invalid pre-existing target is rejected before staging copies'
     Assert-Equal 0 $script:RelocationMoveCount 'an invalid pre-existing target is rejected before promotion'
 
-    foreach ($copyNumber in 1..3) {
+    foreach ($copyNumber in 1..4) {
         Assert-RelocationFailureScenario -Name "copy-$copyNumber" -FailureStage 'Copy' -FailureAt $copyNumber
     }
-    foreach ($hashNumber in 1..12) {
+    foreach ($hashNumber in 1..16) {
         Assert-RelocationFailureScenario -Name "hash-$hashNumber" -FailureStage 'Hash' -FailureAt $hashNumber
     }
-    foreach ($aclNumber in 1..8) {
+    foreach ($aclNumber in 1..10) {
         Assert-RelocationFailureScenario -Name "acl-$aclNumber" -FailureStage 'Acl' -FailureAt $aclNumber
     }
     Assert-RelocationFailureScenario -Name 'move-before' -FailureStage 'Move' -FailureAt 1

@@ -690,7 +690,7 @@ try {
     $mainScriptSource = $source.Substring($mainScriptStart)
     $profileValidationIndex = $mainScriptSource.IndexOf('$approvedProfile = Get-OOShutUpApprovedProfile', [System.StringComparison]::Ordinal)
     $missingProfileGuardIndex = $mainScriptSource.IndexOf('if ($null -eq $approvedProfile)', [System.StringComparison]::Ordinal)
-    $missingProfileExitIndex = if ($missingProfileGuardIndex -ge 0) { $mainScriptSource.IndexOf('exit 1', $missingProfileGuardIndex, [System.StringComparison]::Ordinal) } else { -1 }
+    $missingProfileExitIndex = if ($missingProfileGuardIndex -ge 0) { $mainScriptSource.IndexOf('exit (Get-OOShutUpTerminalExitCode -Outcome Failed -ExitCode 1)', $missingProfileGuardIndex, [System.StringComparison]::Ordinal) } else { -1 }
     Assert-True ($profileValidationIndex -ge 0 -and $missingProfileGuardIndex -gt $profileValidationIndex -and $missingProfileExitIndex -gt $missingProfileGuardIndex) 'the main entry point exits when profile validation fails'
     foreach ($sideEffectMarker in @(
         'Get-ScriptRelocationPackageTarget',
@@ -714,6 +714,9 @@ try {
     Assert-True ($source -notmatch '(?m)Start-Process[^\r\n]*-Wait') 'the O&O child is started without an unbounded Start-Process wait'
 
     $requiredFunctions = @(
+        'Set-OOShutUpLogStage',
+        'Set-OOShutUpLogErrorCategory',
+        'Set-OOShutUpLogOutcome',
         'Get-OOShutUpTrustedReleaseSignerThumbprint',
         'Test-OOShutUpEnforcedAllSignedPolicy',
         'Test-OOShutUpMachineTrustedPublisher',
@@ -1028,7 +1031,7 @@ try {
     Assert-Equal 1 ([regex]::Matches($reapplyBranch, 'Invoke-OOShutUpConfiguration -ExecutablePath \$exePath -SystemReapply').Count) 'one ReapplyOnly invocation makes at most one bounded reapply per operator command'
     Assert-True ($reapplyBranch -notmatch '(?i)\b(Get|Start|Register|Unregister)-ScheduledTask\b') 'manual ReapplyOnly recovery does not depend on Task Scheduler availability'
     Assert-True ($reapplyBranch -notmatch '(?i)Invoke-OOShutUpTaskSetup|Invoke-OOShutUpRestart|\bwhile\s*\(|\bfor\s*\(') 'ReapplyOnly recovery creates no task, requests no restart, and adds no retry loop'
-    Assert-True ($reapplyBranch.Contains('exit 0')) 'successful ReapplyOnly recovery exits before normal installation and restart handling'
+    Assert-True ($reapplyBranch.Contains('Get-OOShutUpTerminalExitCode -Outcome Complete -ExitCode 0')) 'successful ReapplyOnly recovery records its terminal result before exiting'
     foreach ($mutationMarker in @(
         'Invoke-ScriptRelocation -CurrentScriptPath',
         'Invoke-OOShutUpConfigurationWithRestorePointGate',
@@ -1048,7 +1051,7 @@ try {
     Assert-True ($mainSource.Contains('$taskSetup = Invoke-OOShutUpTaskSetup') -and $mainSource.Contains('$installerOutcome = Get-OOShutUpInstallOutcome')) 'the normal flow consumes explicit task and configuration outcomes'
     Assert-True ($source -notmatch '\$SettingsVerified|SettingsOutcome\s*=\s*''Verified''') 'native O&O exit results are not converted into settings verification'
     Assert-True ($source.Contains('ReadbackState = ''Unavailable''') -and $source.Contains('SettingsReadback = $settingsReadback')) 'the installer reports that independent settings readback is unavailable'
-    Assert-True ($mainSource.Contains('exit $installerOutcome.ExitCode')) 'the normal flow returns the computed complete, partial, or failed exit code'
+    Assert-True ($mainSource.Contains('exit (Get-OOShutUpTerminalExitCode -Outcome $installerOutcome.Status -ExitCode $installerOutcome.ExitCode)')) 'the normal flow records its final outcome and returns a fail-closed exit code'
     Assert-True ($mainSource.Contains('Write-OOShutUpInstallSummary -Outcome $installerOutcome')) 'the normal flow logs the summary from the installer outcome contract'
     Assert-True (-not $mainSource.Contains('=== Configuration Complete ===')) 'full-success wording is not unconditional in the normal flow'
     $summaryFunctionSource = [string](@($functionAsts | Where-Object { $_.Name -eq 'Write-OOShutUpInstallSummary' })[0].Extent.Text)

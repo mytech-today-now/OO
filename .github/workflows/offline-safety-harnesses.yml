@@ -1,0 +1,37 @@
+name: Offline safety harnesses
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-powershell-51:
+    name: Windows PowerShell 5.1 offline harnesses
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Run aggregate offline checks
+        shell: powershell
+        run: .\tests\run-offline-tests.ps1
+
+  windows-powershell-7:
+    name: PowerShell 7 offline harnesses
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Run aggregate offline checks
+        shell: pwsh
+        run: ./tests/run-offline-tests.ps1
+
+  linux-bash:
+    name: Linux Bash offline harnesses
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Run aggregate offline checks
+        shell: pwsh
+        run: ./tests/run-offline-tests.ps1

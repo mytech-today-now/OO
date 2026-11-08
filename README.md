@@ -125,9 +125,9 @@ This repository contains an installer framework for **O&O ShutUp10++**. It can a
 - Queues overlapping reapplications so a later successful update is not discarded
 
 ### ✅ **Comprehensive Logging**
-- Color-coded console output with timestamps
-- Detailed error messages and stack traces
-- Clear status indicators (INFO, SUCCESS, WARNING, ERROR)
+- Protected, structured application diagnostics for hidden scheduled-task runs
+- Rotating logs with stage, run ID, safe error category, native result, approved profile digests, and outcome
+- Console output remains available for interactive runs; profile values, configuration contents, credentials, and tokens are not written to the application log
 
 ## Requirements
 
@@ -364,6 +364,14 @@ Get-ScheduledTaskInfo -TaskName "Install-OOShutUp10" -TaskPath "\myTech.Today\"
 
 For the full Task Scheduler history, open `\myTech.Today\Install-OOShutUp10` in Task Scheduler and select its **History** tab.
 
+#### Application Diagnostics
+
+The installer and hidden SYSTEM task write stage-level JSON Lines records to `%ProgramData%\myTech.Today-OOShutUp10\Logs\Install-OOShutUp10.jsonl`. The directory and each log file have protected ACLs granting full access only to LocalSystem and Builtin Administrators. The current file is limited to 1 MiB, with up to three 1 MiB rotated files (`.1` through `.3`).
+
+Each record contains a UTC timestamp, run ID, stage, status level, safe error category, numeric native result when available, approved profile and manifest SHA-256 digests, and outcome. Free-form messages are not stored in the file. Profile selections and values, `.cfg` contents, credentials, and tokens are excluded. Task Scheduler history and `Get-ScheduledTaskInfo` continue to provide task-level start time and result; the application log provides the run stage and recovery context.
+
+If the protected logger cannot initialize, configuration stops before changes begin. If a write or rotation fails during a run, the script prints a safe console fallback, suppresses error details in that fallback, and returns failure instead of recording or returning `Complete`. Read the file from an elevated PowerShell session. A machine execution-policy or signature rejection that prevents the trusted script from starting remains visible only in Task Scheduler history.
+
 ### Removing the Scheduled Task
 
 This removes only the registration at `\myTech.Today\Install-OOShutUp10` after confirmation. It does not delete the installer, approved profile, O&O executable, or logs. The exact-path lookup must return one task before removal is attempted:
@@ -486,6 +494,10 @@ The hold-open helper must share read, write, and delete access; a `FileShare.Non
 Before applying the profile, the script attempts to create a Windows restore point and reports whether that attempt succeeded. In O&O ShutUp10, use **Actions → Undo → History** to review and undo the session that applied the profile. O&O keeps a stack of recent sessions, so undoing an older entry also rolls back newer entries above it. See [O&O's undo-history instructions](https://manuals.oo-software.com/ooshutup10/en/docs/common-features/undo-history/). A restore point is a broader recovery option when available; neither recovery path is guaranteed by this script.
 
 The disposable-VM recovery gate is documented in [docs/recovery-vm-acceptance.md](docs/recovery-vm-acceptance.md). Recovery remains **NOT VERIFIED** until a reviewed harmless fixture has been applied and the O&O Undo History result has a completed VM record. Record System Restore point availability separately; a listed point does not demonstrate that a restore operation will succeed. Never run this gate on a developer workstation.
+
+### Running the offline safety harnesses
+
+From the repository root, run `.\tests\run-offline-tests.ps1` in Windows PowerShell 5.1 or PowerShell 7. On Linux, run `pwsh ./tests/run-offline-tests.ps1`; Windows-only checks are reported as skipped and the Bash harnesses run. The aggregate runner continues through failures and returns a nonzero exit code when any check fails. These offline checks do not establish live Windows ACL, registry, Task Scheduler, O&O, or disposable-VM behavior.
 
 ## Troubleshooting
 

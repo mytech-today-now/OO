@@ -4,6 +4,8 @@
 
 ### Changed
 
+- Add a protected, rotating SYSTEM application log with safe stage diagnostics; logging failures stop initialization or prevent a successful completion result.
+- Add an aggregate offline safety runner and Windows PowerShell 5.1, PowerShell 7, and Linux Bash CI jobs.
 - Check administrator access before runtime discovery and request UAC elevation through the signed helper when needed. Preserve installer arguments and exit status, and stop when elevation is canceled.
 - Run `dnf` and `pacman` installation directly as root or through `sudo`, preserving package-manager failures without retrying.
 - Add a checkpointed disposable-VM acceptance procedure for O&O Undo History recovery. Record System Restore availability separately and keep recovery **NOT VERIFIED** until a reviewed VM record is complete.

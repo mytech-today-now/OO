@@ -496,8 +496,8 @@ try {
 
     $mainSource = $source.Substring($source.IndexOf('#region Main Script', [System.StringComparison]::Ordinal))
     $mainGatePosition = $mainSource.IndexOf('if (-not $configurationResult.ConfigurationStarted)', [System.StringComparison]::Ordinal)
-    $mainFailureExitPosition = $mainSource.IndexOf('exit 1', $mainGatePosition, [System.StringComparison]::Ordinal)
-    Assert-True ($mainGatePosition -ge 0 -and $mainFailureExitPosition -gt $mainGatePosition) 'a blocked restore gate exits the installer with a nonzero status'
+    $mainFailureExitPosition = $mainSource.IndexOf('exit (Get-OOShutUpTerminalExitCode -Outcome Failed -ExitCode 1)', $mainGatePosition, [System.StringComparison]::Ordinal)
+    Assert-True ($mainGatePosition -ge 0 -and $mainFailureExitPosition -gt $mainGatePosition) 'a blocked restore gate records failure before the installer exits nonzero'
 
     $restoreCases = @(
         @{ Name = 'protection disabled'; Scenario = 'protection-disabled'; ExpectedCreated = $false; ExpectedPreparation = $true },
