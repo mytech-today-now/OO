@@ -56,9 +56,47 @@ else
                 exit "$status"
             fi
         elif command_exists dnf; then
-            [ "$EUID" -ne 0 ] && sudo dnf install -y powershell || dnf install -y powershell
+            if [ "$(id -u)" -eq 0 ]; then
+                if dnf install -y powershell; then
+                    :
+                else
+                    status=$?
+                    exit "$status"
+                fi
+            else
+                if ! command_exists sudo; then
+                    echo "[ERROR] sudo is required to install PowerShell with dnf when not running as root." >&2
+                    exit 127
+                fi
+
+                if sudo dnf install -y powershell; then
+                    :
+                else
+                    status=$?
+                    exit "$status"
+                fi
+            fi
         elif command_exists pacman; then
-            [ "$EUID" -ne 0 ] && sudo pacman -S --noconfirm powershell || pacman -S --noconfirm powershell
+            if [ "$(id -u)" -eq 0 ]; then
+                if pacman -S --noconfirm powershell; then
+                    :
+                else
+                    status=$?
+                    exit "$status"
+                fi
+            else
+                if ! command_exists sudo; then
+                    echo "[ERROR] sudo is required to install PowerShell with pacman when not running as root." >&2
+                    exit 127
+                fi
+
+                if sudo pacman -S --noconfirm powershell; then
+                    :
+                else
+                    status=$?
+                    exit "$status"
+                fi
+            fi
         else
             echo "[ERROR] Could not detect package manager."; exit 1
         fi

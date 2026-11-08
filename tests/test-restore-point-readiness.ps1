@@ -230,6 +230,8 @@ function Get-OOShutUpApprovedProfile {
         Sha256 = $script:OOShutUpApprovedDigest
         ManifestSha256 = $script:OOShutUpApprovedManifestDigest
         Version = 'test-1.0'
+        OOShutUpVersionMinimum = '3.6.1135.0'
+        OOShutUpVersionMaximum = '3.6.1135.0'
         SettingCount = 1
         Path = 'C:\fixtures\ooshutup10.cfg'
     }
@@ -287,7 +289,12 @@ function Remove-OOShutUpProfileSnapshot {
 
 function Test-OOShutUpPayload {
     [CmdletBinding()]
-    param([string]$Path, [switch]$Quiet)
+    param(
+        [string]$Path,
+        [switch]$Quiet,
+        [string]$ReviewedMinimumVersion,
+        [string]$ReviewedMaximumVersion
+    )
 
     return $true
 }

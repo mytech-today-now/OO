@@ -147,11 +147,11 @@ On Windows, `MachinePolicy` and `UserPolicy` Group Policy settings take preceden
 Before profile validation, relocation, registry work, restore-point work, O&O launch, or task changes, a production run requires all of the following:
 
 - An administrator-enforced `MachinePolicy` of `AllSigned`.
-- A valid Authenticode signature on `Install-OOShutUp10.ps1` and the adjacent `Install-OOShutUp10.release.psd1` manifest, signed by the same certificate.
+- A valid Authenticode signature on `Install-OOShutUp10.ps1`, `Install-OOShutUp10-Elevation.ps1`, and the adjacent `Install-OOShutUp10.release.psd1` manifest, signed by the same certificate.
 - The signer thumbprint to match `HKLM\SOFTWARE\Policies\myTech.Today\OOShutUp10\TrustedReleaseSignerThumbprint`.
 - A manifest with exactly `schemaVersion`, `scriptFile`, and `scriptSha256` fields whose digest matches the script bytes.
 
-The organization provisions the policy registry value and code-signing certificate outside this repository, and protects them with managed Windows policy. The certificate chain must be trusted and its public certificate must be in the machine's Trusted Publishers store. Release automation signs the script first, computes its SHA-256 over the final signed bytes, writes the manifest, then signs the manifest. The scheduled task uses the same signed release package and trust checks. The release manifest is copied and ACL-checked with the script during relocation. No private key or maintained release hash belongs in the repository.
+The organization provisions the policy registry value and code-signing certificate outside this repository, and protects them with managed Windows policy. The certificate chain must be trusted and its public certificate must be in the machine's Trusted Publishers store. Release automation signs the installer and elevation helper first, computes the installer's SHA-256 over its final signed bytes, writes the manifest, then signs the manifest. The scheduled task uses the same signed release package and trust checks. The release manifest is copied and ACL-checked with the installer during relocation. No private key or maintained release hash belongs in the repository.
 
 The release manifest is a PowerShell data file with exactly these fields:
 
@@ -185,7 +185,7 @@ Use that development path only on a disposable test machine with a harmless appr
 
 ### Initial Installation and Setup
 
-Run the script as Administrator in CMD:
+Run the launcher from CMD. A configured production package checks administrator access before runtime discovery and requests UAC elevation through the signed helper when needed. Canceling the prompt stops before runtime installation or O&O launch:
 
 ```cmd (elevated)
 <drive>:\path\to\script\install.bat
@@ -484,6 +484,8 @@ The hold-open helper must share read, write, and delete access; a `FileShare.Non
 ### Rollback
 
 Before applying the profile, the script attempts to create a Windows restore point and reports whether that attempt succeeded. In O&O ShutUp10, use **Actions → Undo → History** to review and undo the session that applied the profile. O&O keeps a stack of recent sessions, so undoing an older entry also rolls back newer entries above it. See [O&O's undo-history instructions](https://manuals.oo-software.com/ooshutup10/en/docs/common-features/undo-history/). A restore point is a broader recovery option when available; neither recovery path is guaranteed by this script.
+
+The disposable-VM recovery gate is documented in [docs/recovery-vm-acceptance.md](docs/recovery-vm-acceptance.md). Recovery remains **NOT VERIFIED** until a reviewed harmless fixture has been applied and the O&O Undo History result has a completed VM record. Record System Restore point availability separately; a listed point does not demonstrate that a restore operation will succeed. Never run this gate on a developer workstation.
 
 ## Troubleshooting
 

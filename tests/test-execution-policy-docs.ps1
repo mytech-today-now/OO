@@ -58,9 +58,11 @@ function ConvertTo-PolicySnapshot {
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $readmePath = Join-Path $repoRoot 'README.md'
 $installerPath = Join-Path $repoRoot 'Install-OOShutUp10.ps1'
+$elevationHelperPath = Join-Path $repoRoot 'Install-OOShutUp10-Elevation.ps1'
 $batchPath = Join-Path $repoRoot 'install.bat'
 $readme = [System.IO.File]::ReadAllText($readmePath)
 $installer = [System.IO.File]::ReadAllText($installerPath)
+$elevationHelper = [System.IO.File]::ReadAllText($elevationHelperPath)
 $batch = [System.IO.File]::ReadAllText($batchPath)
 $fallback = 'PowerShell policy blocks this production launch. No policy was changed; restore a trusted signed release or use -DevelopmentMode only from a source checkout.'
 
@@ -114,6 +116,9 @@ Assert-True ($installer.Contains('powershell.exe -NoProfile -ExecutionPolicy Byp
 Assert-True ($installer.Contains('pwsh.exe -NoProfile -ExecutionPolicy Bypass -File')) 'script help documents the PowerShell 7 process-scoped launch'
 Assert-True ($installer.Contains('Development mode is available only for a Git source checkout') -and $installer.Contains('does not relocate the checkout or create a scheduled task')) 'script help limits unsigned execution to explicit checkout development mode'
 Assert-True ($batch -match '(?im)^pwsh -NoProfile -ExecutionPolicy AllSigned -File ') 'batch wrapper requires signed scripts for production launch'
+Assert-True ($batch -match '(?im)^powershell -NoProfile -ExecutionPolicy AllSigned -File .*Install-OOShutUp10-Elevation\.ps1') 'batch wrapper requires a signed elevation helper'
+Assert-True ($elevationHelper.Contains('Start-Process') -and $elevationHelper.Contains('-Verb RunAs') -and $elevationHelper.Contains('return [int]$process.ExitCode')) 'the elevation helper uses UAC and preserves the child status'
+Assert-True ($batch.IndexOf('net session', [System.StringComparison]::Ordinal) -lt $batch.IndexOf('where pwsh', [System.StringComparison]::Ordinal)) 'the batch wrapper checks administrator access before runtime discovery'
 
 $windowsPowerShell = Get-Command powershell.exe -ErrorAction SilentlyContinue
 $powerShell7 = Get-Command pwsh.exe -ErrorAction SilentlyContinue
@@ -161,6 +166,7 @@ try {
     $mockBin = Join-Path $tempRoot 'mock-bin'
     [void][System.IO.Directory]::CreateDirectory($mockBin)
     $fakePwshPath = Join-Path $mockBin 'pwsh.cmd'
+    $fakeNetPath = Join-Path $mockBin 'net.cmd'
     $batchCapturePath = Join-Path $tempRoot 'batch-arguments.txt'
     $fakePwsh = [string]::Join([Environment]::NewLine, @(
         '@echo off',
@@ -169,10 +175,21 @@ try {
     )) + [Environment]::NewLine
     [System.IO.File]::WriteAllText($fakePwshPath, $fakePwsh, $utf8NoBom)
 
+    $fakeNet = [string]::Join([Environment]::NewLine, @(
+        '@echo off',
+        'exit /b 0'
+    )) + [Environment]::NewLine
+    [System.IO.File]::WriteAllText($fakeNetPath, $fakeNet, $utf8NoBom)
+
+    $testBatchPath = Join-Path $tempRoot 'install-under-test.bat'
+    $testBatch = [System.Text.RegularExpressions.Regex]::Replace($batch, '(?m)^net session ', 'call net session ')
+    $testBatch = $testBatch.Replace('pwsh -NoProfile -ExecutionPolicy AllSigned -File', 'call pwsh -NoProfile -ExecutionPolicy AllSigned -File')
+    [System.IO.File]::WriteAllText($testBatchPath, $testBatch, [System.Text.Encoding]::ASCII)
+
     $batchRunnerPath = Join-Path $tempRoot 'run-mocked-batch.cmd'
     $batchRunner = [string]::Join([Environment]::NewLine, @(
         '@echo off',
-        ('call "' + $batchPath + '" < nul'),
+        ('call "' + $testBatchPath + '" < nul'),
         'exit /b %ERRORLEVEL%'
     )) + [Environment]::NewLine
     [System.IO.File]::WriteAllText($batchRunnerPath, $batchRunner, $utf8NoBom)

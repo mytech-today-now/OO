@@ -4,6 +4,10 @@
 
 ### Changed
 
+- Check administrator access before runtime discovery and request UAC elevation through the signed helper when needed. Preserve installer arguments and exit status, and stop when elevation is canceled.
+- Run `dnf` and `pacman` installation directly as root or through `sudo`, preserving package-manager failures without retrying.
+- Add a checkpointed disposable-VM acceptance procedure for O&O Undo History recovery. Record System Restore availability separately and keep recovery **NOT VERIFIED** until a reviewed VM record is complete.
+- Expand mock coverage for installer elevation, argument forwarding, WinGet consent, restore-point outcomes, and `dnf`/`pacman` behavior.
 - Reapply the approved profile only after Windows Update Client event 19, wait two minutes, and queue overlapping task runs.
 - Verify the task trigger and queue policy before replacing the owned task. Report partial setup with exit code `2` and task recovery instructions when settings were applied but the task is unverified.
 - Offer a timed, cancellable graceful restart after settings change. Force-closing applications requires the explicit `-ForceRestart` option, and non-interactive runs skip restart.

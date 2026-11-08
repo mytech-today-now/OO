@@ -677,7 +677,7 @@ try {
     Assert-True ($readmeSource.Contains('Configuration is unavailable from a clean checkout.') -and $readmeSource.Contains('the `profiles/` directory contains only `README.md`') -and $readmeSource.Contains('No default settings are included or implied.')) 'the README clearly labels the clean-checkout profile blocker'
     Assert-True ($source.Contains('The task profile contains settings with unknown user scope. Reapplication was skipped; review the profile scope before retrying.')) 'unknown scope has the required fail-closed status'
     Assert-True ($source.Contains('The SYSTEM task target ACL could not be verified. No task was registered; move the script to a protected path and retry.')) 'the required task ACL fallback is present'
-    Assert-True ($installerBatchSource.Contains('set "INSTALLER_EXIT_CODE=!ERRORLEVEL!"') -and $installerBatchSource.Contains('exit /b !INSTALLER_EXIT_CODE!')) 'the batch wrapper preserves the PowerShell installer exit code'
+    Assert-True ($installerBatchSource.Contains('set "INSTALLER_EXIT_CODE=%ERRORLEVEL%"') -and $installerBatchSource.Contains('exit /b %INSTALLER_EXIT_CODE%')) 'the batch wrapper preserves the PowerShell installer exit code'
     Assert-True ($installerBatchSource.Contains('Setup is partial. Repair the update task before relying on automatic reapplication.')) 'the batch wrapper reports partial setup with the task recovery action'
     Assert-True ($installerBatchSource -notmatch '\[INFO\] Complete\.') 'the batch wrapper does not print unconditional completion'
     Assert-True ($source.Contains('Task ownership is ambiguous. No task was deleted; inspect the listed path and retry after confirming ownership.')) 'ambiguous task ownership has the required fallback'
@@ -1133,8 +1133,20 @@ try {
         }
 
         $overrideSetupResult = [pscustomobject]@{ Verified = $true; ExceptionMessage = $null }
+        $unavailableRestoreInstallResult = Get-OOShutUpInstallOutcome `
+            -ConfigurationOutcome $changedConfigurationOutcome `
+            -RestorePointVerified $false `
+            -RestorePointOverrideUsed $false `
+            -TaskSetup $overrideSetupResult
+        Assert-Equal 'Failed' $unavailableRestoreInstallResult.Status 'an unavailable restore point without override cannot report a complete install'
+        Assert-Equal 1 $unavailableRestoreInstallResult.ExitCode 'an unavailable restore point without override returns failure'
+        Assert-Equal 'Not verified' $unavailableRestoreInstallResult.RestorePointOutcome 'an unavailable restore point is not mislabeled as verified'
+        Assert-True ($unavailableRestoreInstallResult.Summary.Contains('required restore point was not verified')) 'the failure summary accurately identifies the missing restore point'
+        Assert-True ($unavailableRestoreInstallResult.RecoveryMessage.Contains('A restore point could not be verified')) 'the failure recovery guidance matches the unavailable restore status'
+
         $overrideInstallResult = Get-OOShutUpInstallOutcome -ConfigurationOutcome $changedConfigurationOutcome -RestorePointVerified $false -RestorePointOverrideUsed $true -TaskSetup $overrideSetupResult
         Assert-Equal 0 $overrideInstallResult.ExitCode 'an explicit restore point override still permits success when the task is verified'
+        Assert-Equal 'Complete' $overrideInstallResult.Status 'the explicit override status agrees with the verified task and O&O outcome'
         Assert-Equal 'Explicitly overridden' $overrideInstallResult.RestorePointOutcome 'the result retains the separate restore point outcome'
 
         $unknownConfigurationOutcome = New-OOShutUpConfigurationOutcome `
