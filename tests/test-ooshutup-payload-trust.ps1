@@ -674,7 +674,7 @@ try {
     Assert-True ($source.Contains('Get-AuthenticodeSignature -FilePath $Path')) 'Authenticode is checked before accepting a payload'
     Assert-True ($source.Contains('The O&O download could not be authenticated. No executable was started; verify the vendor signature before retrying.')) 'the required authentication fallback is present'
     Assert-True ($source.Contains('The approved settings profile is missing or invalid. No privacy settings were applied; place the reviewed profile in the configured directory.')) 'the required profile fallback is present'
-    Assert-True ($readmeSource.Contains('Configuration is unavailable from a clean checkout.') -and $readmeSource.Contains('the `profiles/` directory contains only `README.md`') -and $readmeSource.Contains('No default settings are included or implied.')) 'the README clearly labels the clean-checkout profile blocker'
+    Assert-True ($readmeSource.Contains('Approved configuration is unavailable from a clean checkout.') -and $readmeSource.Contains('estimated candidate') -and $readmeSource.Contains('approval manifest and per-setting scope-evidence records are absent') -and $readmeSource.Contains('No approved default settings are included or implied.')) 'the README distinguishes the unapproved estimate from an installable profile'
     Assert-True ($source.Contains('The task profile contains settings with unknown user scope. Reapplication was skipped; review the profile scope before retrying.')) 'unknown scope has the required fail-closed status'
     Assert-True ($source.Contains('The SYSTEM task target ACL could not be verified. No task was registered; move the script to a protected path and retry.')) 'the required task ACL fallback is present'
     Assert-True ($installerBatchSource.Contains('set "INSTALLER_EXIT_CODE=%ERRORLEVEL%"') -and $installerBatchSource.Contains('exit /b %INSTALLER_EXIT_CODE%')) 'the batch wrapper preserves the PowerShell installer exit code'
@@ -692,10 +692,21 @@ try {
     $missingProfileGuardIndex = $mainScriptSource.IndexOf('if ($null -eq $approvedProfile)', [System.StringComparison]::Ordinal)
     $missingProfileExitIndex = if ($missingProfileGuardIndex -ge 0) { $mainScriptSource.IndexOf('exit (Get-OOShutUpTerminalExitCode -Outcome Failed -ExitCode 1)', $missingProfileGuardIndex, [System.StringComparison]::Ordinal) } else { -1 }
     Assert-True ($profileValidationIndex -ge 0 -and $missingProfileGuardIndex -gt $profileValidationIndex -and $missingProfileExitIndex -gt $missingProfileGuardIndex) 'the main entry point exits when profile validation fails'
+    $preProfileFlow = $mainScriptSource.Substring(0, $profileValidationIndex)
+    foreach ($protectedOperation in @(
+        'Set-ItemProperty',
+        'Set-RestorePointFrequencyRawValue',
+        'New-SystemRestorePoint',
+        'Start-Process',
+        'Register-ScheduledTask'
+    )) {
+        Assert-True (-not $preProfileFlow.Contains($protectedOperation)) "the main entry point does not reach $protectedOperation before profile validation"
+    }
     foreach ($sideEffectMarker in @(
         'Get-ScriptRelocationPackageTarget',
         'Install-OOShutUp',
         'Invoke-OOShutUpConfigurationWithRestorePointGate',
+        'Invoke-OOShutUpConfiguration -ExecutablePath',
         'Invoke-OOShutUpTaskSetup'
     )) {
         $sideEffectIndex = $mainScriptSource.IndexOf($sideEffectMarker, [System.StringComparison]::Ordinal)
@@ -1907,6 +1918,38 @@ try {
     Assert-Equal 'Failed' (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture).State 'a malformed manifest prevents configuration'
     Assert-Equal $startedBeforeMalformedManifest $script:StartedPaths.Count 'a malformed manifest causes no process launch'
     Assert-InvalidProfileStopsBeforeTaskMutation -Name 'malformed manifest'
+
+    $cleanCheckoutProfileDirectory = Join-Path $script:FixtureRoot 'clean checkout with unavailable configuration\profiles'
+    [System.IO.Directory]::CreateDirectory($cleanCheckoutProfileDirectory) | Out-Null
+    Copy-Item -LiteralPath (Join-Path $repoRoot 'profiles\README.md') -Destination (Join-Path $cleanCheckoutProfileDirectory 'README.md')
+    $savedProfileDirectory = $script:OOShutUpProfileDirectory
+    $savedProfilePath = $script:OOShutUpProfilePath
+    $savedProfileManifestPath = $script:OOShutUpProfileManifestPath
+    try {
+        $script:OOShutUpProfileDirectory = $cleanCheckoutProfileDirectory
+        $script:OOShutUpProfilePath = Join-Path $cleanCheckoutProfileDirectory 'ooshutup10.cfg'
+        $script:OOShutUpProfileManifestPath = Join-Path $cleanCheckoutProfileDirectory 'ooshutup10.approval.json'
+        Assert-Equal $false (Test-Path -LiteralPath $script:OOShutUpProfilePath) 'the clean-checkout fixture has no settings profile'
+        Assert-Equal $false (Test-Path -LiteralPath $script:OOShutUpProfileManifestPath) 'the clean-checkout fixture has no approval manifest'
+        Assert-Equal $false (Test-Path -LiteralPath (Join-Path $cleanCheckoutProfileDirectory 'scope-evidence')) 'the clean-checkout fixture has no per-setting scope records'
+
+        $script:LogMessages.Clear()
+        $startedBeforeCleanCheckout = $script:StartedPaths.Count
+        $taskLookupsBeforeCleanCheckout = $script:ScheduledTaskLookupCount
+        $taskRegistrationsBeforeCleanCheckout = $script:TaskRegistrationCalls.Count
+        Assert-Equal $null (Get-OOShutUpApprovedProfile) 'a checkout containing only the profile instructions remains configuration-unavailable'
+        Assert-True ([string]::Join("`n", [string[]]$script:LogMessages.ToArray()).Contains($script:OOShutUpProfileFailureMessage)) 'clean-checkout rejection reports that the approved profile is missing or invalid'
+        Assert-Equal 'Failed' (Invoke-OOShutUpConfiguration -ExecutablePath $validFixture).State 'the clean-checkout profile gate fails before configuration'
+        Assert-Equal $startedBeforeCleanCheckout $script:StartedPaths.Count 'the clean-checkout profile gate starts no O&O settings process'
+        Assert-Equal $taskLookupsBeforeCleanCheckout $script:ScheduledTaskLookupCount 'the clean-checkout profile gate performs no task lookup'
+        Assert-Equal $taskRegistrationsBeforeCleanCheckout $script:TaskRegistrationCalls.Count 'the clean-checkout profile gate registers no scheduled task'
+        Assert-InvalidProfileStopsBeforeTaskMutation -Name 'clean checkout without reviewed profile artifacts'
+    }
+    finally {
+        $script:OOShutUpProfileDirectory = $savedProfileDirectory
+        $script:OOShutUpProfilePath = $savedProfilePath
+        $script:OOShutUpProfileManifestPath = $savedProfileManifestPath
+    }
 
     Remove-Item -LiteralPath $script:OOShutUpProfilePath -Force
     $startedBeforeMissingProfile = $script:StartedPaths.Count

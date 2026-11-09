@@ -1,0 +1,801 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>O&amp;O ShutUp10 Profile Review Intake</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #17212b;
+      --muted: #536272;
+      --line: #c9d3dc;
+      --panel: #ffffff;
+      --canvas: #f2f5f7;
+      --brand: #075e70;
+      --brand-dark: #064653;
+      --warning: #6d4300;
+      --warning-bg: #fff3d5;
+      --danger: #8a2525;
+      --success: #155b37;
+      --focus: #0b6fca;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--canvas);
+      color: var(--ink);
+      font: 16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+    header, main, footer { width: min(1120px, calc(100% - 2rem)); margin-inline: auto; }
+    header { padding: 2.5rem 0 1.25rem; }
+    h1 { margin: 0 0 .65rem; font-size: clamp(1.8rem, 3vw, 2.6rem); line-height: 1.15; }
+    h2 { margin: 0 0 .7rem; font-size: 1.35rem; }
+    h3 { margin: 0; font-size: 1.1rem; }
+    p { margin: .45rem 0 0; }
+    .lede { max-width: 78ch; color: var(--muted); font-size: 1.05rem; }
+    .notice, .section, .setting-card, .scope-run {
+      border: 1px solid var(--line);
+      border-radius: .8rem;
+      background: var(--panel);
+    }
+    .notice { margin: 1rem 0; padding: 1rem 1.15rem; }
+    .notice h2 { font-size: 1.1rem; }
+    .notice-warning { border-color: #d6aa54; background: var(--warning-bg); color: #442b00; }
+    .section { margin: 1rem 0; padding: 1.25rem; }
+    .section-heading { display: flex; align-items: start; gap: .8rem; margin-bottom: 1rem; }
+    .step {
+      display: inline-grid;
+      width: 2rem;
+      height: 2rem;
+      flex: 0 0 2rem;
+      place-items: center;
+      border-radius: 50%;
+      background: #e2f1f3;
+      color: var(--brand-dark);
+      font-weight: 750;
+    }
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; }
+    .grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .field { display: flex; min-width: 0; flex-direction: column; gap: .3rem; }
+    [hidden] { display: none !important; }
+    .field > span, .field > label { font-weight: 650; }
+    label { cursor: pointer; }
+    input, select, textarea, button { font: inherit; }
+    input[type="text"], input[type="date"], input[type="file"], select, textarea {
+      width: 100%;
+      min-height: 2.7rem;
+      padding: .55rem .65rem;
+      border: 1px solid #8796a4;
+      border-radius: .4rem;
+      background: #fff;
+      color: var(--ink);
+    }
+    input[type="file"] { padding: .4rem; }
+    textarea { min-height: 5.4rem; resize: vertical; }
+    input:focus-visible, select:focus-visible, textarea:focus-visible, button:focus-visible, summary:focus-visible {
+      outline: 3px solid var(--focus);
+      outline-offset: 2px;
+    }
+    .help, .muted { color: var(--muted); font-size: .92rem; }
+    .check-row { display: flex; align-items: start; gap: .55rem; margin-top: .8rem; }
+    .check-row input { width: 1.15rem; height: 1.15rem; margin: .18rem 0 0; flex: 0 0 auto; }
+    .file-status { margin-top: .85rem; padding: .7rem .8rem; border-radius: .45rem; background: #edf2f5; white-space: pre-wrap; }
+    .file-status[data-state="error"] { color: var(--danger); background: #fff0ef; }
+    .file-status[data-state="success"] { color: var(--success); background: #eaf6ef; }
+    .settings-empty { padding: 1rem; border: 1px dashed #9cabb8; border-radius: .55rem; color: var(--muted); }
+    .setting-card { margin: 1rem 0; padding: 1rem; }
+    .setting-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: .7rem; margin-bottom: 1rem; }
+    .setting-id { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+    .pill { padding: .2rem .6rem; border: 1px solid #9db8bd; border-radius: 99px; background: #edf8f8; font-weight: 700; }
+    .scope-run { margin-top: .85rem; padding: 1rem; background: #f8fafb; }
+    .scope-run summary { cursor: pointer; font-weight: 700; }
+    .run-body { padding-top: 1rem; }
+    .subhead { margin: 1rem 0 .55rem; font-size: 1rem; }
+    .divider { height: 1px; margin: 1rem 0; border: 0; background: var(--line); }
+    .actions { display: flex; flex-wrap: wrap; align-items: center; gap: .7rem; margin-top: 1rem; }
+    button {
+      min-height: 2.7rem;
+      padding: .55rem .95rem;
+      border: 1px solid var(--brand-dark);
+      border-radius: .45rem;
+      background: var(--brand);
+      color: white;
+      cursor: pointer;
+      font-weight: 700;
+    }
+    button:hover { background: var(--brand-dark); }
+    button.secondary { border-color: #71818e; background: #fff; color: var(--ink); }
+    button.secondary:hover { background: #edf2f5; }
+    button.remove { border-color: #a34545; background: #fff; color: var(--danger); }
+    button.remove:hover { background: #fff0ef; }
+    button:disabled { cursor: not-allowed; opacity: .58; }
+    .save-panel { position: sticky; bottom: 0; z-index: 2; margin-top: 1.3rem; padding: .9rem 1rem; border: 1px solid #9eb3bb; border-radius: .75rem .75rem 0 0; background: #eef7f8; box-shadow: 0 -5px 18px #17212b12; }
+    .save-panel p { margin: 0; }
+    .save-status { min-height: 1.5rem; margin-top: .45rem !important; color: var(--muted); }
+    .save-status[data-state="error"] { color: var(--danger); }
+    .save-status[data-state="success"] { color: var(--success); }
+    .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+    footer { padding: 1.5rem 0 2.5rem; color: var(--muted); font-size: .92rem; }
+    @media (max-width: 760px) {
+      header, main, footer { width: min(100% - 1rem, 1120px); }
+      header { padding-top: 1.5rem; }
+      .grid, .grid-3 { grid-template-columns: 1fr; }
+      .section { padding: 1rem; }
+      .save-panel { position: static; border-radius: .75rem; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>O&amp;O ShutUp10 profile review intake</h1>
+    <p class="lede">Record an owner-reviewed profile from the exact exported <code>.cfg</code>, its O&amp;O source review, and a two-account disposable-VM scope check for every setting and reviewed release.</p>
+  </header>
+
+  <main>
+    <section class="notice notice-warning" aria-labelledby="boundary-title">
+      <h2 id="boundary-title">Review boundary</h2>
+      <p>This page does not choose settings, infer their meaning or scope, authenticate evidence, or approve a profile. Enter only decisions verified by the owner and current O&amp;O sources. The generated JSON is an intake bundle containing the exact profile bytes, a schema version 4 manifest object, and the supplied evidence. It still needs human review and must be split into the installer's separate files and scope records before use.</p>
+      <p>All processing stays in this browser tab. The uploaded configuration and evidence are embedded in the saved JSON, so store that file as carefully as the profile itself.</p>
+    </section>
+
+    <form id="intakeForm" novalidate>
+      <section class="section" aria-labelledby="profile-heading">
+        <div class="section-heading"><span class="step" aria-hidden="true">1</span><div><h2 id="profile-heading">Profile and owner review</h2><p class="muted">The setting IDs and states are read from the selected O&amp;O export. Other values must come from review evidence.</p></div></div>
+        <div class="grid">
+          <label class="field" for="cfgFile"><span>O&amp;O ShutUp10 exported profile (.cfg)</span><input id="cfgFile" type="file" accept=".cfg,text/plain" required><span class="help">The bundle stores these exact bytes and calculates their SHA-256 digest locally.</span></label>
+          <label class="field" for="reviewer"><span>Owner or authorized reviewer</span><input id="reviewer" type="text" maxlength="120" autocomplete="name" required><span class="help">Enter the person or accountable team that completed the review.</span></label>
+          <label class="field" for="reviewerRole"><span>Review authority</span><select id="reviewerRole" required><option value="">Choose one</option><option value="owner">Product owner</option><option value="authorized-delegate">Authorized delegate with owner sign-off</option><option value="not-owner-reviewed">Not owner-reviewed yet</option></select></label>
+          <label id="ownerApproverRow" class="field" for="ownerApprover" hidden><span>Product owner who approved this review</span><input id="ownerApprover" type="text" maxlength="120" autocomplete="name"><span class="help">Required when an authorized delegate records the review.</span></label>
+          <label id="ownerApprovalDateRow" class="field" for="ownerApprovalDate" hidden><span>Product owner approval date</span><input id="ownerApprovalDate" type="date"><span class="help">Required when an authorized delegate records the review.</span></label>
+          <label class="field" for="reviewDate"><span>Owner review date</span><input id="reviewDate" type="date" required></label>
+          <label class="field" for="profileVersion"><span>Reviewed profile version</span><input id="profileVersion" type="text" maxlength="64" placeholder="For example, 1.0.0" required><span class="help">Use letters, numbers, dots, underscores, or hyphens.</span></label>
+        </div>
+        <div id="fileStatus" class="file-status" role="status" aria-live="polite">Select the exact exported .cfg to load its settings.</div>
+      </section>
+
+      <section class="section" aria-labelledby="range-heading">
+        <div class="section-heading"><span class="step" aria-hidden="true">2</span><div><h2 id="range-heading">O&amp;O version review</h2><p class="muted">The range is inclusive and uses the executable's four-part Windows FileVersion. Exact-release approval uses the same value for both ends.</p></div></div>
+        <div class="grid grid-3">
+          <label class="field" for="minimumVersion"><span>Minimum reviewed version</span><input id="minimumVersion" type="text" inputmode="decimal" placeholder="3.6.1135.0" required></label>
+          <label class="field" for="maximumVersion"><span>Maximum reviewed version</span><input id="maximumVersion" type="text" inputmode="decimal" placeholder="3.6.1135.0" required></label>
+          <label class="field" for="reviewedReleases"><span>Every exact release included</span><textarea id="reviewedReleases" placeholder="One four-part FileVersion per line" aria-describedby="release-help"></textarea></label>
+        </div>
+        <p id="release-help" class="help">For an exact range, the minimum and maximum are recorded automatically. For a wider range, list each reviewed release version and confirm that the list covers every release in the inclusive range.</p>
+        <label id="rangeCoverageRow" class="check-row" hidden><input id="rangeCoverage" type="checkbox"><span>I verified that every O&amp;O release within the inclusive minimum-to-maximum range is included and reviewed below.</span></label>
+      </section>
+
+      <section class="section" aria-labelledby="settings-heading">
+        <div class="section-heading"><span class="step" aria-hidden="true">3</span><div><h2 id="settings-heading">Review every setting</h2><p class="muted">For each ID, enter its verified category, effect, availability, scope, and one complete VM record per reviewed release. Scope evidence must cover the machine hive and both disposable user hives.</p></div></div>
+        <div id="settingsList" class="settings-empty">Load a valid .cfg file to build the setting review forms.</div>
+      </section>
+
+      <section class="section" aria-labelledby="attest-heading">
+        <div class="section-heading"><span class="step" aria-hidden="true">4</span><div><h2 id="attest-heading">Owner review attestations</h2><p class="muted">These statements are required before an intake bundle can be saved.</p></div></div>
+        <label class="check-row"><input id="attestIds" type="checkbox"><span>I checked every setting ID and <code>+</code>/<code>-</code> state against the exact exported profile and the current O&amp;O setting information.</span></label>
+        <label class="check-row"><input id="attestSources" type="checkbox"><span>I verified that the supplied O&amp;O source links are official and current, and that the descriptions, categories, and availability match every release listed above.</span></label>
+        <label class="check-row"><input id="attestVm" type="checkbox"><span>The supplied scope records come from disposable Windows VMs, identify two distinct disposable accounts and SIDs, capture the machine and both user hives before and after, and show only the declared scope changed.</span></label>
+        <label class="check-row"><input id="attestOwner" type="checkbox"><span>The product owner completed or explicitly authorized this review. I understand that this form records claims but cannot verify the reviewer, source, VM, registry observations, or approval.</span></label>
+      </section>
+    </form>
+
+    <section class="save-panel" aria-label="Save review intake">
+      <div class="actions">
+        <button id="saveButton" type="button">Save review intake JSON</button>
+        <button id="clearButton" type="button" class="secondary">Clear form</button>
+      </div>
+      <p class="help">To put the JSON beside this HTML page, choose the folder containing this page when the browser asks. Browsers do not let a local page discover or write to its own folder without that choice.</p>
+      <p id="saveStatus" class="save-status" role="status" aria-live="polite"></p>
+    </section>
+  </main>
+
+  <footer>
+    <p>The installable package still requires the separate <code>ooshutup10.cfg</code>, matching <code>ooshutup10.approval.json</code>, and one reviewed <code>profiles/scope-evidence/&lt;SETTING-ID&gt;.md</code> record per setting. Current-user settings are not eligible for this repository's LocalSystem scheduled task.</p>
+  </footer>
+
+  <script>
+    (() => {
+      'use strict';
+
+      const form = document.getElementById('intakeForm');
+      const fileInput = document.getElementById('cfgFile');
+      const fileStatus = document.getElementById('fileStatus');
+      const settingsList = document.getElementById('settingsList');
+      const saveStatus = document.getElementById('saveStatus');
+      const minInput = document.getElementById('minimumVersion');
+      const maxInput = document.getElementById('maximumVersion');
+      const releasesInput = document.getElementById('reviewedReleases');
+      const coverageRow = document.getElementById('rangeCoverageRow');
+      const coverageInput = document.getElementById('rangeCoverage');
+      let cfgFile = null;
+      let cfgBytes = null;
+      let cfgDigest = null;
+      let cfgSettings = [];
+
+      function make(tag, attrs = {}, text = '') {
+        const node = document.createElement(tag);
+        for (const [key, value] of Object.entries(attrs)) {
+          if (key === 'className') node.className = value;
+          else if (key === 'dataset') Object.assign(node.dataset, value);
+          else if (key in node) node[key] = value;
+          else node.setAttribute(key, value);
+        }
+        if (text) node.textContent = text;
+        return node;
+      }
+
+      function addField(parent, labelText, control, helpText = '') {
+        const label = make('label', { className: 'field' });
+        const caption = make('span', {}, labelText);
+        label.append(caption, control);
+        if (helpText) label.append(make('span', { className: 'help' }, helpText));
+        parent.append(label);
+        return control;
+      }
+
+      function textInput(name, options = {}) {
+        return make('input', {
+          type: 'text',
+          name,
+          required: options.required !== false,
+          maxLength: options.maxLength || 512,
+          placeholder: options.placeholder || ''
+        });
+      }
+
+      function textArea(name, options = {}) {
+        const field = make('textarea', { name, required: options.required !== false, rows: options.rows || 3, placeholder: options.placeholder || '' });
+        return field;
+      }
+
+      function selectInput(name, options, required = true) {
+        const select = make('select', { name, required });
+        for (const option of options) select.append(make('option', { value: option.value }, option.label));
+        return select;
+      }
+
+      function setStatus(node, message, state = '') {
+        node.textContent = message;
+        if (state) node.dataset.state = state;
+        else delete node.dataset.state;
+      }
+
+      function decodeCfg(bytes) {
+        if (bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0xfe) {
+          return new TextDecoder('utf-16le', { fatal: true }).decode(bytes.subarray(2));
+        }
+        if (bytes.length >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) {
+          return new TextDecoder('utf-16be', { fatal: true }).decode(bytes.subarray(2));
+        }
+        return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+      }
+
+      function parseCfg(text) {
+        if (/^#\s*profile-status:\s*estimated-candidate\s*$/im.test(text)) {
+          throw new Error('This file is marked as an estimated candidate, not an O&O export. Do not use it to create owner-review approval evidence.');
+        }
+        const seen = new Set();
+        const entries = [];
+        const lines = text.split(/\r\n|\n|\r/);
+        for (let index = 0; index < lines.length; index += 1) {
+          const line = lines[index];
+          if (!line.trim() || line.trimStart().startsWith('#')) continue;
+          const match = line.match(/^\s*([A-Z][A-Z0-9]{1,15})[\t;]([+-])(?:[\t;].*)?\s*$/);
+          if (!match) throw new Error(`Line ${index + 1} is not a supported setting entry. Expected an ID, tab or semicolon, and + or - state.`);
+          const id = match[1];
+          if (seen.has(id)) throw new Error(`Setting ID ${id} appears more than once (line ${index + 1}).`);
+          seen.add(id);
+          entries.push({ id, state: match[2] });
+        }
+        if (!entries.length) throw new Error('The selected profile contains no setting entries.');
+        return entries;
+      }
+
+      async function digestBytes(bytes) {
+        if (!globalThis.crypto || !crypto.subtle) throw new Error('SHA-256 is unavailable in this browser context. Open this page in a modern browser on a secure local context and try again.');
+        const hash = await crypto.subtle.digest('SHA-256', bytes);
+        return Array.from(new Uint8Array(hash), byte => byte.toString(16).padStart(2, '0')).join('');
+      }
+
+      function rangeBounds() {
+        const parse = value => {
+          const text = value.trim();
+          if (!/^\d+\.\d+\.\d+\.\d+$/.test(text)) return null;
+          const parts = text.split('.').map(Number);
+          if (parts.some(part => !Number.isInteger(part) || part < 0 || part > 65535)) return null;
+          if (parts.some((part, i) => String(part) !== text.split('.')[i])) return null;
+          return { text, parts };
+        };
+        const minimum = parse(minInput.value);
+        const maximum = parse(maxInput.value);
+        if (!minimum || !maximum) throw new Error('Minimum and maximum must be canonical four-part O&O FileVersion values.');
+        if (compareVersions(minimum.parts, maximum.parts) > 0) throw new Error('The minimum O&O version must not be greater than the maximum.');
+        return { minimum, maximum };
+      }
+
+      function compareVersions(a, b) {
+        for (let i = 0; i < 4; i += 1) if (a[i] !== b[i]) return a[i] < b[i] ? -1 : 1;
+        return 0;
+      }
+
+      function reviewedReleaseVersions(bounds) {
+        if (bounds.minimum.text === bounds.maximum.text) return [bounds.minimum.text];
+        const values = releasesInput.value.split(/\r?\n/).map(value => value.trim()).filter(Boolean);
+        if (!values.length) throw new Error('List each exact O&O release included in the wider reviewed range.');
+        const parsed = values.map(value => {
+          if (!/^\d+\.\d+\.\d+\.\d+$/.test(value)) throw new Error(`Invalid reviewed release version: ${value}`);
+          const parts = value.split('.').map(Number);
+          if (parts.some((part, i) => !Number.isInteger(part) || part < 0 || part > 65535 || String(part) !== value.split('.')[i])) throw new Error(`Invalid reviewed release version: ${value}`);
+          if (compareVersions(parts, bounds.minimum.parts) < 0 || compareVersions(parts, bounds.maximum.parts) > 0) throw new Error(`Reviewed release ${value} is outside the declared range.`);
+          return { value, parts };
+        });
+        const unique = new Set(parsed.map(item => item.value));
+        if (unique.size !== parsed.length) throw new Error('Reviewed release versions must be unique.');
+        if (!unique.has(bounds.minimum.text) || !unique.has(bounds.maximum.text)) throw new Error('The reviewed release list must include both the minimum and maximum versions.');
+        if (!coverageInput.checked) throw new Error('Confirm that every release in the inclusive range has been reviewed.');
+        return parsed.sort((a, b) => compareVersions(a.parts, b.parts)).map(item => item.value);
+      }
+
+      function renderCfgStatus() {
+        if (!cfgFile) return;
+        const settingText = cfgSettings.map(setting => `${setting.id} (${setting.state})`).join(', ');
+        setStatus(fileStatus, `${cfgFile.name} · ${cfgBytes.length.toLocaleString()} bytes · SHA-256 ${cfgDigest}\n${cfgSettings.length} unique setting(s): ${settingText}`, 'success');
+      }
+
+      function buildScopeRun(setting, index) {
+        const details = make('details', { className: 'scope-run', open: true });
+        details.append(make('summary', {}, `Two-account VM scope record ${index + 1}`));
+        const body = make('div', { className: 'run-body' });
+        details.append(body);
+
+        const grid = make('div', { className: 'grid grid-3' });
+        addField(grid, 'Exact O&O FileVersion tested', textInput('version', { placeholder: 'Four parts, e.g. 3.6.1135.0' }));
+        addField(grid, 'VM test date', make('input', { type: 'date', name: 'testDate', required: true }));
+        addField(grid, 'Windows build', textInput('windowsBuild', { placeholder: 'Edition, release, build number' }));
+        addField(grid, 'Current official O&O source URL for this setting and release', textInput('sourceUrl', { placeholder: 'https://…' }));
+        addField(grid, 'Source review date', make('input', { type: 'date', name: 'sourceReviewDate', required: true }));
+        const testedState = selectInput('testedState', [
+          { value: '+', label: '+ (enabled)' }, { value: '-', label: '- (disabled)' }
+        ]);
+        testedState.value = setting.state;
+        addField(grid, 'Setting state tested', testedState);
+        const principal = selectInput('executedAs', [
+          { value: '', label: 'Choose account or identity' },
+          { value: 'SYSTEM', label: 'LocalSystem' },
+          { value: 'account-a', label: 'Disposable account A' },
+          { value: 'account-b', label: 'Disposable account B' }
+        ]);
+        addField(grid, 'Identity that applied the setting', principal);
+        const accountA = textInput('accountAName', { placeholder: 'Disposable account A' });
+        addField(grid, 'Disposable account A name', accountA);
+        addField(grid, 'Disposable account A SID', textInput('accountASid', { placeholder: 'S-1-5-21-…' }));
+        addField(grid, 'Disposable account B name', textInput('accountBName', { placeholder: 'Disposable account B' }));
+        addField(grid, 'Disposable account B SID', textInput('accountBSid', { placeholder: 'S-1-5-21-…' }));
+        const changedHive = selectInput('changedHive', [
+          { value: '', label: 'Choose observed result' },
+          { value: 'machine', label: 'Machine hive changed' },
+          { value: 'account-a', label: 'Account A user hive changed' },
+          { value: 'account-b', label: 'Account B user hive changed' },
+          { value: 'none', label: 'No hive changed' },
+          { value: 'multiple', label: 'More than one hive changed' },
+          { value: 'unclear', label: 'Unable to determine' }
+        ]);
+        addField(grid, 'Hive observed to change', changedHive);
+        const onlyIntended = selectInput('onlyIntendedHiveChanged', [
+          { value: '', label: 'Choose one' },
+          { value: 'yes', label: 'Yes' },
+          { value: 'no', label: 'No' },
+          { value: 'unclear', label: 'Unable to determine' }
+        ]);
+        addField(grid, 'Did only the declared hive change?', onlyIntended);
+        body.append(grid);
+
+        const sourceCheck = make('label', { className: 'check-row' });
+        sourceCheck.append(make('input', { type: 'checkbox', name: 'officialSourceVerified' }), make('span', {}, 'I verified this URL is a current official O&O source for this exact setting and release.'));
+        body.append(sourceCheck);
+
+        body.append(make('hr', { className: 'divider' }));
+        body.append(make('h4', { className: 'subhead' }, 'Exact registry paths and values before and after'));
+        body.append(make('p', { className: 'help' }, 'List every relevant value as path = value. Include explicit unchanged observations for the machine hive and both account hives; preserve the actual value text needed to reproduce the comparison.'));
+        const hiveGrid = make('div', { className: 'grid grid-3' });
+        addField(hiveGrid, 'Machine hive — before', textArea('machineBefore', { rows: 4, placeholder: 'Registry path = value (or exact observed absence)' }));
+        addField(hiveGrid, 'Machine hive — after', textArea('machineAfter', { rows: 4 }));
+        addField(hiveGrid, 'Account A user hive — before', textArea('accountABefore', { rows: 4 }));
+        addField(hiveGrid, 'Account A user hive — after', textArea('accountAAfter', { rows: 4 }));
+        addField(hiveGrid, 'Account B user hive — before', textArea('accountBBefore', { rows: 4 }));
+        addField(hiveGrid, 'Account B user hive — after', textArea('accountBAfter', { rows: 4 }));
+        body.append(hiveGrid);
+
+        const vmCheck = make('label', { className: 'check-row' });
+        vmCheck.append(make('input', { type: 'checkbox', name: 'disposableVm' }), make('span', {}, 'This record is from a disposable Windows VM, not a production machine.'));
+        body.append(vmCheck);
+        return details;
+      }
+
+      function buildSettingCard(setting, settingIndex) {
+        const card = make('section', { className: 'setting-card', dataset: { settingId: setting.id } });
+        const head = make('div', { className: 'setting-head' });
+        const heading = make('h3', { className: 'setting-id' }, `Setting ${setting.id}`);
+        head.append(heading, make('span', { className: 'pill' }, `Exported state ${setting.state}`));
+        card.append(head);
+
+        const grid = make('div', { className: 'grid' });
+        addField(grid, 'Reviewed O&O category', textInput('category', { maxLength: 64 }));
+        addField(grid, 'Verified setting description from O&O information', textArea('description', { rows: 3 }));
+        addField(grid, 'Verified impact description (maximum 240 characters)', textArea('impact', { rows: 3 }));
+        const availability = selectInput('availability', [
+          { value: '', label: 'Choose one' },
+          { value: 'available-throughout-range', label: 'Available and reviewed in every listed release' },
+          { value: 'varies', label: 'Availability or behavior varies in the range' },
+          { value: 'not-verified', label: 'Not verified for every listed release' }
+        ]);
+        addField(grid, 'Setting availability across the reviewed range', availability);
+        const scope = selectInput('scope', [
+          { value: '', label: 'Choose one' },
+          { value: 'machine', label: 'Machine scope' },
+          { value: 'current-user', label: 'Current-user scope' },
+          { value: 'unresolved', label: 'Unresolved' }
+        ]);
+        addField(grid, 'Verified scope', scope);
+        card.append(grid);
+
+        const warning = make('p', { className: 'help' }, 'Current-user scope is recorded accurately, but the repository’s LocalSystem scheduled task cannot apply a profile containing current-user settings.');
+        warning.hidden = true;
+        card.append(warning);
+        scope.addEventListener('change', () => { warning.hidden = scope.value !== 'current-user'; });
+
+        const evidenceHeader = make('div', { className: 'setting-head' });
+        evidenceHeader.append(make('h4', { className: 'subhead' }, 'Per-release scope evidence'));
+        const addRun = make('button', { type: 'button', className: 'secondary', textContent: 'Add VM evidence record' });
+        evidenceHeader.append(addRun);
+        card.append(evidenceHeader);
+        const runs = make('div', { dataset: { evidenceRuns: 'true' } });
+        card.append(runs);
+        addRun.addEventListener('click', () => {
+          runs.append(buildScopeRun(setting, runs.children.length));
+        });
+        return card;
+      }
+
+      function renderSettings() {
+        settingsList.replaceChildren();
+        if (!cfgSettings.length) {
+          settingsList.className = 'settings-empty';
+          settingsList.textContent = 'Load a valid .cfg file to build the setting review forms.';
+          return;
+        }
+        settingsList.className = '';
+        cfgSettings.forEach((setting, index) => settingsList.append(buildSettingCard(setting, index)));
+        cfgSettings.forEach((setting, index) => {
+          settingsList.children[index].querySelector('[data-evidence-runs]').append(buildScopeRun(setting, 0));
+        });
+      }
+
+      function updateRangeUI() {
+        const min = minInput.value.trim();
+        const max = maxInput.value.trim();
+        const wider = Boolean(min && max && min !== max);
+        coverageRow.hidden = !wider;
+        if (!wider) {
+          coverageInput.checked = false;
+          if (min && max && min === max) releasesInput.value = min;
+        }
+      }
+
+      function getControl(container, name) {
+        const control = container.querySelector(`[name="${name}"]`);
+        return control ? control.value.trim() : '';
+      }
+
+      function readChecked(container, name) {
+        return Boolean(container.querySelector(`[name="${name}"]`)?.checked);
+      }
+
+      function requireValue(value, label) {
+        if (!value) throw new Error(`${label} is required.`);
+        return value;
+      }
+
+      function validateSingleLine(value, label, maximum) {
+        requireValue(value, label);
+        if (value.length > maximum || /[\u0000-\u001f\u007f-\u009f\u00ad\u200b-\u200f\u2028\u2029\ufeff]/u.test(value)) {
+          throw new Error(`${label} must be one line and no longer than ${maximum} characters.`);
+        }
+        return value;
+      }
+
+      function absoluteHttpsUrl(value, label) {
+        requireValue(value, label);
+        let parsed;
+        try { parsed = new URL(value); } catch { throw new Error(`${label} must be an absolute HTTPS URL.`); }
+        if (parsed.protocol !== 'https:') throw new Error(`${label} must use HTTPS.`);
+        return value;
+      }
+
+      function validateSid(value, label) {
+        requireValue(value, label);
+        if (!/^S-\d-(?:\d+-)*\d+$/i.test(value)) throw new Error(`${label} must be a Windows SID beginning with S-.`);
+        return value;
+      }
+
+      function collectScopeRun(run, setting, expectedVersions, declaredScope) {
+        const version = getControl(run, 'version');
+        if (!expectedVersions.includes(version)) throw new Error(`${setting.id}: VM evidence must cover a listed release version.`);
+        const sourceUrl = absoluteHttpsUrl(getControl(run, 'sourceUrl'), `${setting.id} ${version} source URL`);
+        const sourceReviewDate = requireValue(getControl(run, 'sourceReviewDate'), `${setting.id} ${version} source review date`);
+        const testDate = requireValue(getControl(run, 'testDate'), `${setting.id} ${version} VM test date`);
+        const windowsBuild = validateSingleLine(getControl(run, 'windowsBuild'), `${setting.id} ${version} Windows build`, 160);
+        const testedState = getControl(run, 'testedState');
+        if (testedState !== setting.state) throw new Error(`${setting.id} ${version}: tested state must match the state in the exported .cfg.`);
+        const executedAs = getControl(run, 'executedAs');
+        if (!executedAs) throw new Error(`${setting.id} ${version}: select the identity that applied the setting.`);
+        const accountAName = validateSingleLine(getControl(run, 'accountAName'), `${setting.id} ${version} account A name`, 120);
+        const accountASid = validateSid(getControl(run, 'accountASid'), `${setting.id} ${version} account A SID`);
+        const accountBName = validateSingleLine(getControl(run, 'accountBName'), `${setting.id} ${version} account B name`, 120);
+        const accountBSid = validateSid(getControl(run, 'accountBSid'), `${setting.id} ${version} account B SID`);
+        if (accountAName.toLocaleLowerCase() === accountBName.toLocaleLowerCase() || accountASid.toLocaleLowerCase() === accountBSid.toLocaleLowerCase()) {
+          throw new Error(`${setting.id} ${version}: account A and account B must be distinct accounts with distinct SIDs.`);
+        }
+        if (!readChecked(run, 'officialSourceVerified')) throw new Error(`${setting.id} ${version}: verify the official source before saving.`);
+        if (!readChecked(run, 'disposableVm')) throw new Error(`${setting.id} ${version}: confirm the record came from a disposable VM.`);
+
+        const changedHive = getControl(run, 'changedHive');
+        const expectedHive = declaredScope === 'machine' ? 'machine' : executedAs === 'account-a' ? 'account-a' : executedAs === 'account-b' ? 'account-b' : '';
+        if (declaredScope === 'current-user' && !expectedHive) throw new Error(`${setting.id} ${version}: current-user scope must be tested as disposable account A or B.`);
+        if (changedHive !== expectedHive) throw new Error(`${setting.id} ${version}: the observed changed hive must match the declared ${declaredScope} scope and test identity.`);
+        if (getControl(run, 'onlyIntendedHiveChanged') !== 'yes') throw new Error(`${setting.id} ${version}: confirm that only the intended hive changed.`);
+
+        const registry = {};
+        for (const [key, label] of [
+          ['machineBefore', 'machine hive before'], ['machineAfter', 'machine hive after'],
+          ['accountABefore', 'account A user hive before'], ['accountAAfter', 'account A user hive after'],
+          ['accountBBefore', 'account B user hive before'], ['accountBAfter', 'account B user hive after']
+        ]) {
+          registry[key] = requireValue(getControl(run, key), `${setting.id} ${version} ${label} registry observations`);
+        }
+        return {
+          ooshutupVersion: version,
+          source: { url: sourceUrl, reviewedOn: sourceReviewDate },
+          vmTest: {
+            testedOn: testDate,
+            windowsBuild,
+            executedAs,
+            settingId: setting.id,
+            state: testedState,
+            disposableAccounts: [
+              { label: 'A', name: accountAName, sid: accountASid },
+              { label: 'B', name: accountBName, sid: accountBSid }
+            ],
+            registryObservations: registry,
+            observedChangedHive: changedHive,
+            onlyIntendedHiveChanged: true,
+            declaredScope
+          }
+        };
+      }
+
+      function collectBundle() {
+        if (!cfgFile || !cfgBytes || !cfgDigest || !cfgSettings.length) throw new Error('Select and parse a valid exported .cfg first.');
+        const reviewer = validateSingleLine(document.getElementById('reviewer').value.trim(), 'Owner or authorized reviewer', 120);
+        const reviewerRole = document.getElementById('reviewerRole').value;
+        if (!['owner', 'authorized-delegate'].includes(reviewerRole)) throw new Error('Record an owner review or an authorized delegate review with owner sign-off.');
+        const reviewDate = requireValue(document.getElementById('reviewDate').value, 'Owner review date');
+        const ownerApprover = reviewerRole === 'owner'
+          ? reviewer
+          : validateSingleLine(document.getElementById('ownerApprover').value.trim(), 'Product owner who approved this review', 120);
+        const ownerApprovalDate = reviewerRole === 'owner'
+          ? reviewDate
+          : requireValue(document.getElementById('ownerApprovalDate').value, 'Product owner approval date');
+        const profileVersion = document.getElementById('profileVersion').value.trim();
+        if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(profileVersion)) throw new Error('Profile version must use letters, numbers, dots, underscores, or hyphens and be at most 64 characters.');
+        const bounds = rangeBounds();
+        const reviewedVersions = reviewedReleaseVersions(bounds);
+        if (!document.getElementById('attestIds').checked || !document.getElementById('attestSources').checked || !document.getElementById('attestVm').checked || !document.getElementById('attestOwner').checked) {
+          throw new Error('Complete all four owner review attestations.');
+        }
+
+        const settingDetails = [];
+        const evidenceRecords = [];
+        let hasCurrentUser = false;
+        for (const setting of cfgSettings) {
+          const card = settingsList.querySelector(`[data-setting-id="${setting.id}"]`);
+          const category = validateSingleLine(getControl(card, 'category'), `${setting.id} category`, 64);
+          const description = validateSingleLine(getControl(card, 'description'), `${setting.id} O&O description`, 1000);
+          const impact = validateSingleLine(getControl(card, 'impact'), `${setting.id} impact`, 240);
+          const availability = getControl(card, 'availability');
+          if (availability !== 'available-throughout-range') throw new Error(`${setting.id}: confirm that this setting is available and reviewed throughout every listed release.`);
+          const scope = getControl(card, 'scope');
+          if (!['machine', 'current-user'].includes(scope)) throw new Error(`${setting.id}: select a verified machine or current-user scope.`);
+          if (scope === 'current-user') hasCurrentUser = true;
+
+          const runNodes = Array.from(card.querySelectorAll('.scope-run'));
+          if (!runNodes.length) throw new Error(`${setting.id}: add one two-account VM evidence record for every reviewed release.`);
+          const runs = runNodes.map(run => collectScopeRun(run, setting, reviewedVersions, scope));
+          const runVersions = runs.map(run => run.ooshutupVersion);
+          if (new Set(runVersions).size !== runVersions.length) throw new Error(`${setting.id}: each reviewed release must have exactly one scope record.`);
+          const missing = reviewedVersions.filter(version => !runVersions.includes(version));
+          const extra = runVersions.filter(version => !reviewedVersions.includes(version));
+          if (missing.length || extra.length || runs.length !== reviewedVersions.length) {
+            throw new Error(`${setting.id}: VM records must cover exactly these releases: ${reviewedVersions.join(', ')}.`);
+          }
+          runs.sort((a, b) => compareVersions(a.ooshutupVersion.split('.').map(Number), b.ooshutupVersion.split('.').map(Number)));
+          const recordPath = `profiles/scope-evidence/${setting.id}.md`;
+          const sourceUrl = runs[0].source.url;
+          const scopeEvidence = `O&O source: ${sourceUrl}; two-account VM record: ${recordPath}`;
+          if (scopeEvidence.length > 256 || /[\u0000-\u001f\u007f-\u009f\u00ad\u200b-\u200f\u2028\u2029\ufeff]/u.test(scopeEvidence)) {
+            throw new Error(`${setting.id}: the source URL and record reference do not fit the installer's 256-character scopeEvidence field.`);
+          }
+          settingDetails.push({ id: setting.id, state: setting.state, category, impact, scope, scopeEvidence });
+          evidenceRecords.push({
+            settingId: setting.id,
+            exportedState: setting.state,
+            description,
+            availability,
+            category,
+            impact,
+            declaredScope: scope,
+            recordPath,
+            releases: runs
+          });
+        }
+
+        const manifest = {
+          schemaVersion: 4,
+          ooshutupVersionRange: { minimum: bounds.minimum.text, maximum: bounds.maximum.text },
+          profileVersion,
+          sha256: cfgDigest,
+          settingIds: cfgSettings.map(setting => setting.id),
+          settingDetails
+        };
+        const bytesAsBase64 = btoa(Array.from(cfgBytes, byte => String.fromCharCode(byte)).join(''));
+        return {
+          intakeFormat: 'ooshutup10-profile-review-intake',
+          intakeFormatVersion: 1,
+          generatedAtUtc: new Date().toISOString(),
+          review: {
+            reviewer,
+            reviewerRole,
+            ownerReviewDate: reviewDate,
+            ownerApproval: { approvedBy: ownerApprover, approvedOn: ownerApprovalDate },
+            versionRange: {
+              minimum: bounds.minimum.text,
+              maximum: bounds.maximum.text,
+              everyReleaseInRangeReviewed: bounds.minimum.text === bounds.maximum.text || coverageInput.checked,
+              reviewedReleases: reviewedVersions
+            },
+            attestations: {
+              settingIdsAndStatesComparedToExportAndSource: true,
+              officialCurrentSourcesAndRangeAvailabilityReviewed: true,
+              disposableVmTwoAccountHiveEvidenceReviewed: true,
+              ownerCompletedOrAuthorizedReview: true
+            }
+          },
+          profile: {
+            fileName: 'ooshutup10.cfg',
+            originalFileName: cfgFile.name,
+            byteLength: cfgBytes.length,
+            sha256: cfgDigest,
+            base64: bytesAsBase64
+          },
+          approvalManifest: manifest,
+          scopeEvidenceRecords: evidenceRecords,
+          installerNotes: {
+            packageReady: false,
+            reason: 'This intake bundle must be reviewed and split into the exact .cfg, schema version 4 approval manifest, and one Markdown scope record per setting before use.',
+            currentUserSettingsPresent: hasCurrentUser,
+            localSystemScheduledTaskEligible: !hasCurrentUser
+          }
+        };
+      }
+
+      async function writeBundle(bundle) {
+        const blob = new Blob([JSON.stringify(bundle, null, 2) + '\n'], { type: 'application/json;charset=utf-8' });
+        const outputName = 'ooshutup10-review-intake.json';
+        if ('showDirectoryPicker' in window) {
+          const directory = await window.showDirectoryPicker({ id: 'ooshutup10-review-intake', mode: 'readwrite' });
+          try {
+            const existing = await directory.getFileHandle(outputName);
+            await existing.getFile();
+            if (!window.confirm(`${outputName} already exists in that folder. Replace it?`)) {
+              throw Object.assign(new Error('Save cancelled; the existing file was preserved.'), { name: 'AbortError' });
+            }
+          } catch (error) {
+            if (error?.name !== 'NotFoundError') throw error;
+          }
+          const fileHandle = await directory.getFileHandle(outputName, { create: true });
+          const writable = await fileHandle.createWritable();
+          await writable.write(blob);
+          await writable.close();
+          return `Saved ${outputName} in the folder you selected.`;
+        }
+        if ('showSaveFilePicker' in window) {
+          const fileHandle = await window.showSaveFilePicker({
+            suggestedName: outputName,
+            types: [{ description: 'JSON file', accept: { 'application/json': ['.json'] } }]
+          });
+          const writable = await fileHandle.createWritable();
+          await writable.write(blob);
+          await writable.close();
+          return `Saved ${fileHandle.name}. Choose the folder containing this HTML page to keep them together.`;
+        }
+        const url = URL.createObjectURL(blob);
+        const link = make('a', { href: url, download: outputName });
+        document.body.append(link);
+        link.click();
+        link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+        return `Downloaded ${outputName} to the browser's download location. This browser does not allow the page to choose its own folder.`;
+      }
+
+      fileInput.addEventListener('change', async () => {
+        cfgFile = fileInput.files?.[0] || null;
+        cfgBytes = null;
+        cfgDigest = null;
+        cfgSettings = [];
+        renderSettings();
+        if (!cfgFile) {
+          setStatus(fileStatus, 'Select the exact exported .cfg to load its settings.');
+          return;
+        }
+        try {
+          cfgBytes = new Uint8Array(await cfgFile.arrayBuffer());
+          const decoded = decodeCfg(cfgBytes);
+          cfgSettings = parseCfg(decoded);
+          cfgDigest = await digestBytes(cfgBytes);
+          renderSettings();
+          renderCfgStatus();
+        } catch (error) {
+          cfgBytes = null;
+          cfgDigest = null;
+          cfgSettings = [];
+          renderSettings();
+          setStatus(fileStatus, error instanceof Error ? error.message : 'Could not read the selected profile.', 'error');
+        }
+      });
+
+      minInput.addEventListener('input', updateRangeUI);
+      maxInput.addEventListener('input', updateRangeUI);
+      function updateOwnerSignoffFields() {
+        const delegate = document.getElementById('reviewerRole').value === 'authorized-delegate';
+        document.getElementById('ownerApproverRow').hidden = !delegate;
+        document.getElementById('ownerApprovalDateRow').hidden = !delegate;
+      }
+      document.getElementById('reviewerRole').addEventListener('change', updateOwnerSignoffFields);
+
+      document.getElementById('saveButton').addEventListener('click', async () => {
+        setStatus(saveStatus, '');
+        try {
+          const bundle = collectBundle();
+          const result = await writeBundle(bundle);
+          setStatus(saveStatus, result, 'success');
+        } catch (error) {
+          if (error && error.name === 'AbortError') {
+            setStatus(saveStatus, 'Save was cancelled. No file was saved.');
+          } else {
+            setStatus(saveStatus, error instanceof Error ? error.message : 'Could not create the review intake JSON.', 'error');
+          }
+        }
+      });
+
+      document.getElementById('clearButton').addEventListener('click', () => {
+        form.reset();
+        updateOwnerSignoffFields();
+        fileInput.value = '';
+        cfgFile = null;
+        cfgBytes = null;
+        cfgDigest = null;
+        cfgSettings = [];
+        renderSettings();
+        setStatus(fileStatus, 'Select the exact exported .cfg to load its settings.');
+        setStatus(saveStatus, '');
+        updateRangeUI();
+        document.getElementById('reviewer').focus();
+      });
+
+      renderSettings();
+      updateRangeUI();
+    })();
+  </script>
+</body>
+</html>

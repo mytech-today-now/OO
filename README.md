@@ -97,7 +97,7 @@ This repository contains an installer framework for **O&O ShutUp10++**. It can a
 
 ### Clean-checkout profile availability
 
-**Configuration is unavailable from a clean checkout.** This repository currently ships no reviewed settings profile: the `profiles/` directory contains only `README.md`, with no `ooshutup10.cfg`, `ooshutup10.approval.json`, or per-setting scope-evidence records. In the explicit source-checkout development path, the installer rejects the missing profile pair before relocation, restore-point work, registry changes, O&O launch, or scheduled-task registration. No default settings are included or implied. See [profiles/README.md](profiles/README.md) for owner-review and disposable-VM requirements.
+**Approved configuration is unavailable from a clean checkout.** The repository includes `profiles/ooshutup10.cfg` as an estimated candidate, not an O&O-exported or owner-reviewed profile. The matching approval manifest and per-setting scope-evidence records are absent, so the installer rejects this incomplete package before relocation, restore-point work, registry changes, O&O launch, or scheduled-task registration. No approved default settings are included or implied. See [profiles/README.md](profiles/README.md) for owner-review and disposable-VM requirements.
 
 ## Features
 

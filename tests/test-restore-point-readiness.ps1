@@ -7,6 +7,8 @@ $script:AssertionCount = 0
 $script:LogMessages = New-Object System.Collections.ArrayList
 $script:RestoreScenario = 'success'
 $script:LastRestorePointDescription = $null
+$script:LastMockRestoreProviderResult = $null
+$script:LastListedRestorePoint = $null
 $script:RestorePoints = @()
 $script:ProcessBoundaryCalls = 0
 $script:CurrentRestoreJob = $null
@@ -20,6 +22,8 @@ $script:ProfileFixtureBytes = [System.Text.Encoding]::UTF8.GetBytes('approved pr
 $script:ManifestFixtureBytes = [System.Text.Encoding]::UTF8.GetBytes('approved manifest fixture')
 $script:MockStartProcessFailure = $false
 $script:FrequencyWriteScenario = 'success'
+$script:FrequencyRestoreScenario = 'success'
+$script:FrequencyRestoreWriteCount = 0
 $script:RegistryFixture = [pscustomobject]@{
     KeyExists = $true
     ValueExists = $true
@@ -97,6 +101,12 @@ function Set-RestorePointFrequencyRawValue {
     if ($script:FrequencyWriteScenario -eq 'ignored' -and $Kind -eq [Microsoft.Win32.RegistryValueKind]::DWord) {
         return
     }
+    if ($script:FrequencyRestoreScenario -eq 'failure' -and $Kind -eq [Microsoft.Win32.RegistryValueKind]::DWord) {
+        $script:FrequencyRestoreWriteCount++
+        if ($script:FrequencyRestoreWriteCount -gt 1) {
+            throw 'Mock registry rollback failure.'
+        }
+    }
 
     $script:RegistryFixture.KeyExists = $true
     $script:RegistryFixture.ValueExists = $true
@@ -161,7 +171,8 @@ function Receive-Job {
         throw 'Mock provider receive exception.'
     }
     if ($script:RestoreScenario -eq 'success' -or $script:RestoreScenario -eq 'false-success' -or $script:RestoreScenario -eq 'enumeration-exception') {
-        return @{ Success = $true; Message = 'Mock provider returned success.' }
+        $script:LastMockRestoreProviderResult = @{ Success = $true; Message = 'Mock provider returned success.' }
+        return $script:LastMockRestoreProviderResult
     }
 
     $message = switch -Exact ($script:RestoreScenario) {
@@ -171,7 +182,8 @@ function Receive-Job {
         'provider-exception' { 'The provider threw an exception.' }
         default { 'Mock provider rejected the request.' }
     }
-    return @{ Success = $false; Message = $message }
+    $script:LastMockRestoreProviderResult = @{ Success = $false; Message = $message }
+    return $script:LastMockRestoreProviderResult
 }
 
 function Stop-Job {
@@ -204,12 +216,14 @@ function Get-ComputerRestorePoint {
     }
     if ($script:RestoreScenario -eq 'success') {
         [void]$script:ConfigurationEvents.Add('restore-point-verified')
-        return @([pscustomobject]@{
+        $script:LastListedRestorePoint = [pscustomobject]@{
             Description = $script:LastRestorePointDescription
             SequenceNumber = 42
-        })
+        }
+        return @($script:LastListedRestorePoint)
     }
 
+    $script:LastListedRestorePoint = $null
     return $script:RestorePoints
 }
 
@@ -363,6 +377,9 @@ try {
         'Open-OOShutUpMutationMutex',
         'Release-OOShutUpMutationMutex',
         'Invoke-WithOOShutUpMutationLock',
+        'Set-OOShutUpLogStage',
+        'Set-OOShutUpLogErrorCategory',
+        'Set-OOShutUpLogOutcome',
         'Get-OOShutUpRetainedProfileSnapshots',
         'Wait-OOShutUpChildProcess',
         'New-OOShutUpConfigurationOutcome',
@@ -571,6 +588,37 @@ try {
     }
 
     $script:RestoreScenario = 'success'
+    $script:FrequencyWriteScenario = 'success'
+    $script:FrequencyRestoreScenario = 'failure'
+    $script:FrequencyRestoreWriteCount = 0
+    $rollbackFailurePriorState = [pscustomobject]@{
+        KeyExists = $true
+        ValueExists = $true
+        Value = 0
+        Kind = [Microsoft.Win32.RegistryValueKind]::DWord
+    }
+    $script:RegistryFixture = [pscustomobject]@{
+        KeyExists = $rollbackFailurePriorState.KeyExists
+        ValueExists = $rollbackFailurePriorState.ValueExists
+        Value = $rollbackFailurePriorState.Value
+        Kind = $rollbackFailurePriorState.Kind
+    }
+    $script:LogMessages.Clear()
+    $script:ConfigurationEvents.Clear()
+    $processCallsBeforeRollbackFailure = $script:ProcessBoundaryCalls
+    $rollbackFailureResult = Invoke-OOShutUpConfigurationWithRestorePointGate -ExecutablePath 'C:\fixtures\OOSU10.exe'
+    Assert-Equal $false $rollbackFailureResult.PreparationSucceeded 'registry restore failure is a failed preparation'
+    Assert-Equal $false $rollbackFailureResult.RestorePointVerified 'registry restore failure clears verified status'
+    Assert-Equal $false $rollbackFailureResult.ConfigurationStarted 'registry restore failure blocks configuration'
+    Assert-Equal $processCallsBeforeRollbackFailure $script:ProcessBoundaryCalls 'registry restore failure never reaches Start-Process'
+    Assert-True (-not $script:ConfigurationEvents.Contains('profile-validation')) 'registry restore failure stops before profile validation'
+    Assert-True ([string]::Join("`n", [string[]]$script:LogMessages.ToArray()).Contains($script:OOShutUpRestorePointPreparationFailureMessage)) 'registry restore failure reports that no settings were applied'
+    Assert-True ([string]::Join("`n", [string[]]$script:LogMessages.ToArray()).Contains('Mock registry rollback failure.')) 'registry restore failure detail is retained in diagnostics'
+    Assert-True (Test-RestorePointFrequencyStateEqual -Expected $rollbackFailurePriorState -Actual (Get-RestorePointFrequencyState)) 'registry restore failure leaves the fixture value and type unchanged'
+    $script:FrequencyRestoreScenario = 'success'
+    $script:FrequencyRestoreWriteCount = 0
+
+    $script:RestoreScenario = 'success'
     $script:RegistryFixture = [pscustomobject]@{
         KeyExists = $priorRegistryState.KeyExists
         ValueExists = $priorRegistryState.ValueExists
@@ -580,12 +628,27 @@ try {
     $script:RestorePoints = @()
     $script:LogMessages.Clear()
     $script:ConfigurationEvents.Clear()
+    $script:LastMockRestoreProviderResult = $null
+    $script:LastListedRestorePoint = $null
+    $lockedSuccessResult = Invoke-WithOOShutUpMutationLock -Operation {
+        Invoke-OOShutUpConfigurationWithRestorePointGateCore -ExecutablePath 'C:\fixtures\OOSU10.exe'
+    }
+    Assert-Equal $true $lockedSuccessResult.Succeeded 'the successful gate operation completes under the mutation lock'
+    Assert-Equal $true $lockedSuccessResult.OperationStarted 'the successful gate operation starts only after acquiring the lock'
+    Assert-Equal $true $script:LastMockRestoreProviderResult.Success 'the mocked restore provider reports success'
+    Assert-True ($null -ne $script:LastListedRestorePoint) 'Windows lists a restore point after provider success'
+    Assert-Equal $script:LastRestorePointDescription $script:LastListedRestorePoint.Description 'the listed point exactly matches the requested restore point'
+    Assert-Equal 42 $script:LastListedRestorePoint.SequenceNumber 'the exact listed restore point is retained by the fixture'
+    Assert-Equal $true $lockedSuccessResult.Value.RestorePointVerified 'verified point status survives the locked gate result object'
+    $processCallsBeforePublicSuccess = $script:ProcessBoundaryCalls
+    $script:LogMessages.Clear()
+    $script:ConfigurationEvents.Clear()
     $successResult = Invoke-OOShutUpConfigurationWithRestorePointGate -ExecutablePath 'C:\fixtures\OOSU10.exe'
     Assert-Equal $true $successResult.RestorePointVerified 'verified point status reaches the result'
     Assert-Equal $true $successResult.ConfigurationStarted 'verified point permits configuration'
     Assert-Equal 'Changed' $successResult.ConfigurationOutcome.State 'exit code 30 is retained as an O&O-reported changed outcome'
     Assert-Equal 'Unavailable' $successResult.ConfigurationOutcome.ReadbackState 'the mocked successful process does not imply independent settings readback'
-    Assert-Equal ($callCountBeforeFailure + 1) $script:ProcessBoundaryCalls 'verified point reaches Start-Process exactly once'
+    Assert-Equal ($processCallsBeforePublicSuccess + 1) $script:ProcessBoundaryCalls 'verified point reaches Start-Process exactly once'
     Assert-Equal 'restore-point-verified,profile-validation,snapshot-creation,snapshot-verification,process-start,process-exited,snapshot-removal' ([string]::Join(',', [string[]]$script:ConfigurationEvents.ToArray())) 'the production restore gate, profile validation, snapshot verification, process exit, and cleanup run in order'
     Assert-Equal 0 $script:ActiveProfileSnapshots.Count 'a completed O&O child removes its unique snapshot after process exit is known'
 
