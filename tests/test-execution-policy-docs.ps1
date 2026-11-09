@@ -115,7 +115,7 @@ Assert-True ($readme.Contains('That path may still apply the reviewed profile') 
 Assert-True ($installer.Contains('powershell.exe -NoProfile -ExecutionPolicy Bypass -File')) 'script help documents the Windows PowerShell 5.1 process-scoped launch'
 Assert-True ($installer.Contains('pwsh.exe -NoProfile -ExecutionPolicy Bypass -File')) 'script help documents the PowerShell 7 process-scoped launch'
 Assert-True ($installer.Contains('Development mode is available only for a Git source checkout') -and $installer.Contains('does not relocate the checkout or create a scheduled task')) 'script help limits unsigned execution to explicit checkout development mode'
-Assert-True ($batch -match '(?im)^pwsh -NoProfile -ExecutionPolicy AllSigned -File ') 'batch wrapper requires signed scripts for production launch'
+Assert-True ($batch -match '(?im)^pwsh -NoProfile -ExecutionPolicy Bypass -File ') 'batch wrapper uses process-scoped Bypass for the explicit development path'
 Assert-True ($batch -match '(?im)^powershell -NoProfile -ExecutionPolicy AllSigned -File .*Install-OOShutUp10-Elevation\.ps1') 'batch wrapper requires a signed elevation helper'
 Assert-True ($elevationHelper.Contains('Start-Process') -and $elevationHelper.Contains('-Verb RunAs') -and $elevationHelper.Contains('return [int]$process.ExitCode')) 'the elevation helper uses UAC and preserves the child status'
 Assert-True ($batch.IndexOf('net session', [System.StringComparison]::Ordinal) -lt $batch.IndexOf('where pwsh', [System.StringComparison]::Ordinal)) 'the batch wrapper checks administrator access before runtime discovery'
@@ -183,7 +183,7 @@ try {
 
     $testBatchPath = Join-Path $tempRoot 'install-under-test.bat'
     $testBatch = [System.Text.RegularExpressions.Regex]::Replace($batch, '(?m)^net session ', 'call net session ')
-    $testBatch = $testBatch.Replace('pwsh -NoProfile -ExecutionPolicy AllSigned -File', 'call pwsh -NoProfile -ExecutionPolicy AllSigned -File')
+    $testBatch = $testBatch.Replace('pwsh -NoProfile -ExecutionPolicy Bypass -File', 'call pwsh -NoProfile -ExecutionPolicy Bypass -File')
     [System.IO.File]::WriteAllText($testBatchPath, $testBatch, [System.Text.Encoding]::ASCII)
 
     $batchRunnerPath = Join-Path $tempRoot 'run-mocked-batch.cmd'
@@ -218,7 +218,7 @@ try {
         Assert-Equal 0 $batchProcess.ExitCode "install.bat exits successfully with the fake pwsh child ($batchOutput)"
         Assert-True (Test-Path -LiteralPath $batchCapturePath) 'install.bat invoked the fake pwsh launcher instead of the installer'
         $batchArguments = [System.IO.File]::ReadAllText($batchCapturePath)
-        Assert-True ($batchArguments.Contains('-NoProfile -ExecutionPolicy AllSigned -File')) 'install.bat passes AllSigned to its fake PowerShell 7 child'
+        Assert-True ($batchArguments.Contains('-NoProfile -ExecutionPolicy Bypass -File')) 'install.bat passes process-scoped Bypass to its fake PowerShell 7 child'
         Assert-True ($batchArguments.Contains('Install-OOShutUp10.ps1')) 'install.bat forwards the installer path to the fake PowerShell 7 child'
     }
     finally {

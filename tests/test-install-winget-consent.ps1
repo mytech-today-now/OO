@@ -170,7 +170,7 @@ try {
     $testBatch = $testBatch.Replace('powershell -NoProfile -NonInteractive -Command', 'call powershell -NoProfile -NonInteractive -Command')
     $testBatch = $testBatch.Replace('net session >nul 2>&1', 'call net session >nul 2>&1')
     $testBatch = [System.Text.RegularExpressions.Regex]::Replace($testBatch, '(?m)^winget install ', 'call winget install ')
-    $testBatch = $testBatch.Replace('pwsh -NoProfile -ExecutionPolicy AllSigned -File', 'call pwsh -NoProfile -ExecutionPolicy AllSigned -File')
+    $testBatch = $testBatch.Replace('pwsh -NoProfile -ExecutionPolicy Bypass -File', 'call pwsh -NoProfile -ExecutionPolicy Bypass -File')
     [System.IO.File]::WriteAllText($batchPath, $testBatch, [System.Text.Encoding]::ASCII)
     Copy-Item -LiteralPath $elevationHelperPath -Destination (Join-Path $testRoot 'Install-OOShutUp10-Elevation.ps1')
 
@@ -348,6 +348,7 @@ exit /b %ELEVATION_CHILD_EXIT_CODE%
 
     $previousElevationMarker = [Environment]::GetEnvironmentVariable('MYTECH_INSTALL_ELEVATION_ATTEMPTED', 'Process')
     [Environment]::SetEnvironmentVariable('MYTECH_INSTALL_ELEVATION_ATTEMPTED', $null, 'Process')
+    $clearedElevationMarker = [Environment]::GetEnvironmentVariable('MYTECH_INSTALL_ELEVATION_ATTEMPTED', 'Process')
     try {
         $serializedArguments = @('alpha beta', "O'Brien & Co", '', 'C:\path\', 'quote"value')
         foreach ($childExitCode in @(0, 1, 2)) {
@@ -361,7 +362,7 @@ exit /b %ELEVATION_CHILD_EXIT_CODE%
             Assert-Equal '"alpha beta" "O''Brien & Co" "" "C:\path\\" "quote\"value"' $script:MockElevationArgumentList 'the helper preserves spaces, apostrophes, ampersands, empty values, and quotes'
             Assert-Equal '"alpha beta" "O''Brien & Co" "" "C:\path\\" "quote\"value"' (Get-Content -LiteralPath $helperCapturePath -Raw).TrimEnd("`r", "`n") 'the elevated CMD process receives the original argument boundaries'
             Assert-Equal '1' $script:MockElevationMarker 'the helper marks the elevated child to prevent recursion'
-            Assert-Equal $null ([Environment]::GetEnvironmentVariable('MYTECH_INSTALL_ELEVATION_ATTEMPTED', 'Process')) 'the parent environment is restored after the handoff'
+            Assert-Equal $clearedElevationMarker ([Environment]::GetEnvironmentVariable('MYTECH_INSTALL_ELEVATION_ATTEMPTED', 'Process')) 'the parent environment is restored after the handoff'
         }
 
         $script:MockElevationShouldCancel = $true

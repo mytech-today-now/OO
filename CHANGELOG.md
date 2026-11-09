@@ -4,6 +4,7 @@
 
 ### Changed
 
+- Permit explicit source-checkout `-DevelopmentMode` launches through `install.bat` with process-scoped `Bypass`, while retaining production trust checks and the signed elevation helper.
 - Add a protected, rotating SYSTEM application log with safe stage diagnostics; logging failures stop initialization or prevent a successful completion result.
 - Add an aggregate offline safety runner and Windows PowerShell 5.1, PowerShell 7, and Linux Bash CI jobs.
 - Check administrator access before runtime discovery and request UAC elevation through the signed helper when needed. Preserve installer arguments and exit status, and stop when elevation is canceled.

@@ -105,7 +105,7 @@ echo.
 echo [INFO] Running O^&O ShutUp10 Installer...
 echo.
 
-pwsh -NoProfile -ExecutionPolicy AllSigned -File "%~dp0Install-OOShutUp10.ps1" %*
+pwsh -NoProfile -ExecutionPolicy Bypass -File "%~dp0Install-OOShutUp10.ps1" %*
 set "INSTALLER_EXIT_CODE=%ERRORLEVEL%"
 
 if "%INSTALLER_EXIT_CODE%"=="0" goto :INSTALLER_SUCCESS

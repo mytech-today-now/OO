@@ -138,7 +138,7 @@ This repository contains an installer framework for **O&O ShutUp10++**. It can a
 
 ## Execution Policy and Safe Launch
 
-Do not change the stored `CurrentUser` or `LocalMachine` execution policy to run this installer. Production runs require organization-enforced `AllSigned` policy at `MachinePolicy`. The launcher and scheduled task request `AllSigned`, and the installer checks that machine policy is active before loading repository helpers or starting machine work.
+Do not change the stored `CurrentUser` or `LocalMachine` execution policy to run this installer. Production runs require organization-enforced `AllSigned` policy at `MachinePolicy`. The scheduled task requests `AllSigned`. The batch wrapper uses process-scoped `Bypass` so an explicit source-checkout `-DevelopmentMode` launch can load; this does not override Group Policy. The installer checks machine policy before loading repository helpers or starting machine work.
 
 On Windows, `MachinePolicy` and `UserPolicy` Group Policy settings take precedence. When neither is set, precedence is `Process`, then `CurrentUser`, then `LocalMachine`; a process-scoped launch cannot override Group Policy. Execution policy alone is not a complete application-control boundary, so production deployments must protect the launcher and PowerShell execution path with the organization's application-control policy as well. See [Microsoft's execution policy documentation](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_execution_policies).
 
@@ -163,7 +163,11 @@ The release manifest is a PowerShell data file with exactly these fields:
 }
 ```
 
-This checkout does not include a signed release manifest, signing certificate, or machine trust policy. `install.bat` therefore fails closed when launched from this checkout. For local development only, run the source checkout directly with `-DevelopmentMode`; it verifies a `.git` marker and warns that the source is not release-authenticated. That path may still apply the reviewed profile, but it never relocates the checkout or registers a scheduled task:
+This checkout does not include a signed release manifest, signing certificate, or machine trust policy. `install.bat` therefore fails closed for a production launch. For local development only, run an elevated Command Prompt in the source checkout and pass `-DevelopmentMode` through the batch wrapper. The installer verifies a `.git` marker and warns that the source is not release-authenticated. That path may still apply the reviewed profile, but it never relocates the checkout or registers a scheduled task:
+
+```cmd
+install.bat -DevelopmentMode
+```
 
 ```powershell
 pwsh.exe -NoProfile -ExecutionPolicy Bypass -File ".\Install-OOShutUp10.ps1" -DevelopmentMode
@@ -191,7 +195,7 @@ Run the launcher from CMD. A configured production package checks administrator 
 <drive>:\path\to\script\install.bat
 ```
 
-The batch wrapper starts PowerShell 7 (`pwsh`) with `-ExecutionPolicy AllSigned`. A production launch also requires the signed release package and organization-managed trust settings described above. An unsigned checkout is not a production package.
+The batch wrapper starts PowerShell 7 (`pwsh`) with process-scoped `-ExecutionPolicy Bypass` so an explicit `-DevelopmentMode` launch can load from an elevated Command Prompt. Group Policy `MachinePolicy` takes precedence over process settings. Production still requires the signed release package and organization-managed trust settings described above; an unsigned checkout is not a production package.
 
 If PowerShell 7 is missing, an interactive launch calls WinGet without agreement-acceptance flags so WinGet can show its source and package terms. A launch with redirected input fails closed unless you separately reviewed both agreements and set `MYTECH_ACCEPT_WINGET_AGREEMENTS=YES`. When set on a launch that needs WinGet, this variable passes both acceptance flags and skips those WinGet prompts:
 

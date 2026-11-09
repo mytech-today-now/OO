@@ -667,7 +667,7 @@ try {
     Assert-True ($source.Contains('X509Store') -and $source.Contains('StoreName]::TrustedPublisher') -and $source.Contains('StoreLocation]::LocalMachine')) 'production validation requires the pinned signer in the machine Trusted Publishers store'
     Assert-True ($source.Contains('Import-PowerShellDataFile -Path $ReleaseManifestPath') -and $source.Contains('Get-AuthenticodeSignature -FilePath $ReleaseManifestPath') -and $source.Contains('Get-AuthenticodeSignature -FilePath $ScriptPath')) 'production validation checks signed release metadata and the script signature'
     Assert-True ($source.Contains('if (-not $DevelopmentMode -and -not $SkipRelocate)') -and $source.Contains('Development mode does not register a scheduled task')) 'development mode avoids relocation and scheduled-task registration'
-    Assert-True ($installerBatchSource.Contains('-ExecutionPolicy AllSigned') -and $installerBatchSource -notmatch '-ExecutionPolicy Bypass') 'the batch production launcher requests signed scripts'
+    Assert-True ($installerBatchSource.Contains('pwsh -NoProfile -ExecutionPolicy Bypass -File')) 'the batch wrapper permits the explicit development-mode launch'
     Assert-True ($source.Contains('$DownloadUrl = "https://dl5.oo-software.com/files/ooshutup10/OOSU10.exe"')) 'the official vendor download URL is preserved'
     $versionPolicy = '$MinimumOOShutUpVersion = [version]' + [char]39 + '3.6.1135' + [char]39
     Assert-True ($source.Contains($versionPolicy)) 'the supported version floor is explicit'
