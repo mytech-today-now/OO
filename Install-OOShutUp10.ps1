@@ -8,7 +8,7 @@
 .DESCRIPTION
     This script will:
     1. Validate the reviewed profile and obtain interactive approval or a matching unattended digest
-    2. Check if O&O ShutUp10++ is already installed and download it if not found
+    2. Check if O&O ShutUp10++ is already installed and download it if not found; setup-only downloads go to the current user's LocalAppData
     3. Attempt a system restore point before applying the profile
     4. Apply the approved privacy settings profile quietly
     5. Create a scheduled task pinned to the approved profile and manifest digests
@@ -2303,10 +2303,19 @@ function Get-OOShutUpPath {
     [OutputType([string])]
     param(
         [Parameter(Mandatory = $false)]
-        [string]$ExpectedPath
+        [string]$ExpectedPath,
+
+        [Parameter(Mandatory = $false)]
+        [string]$InstallDirectory
     )
 
-    $path = [System.IO.Path]::GetFullPath((Join-Path $InstallPath $ExecutableName))
+    if ([string]::IsNullOrWhiteSpace($InstallDirectory)) {
+        $path = [System.IO.Path]::GetFullPath((Join-Path $InstallPath $ExecutableName))
+    }
+    else {
+        $path = [System.IO.Path]::GetFullPath((Join-Path $InstallDirectory $ExecutableName))
+    }
+
     if (-not [string]::IsNullOrWhiteSpace($ExpectedPath)) {
         try {
             $canonicalExpectedPath = [System.IO.Path]::GetFullPath($ExpectedPath)
@@ -2328,6 +2337,19 @@ function Get-OOShutUpPath {
     }
 
     return $null
+}
+
+function Get-OOShutUpUserInstallPath {
+    [CmdletBinding()]
+    [OutputType([string])]
+    param()
+
+    $localAppDataPath = [string]$env:LOCALAPPDATA
+    if ([string]::IsNullOrWhiteSpace($localAppDataPath) -or -not [System.IO.Path]::IsPathRooted($localAppDataPath)) {
+        throw 'The current user LocalAppData directory is unavailable; the setup-only O&O install path cannot be established.'
+    }
+
+    return [System.IO.Path]::GetFullPath((Join-Path $localAppDataPath 'myTech.Today\O&O ShutUp10'))
 }
 
 function Get-OOShutUpApprovedProfile {
@@ -2740,17 +2762,32 @@ public static class OOShutUp10AtomicFilePromotion
 function Install-OOShutUp {
     <#
     .SYNOPSIS
-        Downloads and verifies O&O ShutUp10++ into its managed machine directory.
+        Downloads and verifies O&O ShutUp10++ into the selected install directory.
     #>
     [CmdletBinding()]
-    param()
+    param(
+        [Parameter(Mandatory = $false)]
+        [string]$InstallDirectory
+    )
 
-    $managedExecutablePath = [System.IO.Path]::GetFullPath((Join-Path $InstallPath $ExecutableName))
-    $stagingPath = Join-Path $InstallPath ('{0}.{1}.download' -f $ExecutableName, [guid]::NewGuid().ToString('N'))
+    $useDefaultInstallDirectory = [string]::IsNullOrWhiteSpace($InstallDirectory)
+    if ($useDefaultInstallDirectory) {
+        $InstallDirectory = $InstallPath
+    }
+    $InstallDirectory = [System.IO.Path]::GetFullPath($InstallDirectory)
+
+    if ($useDefaultInstallDirectory) {
+        $managedExecutablePath = [System.IO.Path]::GetFullPath((Join-Path $InstallPath $ExecutableName))
+        $stagingPath = Join-Path $InstallPath ('{0}.{1}.download' -f $ExecutableName, [guid]::NewGuid().ToString('N'))
+    }
+    else {
+        $managedExecutablePath = [System.IO.Path]::GetFullPath((Join-Path $InstallDirectory $ExecutableName))
+        $stagingPath = Join-Path $InstallDirectory ('{0}.{1}.download' -f $ExecutableName, [guid]::NewGuid().ToString('N'))
+    }
 
     try {
-        if (-not (Test-Path -LiteralPath $InstallPath -PathType Container)) {
-            New-Item -LiteralPath $InstallPath -ItemType Directory -Force -ErrorAction Stop | Out-Null
+        if (-not (Test-Path -LiteralPath $InstallDirectory -PathType Container)) {
+            New-Item -LiteralPath $InstallDirectory -ItemType Directory -Force -ErrorAction Stop | Out-Null
         }
 
         Write-Log "Downloading O&O ShutUp10++ from: $DownloadUrl" -Level INFO
@@ -2767,7 +2804,12 @@ function Install-OOShutUp {
             }
         }
         catch {
-            Write-Log 'The O&O download failed. Check network connectivity and access to the managed machine directory, then retry.' -Level ERROR
+            if ($useDefaultInstallDirectory) {
+                Write-Log 'The O&O download failed. Check network connectivity and access to the managed machine directory, then retry.' -Level ERROR
+            }
+            else {
+                Write-Log ("The O&O download failed while targeting `"{0}`". Check network connectivity and directory access, then retry." -f $InstallDirectory) -Level ERROR
+            }
             return $false
         }
 
@@ -2779,7 +2821,7 @@ function Install-OOShutUp {
             Move-OOShutUpFileAtomically -SourcePath $stagingPath -DestinationPath $managedExecutablePath
         }
         catch {
-            Write-Log 'The verified O&O download could not be promoted; the existing executable was left in place. Check managed directory access and retry.' -Level ERROR
+            Write-Log ("The verified O&O download could not be promoted into `"{0}`"; the existing executable was left in place. Check directory access and retry." -f $InstallDirectory) -Level ERROR
             return $false
         }
 
@@ -2788,7 +2830,7 @@ function Install-OOShutUp {
         return $true
     }
     catch {
-        Write-Log 'The O&O executable could not be stored in the approved machine directory. The previous verified copy was left in place; check Program Files permissions and retry.' -Level ERROR
+        Write-Log ("The O&O executable could not be stored in `"{0}`". No unverified executable was activated; check access to that directory and retry." -f $InstallDirectory) -Level ERROR
         return $false
     }
     finally {
@@ -5069,7 +5111,7 @@ try {
     if ($DevelopmentMode -and -not $ReapplyOnly -and (-not $hasProfileFile -or -not $hasProfileManifest)) {
         $setupOnly = $true
         Set-OOShutUpLogStage -Stage ProfileValidation
-        Write-Log 'No complete reviewed profile pair is present. Setup-only mode will install and open O&O without applying privacy settings or registering a scheduled task.' -Level WARNING
+        Write-Log 'No complete reviewed profile pair is present. Setup-only mode will use an existing verified O&O copy or install it for the current user, then open it without applying privacy settings or registering a scheduled task.' -Level WARNING
     }
     else {
         # Validate the reviewed profile before relocation, registry changes, restore points, task changes, or O&O configuration.
@@ -5194,6 +5236,66 @@ try {
     Write-Log ("Log Location: {0}" -f $script:OOShutUpLogFilePath) -Level INFO
     Write-Log " " -Level INFO
 
+    if ($setupOnly) {
+        Set-OOShutUpLogStage -Stage PayloadInstall
+        Update-ScriptProgress -PercentComplete 20 -Status "Setup only: Preparing O&O" -CurrentOperation "Checking for a verified O&O ShutUp10++ copy"
+
+        # Prefer a verified machine copy when one already exists. A fresh setup-only
+        # install belongs to the current user and does not need a Program Files write.
+        $exePath = Get-OOShutUpPath
+        if ($exePath) {
+            Write-Log "Using the existing verified machine copy at: $exePath" -Level SUCCESS
+        }
+        else {
+            try {
+                $setupInstallPath = Get-OOShutUpUserInstallPath
+            }
+            catch {
+                Set-OOShutUpLogErrorCategory -Category UnexpectedFailure
+                Write-Log 'The current user application-data directory is unavailable. O&O could not be installed for setup-only use.' -Level ERROR
+                exit (Get-OOShutUpTerminalExitCode -Outcome Failed -ExitCode 1)
+            }
+
+            $exePath = Get-OOShutUpPath -InstallDirectory $setupInstallPath
+            if (-not $exePath) {
+                Write-Log ("No verified O&O copy is present in the current-user directory. Installing it to: {0}" -f $setupInstallPath) -Level INFO
+                if (-not (Install-OOShutUp -InstallDirectory $setupInstallPath)) {
+                    Write-Progress -Activity "O&O ShutUp10++ Installation and Configuration" -Completed
+                    Set-OOShutUpLogErrorCategory -Category UnexpectedFailure
+                    Write-Log ("O&O could not be installed to the current-user directory `"{0}`". See the preceding log line for download, file-verification, or folder-access details, then run install.bat again." -f $setupInstallPath) -Level ERROR
+                    exit (Get-OOShutUpTerminalExitCode -Outcome Failed -ExitCode 1)
+                }
+
+                $exePath = Get-OOShutUpPath -InstallDirectory $setupInstallPath
+            }
+        }
+
+        if (-not $exePath) {
+            Write-Progress -Activity "O&O ShutUp10++ Installation and Configuration" -Completed
+            Set-OOShutUpLogErrorCategory -Category PayloadRejected
+            Write-Log 'O&O was downloaded, but its publisher, file version, or final installation could not be verified. No application was opened.' -Level ERROR
+            exit (Get-OOShutUpTerminalExitCode -Outcome Failed -ExitCode 1)
+        }
+
+        Write-Log "Using verified O&O ShutUp10++ at: $exePath" -Level INFO
+        if (-not $NonInteractive) {
+            try {
+                Start-Process -FilePath $exePath -WorkingDirectory (Split-Path -Parent $exePath) -ErrorAction Stop | Out-Null
+            }
+            catch {
+                Set-OOShutUpLogErrorCategory -Category ProcessFailure
+                Write-Log 'The verified O&O application is installed but could not be opened. No privacy settings were applied.' -Level ERROR
+                exit (Get-OOShutUpTerminalExitCode -Outcome Failed -ExitCode 1)
+            }
+            Write-Log 'O&O ShutUp10++ was opened for manual setup. No privacy settings were applied and no update task was registered.' -Level SUCCESS
+        }
+        else {
+            Write-Log 'The verified O&O application is installed. No interactive console was available, so the application was not opened; no privacy settings were applied and no update task was registered.' -Level WARNING
+        }
+        Write-Log 'To apply settings later, add an owner-reviewed O&O export and its matching approval manifest to the profiles directory, then run the installer again.' -Level INFO
+        exit (Get-OOShutUpTerminalExitCode -Outcome SetupOnly -ExitCode 0)
+    }
+
     # Step 1: Check if already installed
     Set-OOShutUpLogStage -Stage PayloadInstall
     Update-ScriptProgress -PercentComplete 15 -Status "Step 1 of 5: Checking Installation" -CurrentOperation "Checking if O&O ShutUp10++ is already installed"
@@ -5230,25 +5332,6 @@ try {
     }
 
     Write-Log "Using O&O ShutUp10++ at: $exePath" -Level INFO
-
-    if ($setupOnly) {
-        if (-not $NonInteractive) {
-            try {
-                Start-Process -FilePath $exePath -WorkingDirectory $InstallPath -ErrorAction Stop | Out-Null
-            }
-            catch {
-                Set-OOShutUpLogErrorCategory -Category ProcessFailure
-                Write-Log 'The verified O&O application is installed but could not be opened. No privacy settings were applied.' -Level ERROR
-                exit (Get-OOShutUpTerminalExitCode -Outcome Failed -ExitCode 1)
-            }
-            Write-Log 'O&O ShutUp10++ was opened for manual setup. No privacy settings were applied and no update task was registered.' -Level SUCCESS
-        }
-        else {
-            Write-Log 'The verified O&O application is installed. No interactive console was available, so the application was not opened; no privacy settings were applied and no update task was registered.' -Level WARNING
-        }
-        Write-Log 'To apply settings later, add an owner-reviewed O&O export and its matching approval manifest to the profiles directory, then run the installer again.' -Level INFO
-        exit (Get-OOShutUpTerminalExitCode -Outcome SetupOnly -ExitCode 0)
-    }
 
     # Step 2: Prepare System Restore. The temporary frequency value is applied and restored inside New-SystemRestorePoint.
     Set-OOShutUpLogStage -Stage RestorePoint

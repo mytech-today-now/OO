@@ -97,7 +97,7 @@ This repository contains an installer framework for **O&O ShutUp10++**. It can a
 
 ### Clean-checkout profile availability
 
-**Approved configuration is unavailable from a clean checkout.** The repository includes `profiles/ooshutup10.cfg` as an estimated candidate, not an O&O-exported or owner-reviewed profile. The matching approval manifest and per-setting scope-evidence records are absent, so no privacy settings or scheduled task can be applied. An interactive source-checkout run uses setup-only mode: it verifies or downloads O&O and opens the application without applying settings or creating a restore point. With redirected input, it leaves the application closed. No approved default settings are included or implied. See [profiles/README.md](profiles/README.md) for owner-review and disposable-VM requirements.
+**Approved configuration is unavailable from a clean checkout.** The repository includes `profiles/ooshutup10.cfg` as an estimated candidate, not an O&O-exported or owner-reviewed profile. The matching approval manifest and per-setting scope-evidence records are absent, so no privacy settings or scheduled task can be applied. An interactive source-checkout run uses setup-only mode: it reuses a verified machine copy when available; otherwise it installs the verified O&O executable under `%LOCALAPPDATA%\myTech.Today\O&O ShutUp10`, then opens it. This avoids a Program Files write for a first-time setup. No settings or restore point are applied or created. With redirected input, it leaves the application closed. No approved default settings are included or implied. See [profiles/README.md](profiles/README.md) for owner-review and disposable-VM requirements.
 
 ## Features
 
@@ -163,7 +163,7 @@ The release manifest is a PowerShell data file with exactly these fields:
 }
 ```
 
-This checkout does not include a signed release manifest, signing certificate, or machine trust policy. In this Git checkout, `install.bat` detects the missing release manifest and selects development mode automatically when `MachinePolicy` does not enforce `AllSigned`. It requests UAC through the development helper if needed. The installer warns that the source is not release-authenticated. That path may still apply the reviewed profile when a valid pair is present, but it never relocates the checkout or registers a scheduled task. Without a profile pair, it verifies or downloads O&O, opens the app for manual setup, and applies no settings. The checked-in estimated candidate is never applied. To select the same mode explicitly, use `install.bat -DevelopmentMode`.
+This checkout does not include a signed release manifest, signing certificate, or machine trust policy. In this Git checkout, `install.bat` detects the missing release manifest and selects development mode automatically when `MachinePolicy` does not enforce `AllSigned`. It requests UAC through the development helper if needed. The installer warns that the source is not release-authenticated. That path may still apply the reviewed profile when a valid pair is present, but it never relocates the checkout or registers a scheduled task. Without a profile pair, it reuses a verified machine copy or installs O&O under `%LOCALAPPDATA%\myTech.Today\O&O ShutUp10` and opens it for manual setup. The checked-in estimated candidate is never applied. To select the same mode explicitly, use `install.bat -DevelopmentMode`.
 
 ```cmd
 install.bat
@@ -179,7 +179,7 @@ Windows PowerShell 5.1 can use the same development-only flow:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\Install-OOShutUp10.ps1"
 ```
 
-The source-checkout path is intended for local development and testing. Interactive setup-only mode opens O&O with no profile changes; redirected runs keep its window closed. A reviewed-profile run may change system settings and must be used only on a suitable test machine. Add a reviewed profile pair before applying settings. Development mode never creates the scheduled task.
+The source-checkout path is intended for local development and testing. Interactive setup-only mode uses a verified machine copy or installs O&O into the current user's LocalAppData, then opens it with no profile changes; redirected runs keep its window closed. A reviewed-profile run may change system settings and must be used only on a suitable test machine. Add a reviewed profile pair before applying settings. Development mode never creates the scheduled task.
 
 ## Usage
 
@@ -189,13 +189,13 @@ The source-checkout path is intended for local development and testing. Interact
 
 ### Initial Installation and Setup
 
-Run `install.bat` from CMD. It checks administrator access before runtime discovery, requests UAC elevation when needed, installs PowerShell 7 if it is missing, then installs or opens O&O. Canceling the prompt stops before runtime installation or O&O launch:
+Run `install.bat` from CMD. It checks administrator access before runtime discovery, requests UAC elevation when needed, installs PowerShell 7 if it is missing, then opens a verified O&O copy or installs one for the current user when setup-only mode is active. Canceling the prompt stops before runtime installation or O&O launch:
 
 ```cmd (elevated)
 <drive>:\path\to\script\install.bat
 ```
 
-The batch wrapper starts PowerShell 7 (`pwsh`) with process-scoped `-ExecutionPolicy Bypass`. A source checkout without a release manifest automatically uses development mode; an organization-enforced `MachinePolicy` still takes precedence. A valid reviewed profile pair enables the normal configuration flow. If the pair is absent, an interactive setup-only run opens O&O without applying privacy settings; redirected runs leave the window closed. Production still requires the signed release package and organization-managed trust settings described above.
+The batch wrapper starts PowerShell 7 (`pwsh`) with process-scoped `-ExecutionPolicy Bypass`. A source checkout without a release manifest automatically uses development mode; an organization-enforced `MachinePolicy` still takes precedence. A valid reviewed profile pair enables the normal configuration flow. If the pair is absent, an interactive setup-only run reuses a verified machine copy or installs O&O into `%LOCALAPPDATA%\myTech.Today\O&O ShutUp10`, then opens it without applying privacy settings; redirected runs leave the window closed. Production still requires the signed release package and organization-managed trust settings described above.
 
 If PowerShell 7 is missing, an interactive launch calls WinGet without agreement-acceptance flags so WinGet can show its source and package terms. After installation, the launcher checks PATH and the standard PowerShell install locations so it can run PowerShell without requiring a sign-out to refresh PATH. A launch with redirected input fails closed unless you separately reviewed both agreements and set `MYTECH_ACCEPT_WINGET_AGREEMENTS=YES`. When set on a launch that needs WinGet, this variable passes both acceptance flags and skips those WinGet prompts:
 
@@ -540,7 +540,7 @@ If you get an ampersand error in a source checkout, use the call operator and ex
 
 ### O&O ShutUp10++ Not Found After Installation
 
-The installer stores the portable executable at one machine-managed path: `%ProgramW6432%\OO Software\O&O ShutUp10\OOSU10.exe`. If `%ProgramW6432%` is unavailable, it uses `%ProgramFiles%` as the machine root. The installer and LocalSystem reapply task resolve this same absolute path; they do not search a user's TEMP, profile, LOCALAPPDATA, or PATH.
+Approved-profile configuration stores the portable executable at one machine-managed path: `%ProgramW6432%\OO Software\O&O ShutUp10\OOSU10.exe`. If `%ProgramW6432%` is unavailable, it uses `%ProgramFiles%` as the machine root. The configuration flow and LocalSystem reapply task resolve this same absolute path. Setup-only source-checkout runs without a verified machine copy use the separate current-user LocalAppData path and never register a task.
 
 If the managed copy is missing or fails signature and version validation, reapplication is skipped with: “The approved O&O executable path is unavailable to the scheduled task. Reapplication was skipped; restore the verified machine copy.” Run the installer again with administrator privileges to restore the verified portable copy.
 
