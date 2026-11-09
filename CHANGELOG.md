@@ -4,7 +4,10 @@
 
 ### Changed
 
-- Permit explicit source-checkout `-DevelopmentMode` launches through `install.bat` with process-scoped `Bypass`, while retaining production trust checks and the signed elevation helper.
+- Automatically select source-checkout development mode when no release manifest or enforced `AllSigned` policy is present; use the development elevation helper only for that checkout path.
+- Add a setup-only first run that verifies or downloads O&O and opens its UI in interactive sessions when a reviewed profile pair is absent, without applying settings or creating a restore point or scheduled task.
+- Report the setup-only outcome separately from successful profile configuration and task registration.
+- Locate PowerShell 7 from PATH, standard machine paths, and the Windows app alias, including immediately after WinGet installation.
 - Add a protected, rotating SYSTEM application log with safe stage diagnostics; logging failures stop initialization or prevent a successful completion result.
 - Add an aggregate offline safety runner and Windows PowerShell 5.1, PowerShell 7, and Linux Bash CI jobs.
 - Check administrator access before runtime discovery and request UAC elevation through the signed helper when needed. Preserve installer arguments and exit status, and stop when elevation is canceled.

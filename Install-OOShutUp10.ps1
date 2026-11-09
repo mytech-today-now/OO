@@ -3,7 +3,7 @@
 
 <#
 .SYNOPSIS
-    Installs O&O ShutUp10++ and applies the approved settings profile packaged beside the script.
+    Installs or opens O&O ShutUp10++; applies settings only from a valid reviewed profile package.
 
 .DESCRIPTION
     This script will:
@@ -12,7 +12,8 @@
     3. Attempt a system restore point before applying the profile
     4. Apply the approved privacy settings profile quietly
     5. Create a scheduled task pinned to the approved profile and manifest digests
-    6. Offer a graceful, cancellable restart only when O&O reports changed settings; force requires -ForceRestart
+    6. In a source checkout without a reviewed profile pair, open O&O in setup-only mode without applying settings
+    7. Offer a graceful, cancellable restart only when O&O reports changed settings; force requires -ForceRestart
 
 .PARAMETER ReapplyOnly
     If specified, only reapplies the approved privacy settings without installation or task creation.
@@ -20,16 +21,18 @@
     from the installed signed release to recover after a missed event or unavailable scheduled task.
 
 .PARAMETER NonInteractive
-    Suppresses prompts only when both approved profile and manifest SHA-256 digests match. Redirected or unavailable
-    console input automatically selects this exact-digest approval path before any configuration changes.
+    Suppresses profile-approval prompts only when both approved profile and manifest SHA-256 digests match. Redirected
+    or unavailable input uses that exact-digest path for profile application. Without a profile in a source checkout,
+    setup-only mode installs O&O but does not open its interactive window.
 
 .PARAMETER ForceRestart
     Explicitly permits Restart-Computer to force-close applications when a restart is confirmed.
     Unsaved work may be lost; use only when that risk is accepted.
 
 .PARAMETER DevelopmentMode
-    Explicitly permits a source checkout to run without a signed release package. This is a development-only path;
-    it warns before running and does not relocate the checkout or create a scheduled task.
+    Permits a Git source checkout to run without a signed release package. When no adjacent signed release manifest
+    exists and MachinePolicy does not enforce AllSigned, the installer selects this development-only path automatically.
+    It warns before running and does not relocate the checkout or create a scheduled task.
 
 .PARAMETER ApprovedProfileSha256
     The exact SHA-256 digest of the reviewed O&O settings export approved for unattended use.
@@ -65,7 +68,9 @@
     Production releases require administrator-enforced MachinePolicy AllSigned, a valid Authenticode signature on this
     script and its adjacent Install-OOShutUp10.release.psd1 manifest, matching SHA-256 metadata, and a signer
     thumbprint configured outside this repository at HKLM\SOFTWARE\Policies\myTech.Today\OOShutUp10.
-    Use -DevelopmentMode only from a source checkout; that path warns and skips relocation and scheduled-task creation.
+    A Git source checkout without a release manifest automatically uses development mode when MachinePolicy does not
+    enforce AllSigned. That path warns and skips relocation and scheduled-task creation. Production packages still
+    require the signed release and managed trust configuration described below.
     No signing key or production trust pin is stored in this repository.
     MachinePolicy and UserPolicy Group Policy settings take precedence; otherwise Process takes precedence over CurrentUser and LocalMachine.
     PowerShell policy blocks this production launch. No policy was changed; restore a trusted signed release or use -DevelopmentMode only from a source checkout.
@@ -266,6 +271,18 @@ function Test-OOShutUpSourceCheckout {
     }
 
     return $false
+}
+
+# A Git checkout without a release manifest is a development package. Select that
+# path automatically only when the machine does not enforce AllSigned. An enforced
+# AllSigned policy and complete release packages still pass through production gates.
+$script:OOShutUpSourceCheckout = Test-OOShutUpSourceCheckout -ScriptPath $PSCommandPath
+$script:OOShutUpReleaseManifestPath = Join-Path (Split-Path -Parent $PSCommandPath) 'Install-OOShutUp10.release.psd1'
+if (-not $DevelopmentMode -and
+    $script:OOShutUpSourceCheckout -and
+    -not (Test-Path -LiteralPath $script:OOShutUpReleaseManifestPath -PathType Leaf) -and
+    -not (Test-OOShutUpEnforcedAllSignedPolicy)) {
+    $DevelopmentMode = $true
 }
 
 function Test-OOShutUpSourceIntegrity {
@@ -745,7 +762,7 @@ function Set-OOShutUpLogOutcome {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
-        [ValidateSet('InProgress', 'Complete', 'Partial', 'Failed', 'Unknown')]
+        [ValidateSet('InProgress', 'Complete', 'SetupOnly', 'Partial', 'Failed', 'Unknown')]
         [string]$Outcome
     )
 
@@ -861,7 +878,7 @@ function Write-OOShutUpAuditRecord {
         [string]$ErrorCategory,
 
         [Parameter(Mandatory = $true)]
-        [ValidateSet('InProgress', 'Complete', 'Partial', 'Failed', 'Unknown')]
+        [ValidateSet('InProgress', 'Complete', 'SetupOnly', 'Partial', 'Failed', 'Unknown')]
         [string]$Outcome,
 
         [Parameter(Mandatory = $false)]
@@ -1228,7 +1245,7 @@ function Get-OOShutUpTerminalExitCode {
     [OutputType([int])]
     param(
         [Parameter(Mandatory = $true)]
-        [ValidateSet('Complete', 'Partial', 'Failed', 'Unknown')]
+        [ValidateSet('Complete', 'SetupOnly', 'Partial', 'Failed', 'Unknown')]
         [string]$Outcome,
 
         [Parameter(Mandatory = $true)]
@@ -1246,6 +1263,7 @@ function Get-OOShutUpTerminalExitCode {
     Set-OOShutUpLogErrorCategory -Category $(if ($Outcome -eq 'Failed') { 'UnexpectedFailure' } else { 'None' })
     $level = switch -Exact ($Outcome) {
         'Complete' { 'SUCCESS' }
+        'SetupOnly' { 'INFO' }
         'Partial' { 'WARNING' }
         'Failed' { 'ERROR' }
         default { 'WARNING' }
@@ -5043,29 +5061,41 @@ try {
         Write-Log 'Console input is redirected or unavailable. Using the non-interactive approval path; exact approved profile and manifest SHA-256 digests are required.' -Level WARNING
     }
 
-    # Validate the reviewed profile before relocation, registry changes, restore points, task changes, or O&O launch.
-    Set-OOShutUpLogStage -Stage ProfileValidation
-    $approvedProfile = Get-OOShutUpApprovedProfile -RequireMachineScope:$ReapplyOnly
-    if ($null -eq $approvedProfile) {
-        Set-OOShutUpLogErrorCategory -Category ProfileRejected
-        Write-Log 'Profile validation failed; no configuration changes were started.' -Level ERROR
-        exit (Get-OOShutUpTerminalExitCode -Outcome Failed -ExitCode 1)
+    # A source checkout without both reviewed files can install and open O&O for
+    # manual setup. It must not apply settings, create a restore point, or register a task.
+    $setupOnly = $false
+    $hasProfileFile = Test-Path -LiteralPath $script:OOShutUpProfilePath -PathType Leaf
+    $hasProfileManifest = Test-Path -LiteralPath $script:OOShutUpProfileManifestPath -PathType Leaf
+    if ($DevelopmentMode -and -not $ReapplyOnly -and (-not $hasProfileFile -or -not $hasProfileManifest)) {
+        $setupOnly = $true
+        Set-OOShutUpLogStage -Stage ProfileValidation
+        Write-Log 'No complete reviewed profile pair is present. Setup-only mode will install and open O&O without applying privacy settings or registering a scheduled task.' -Level WARNING
     }
-    Write-Log ("Validated approved settings profile version {0} for O&O file version range {1} (profile SHA-256 {2}; manifest SHA-256 {3}; {4} settings). Setting values are omitted from logs." -f $approvedProfile.Version, $approvedProfile.OOShutUpVersionRange, $approvedProfile.Sha256, $approvedProfile.ManifestSha256, $approvedProfile.SettingCount) -Level INFO
+    else {
+        # Validate the reviewed profile before relocation, registry changes, restore points, task changes, or O&O configuration.
+        Set-OOShutUpLogStage -Stage ProfileValidation
+        $approvedProfile = Get-OOShutUpApprovedProfile -RequireMachineScope:$ReapplyOnly
+        if ($null -eq $approvedProfile) {
+            Set-OOShutUpLogErrorCategory -Category ProfileRejected
+            Write-Log 'Profile validation failed; no configuration changes were started.' -Level ERROR
+            exit (Get-OOShutUpTerminalExitCode -Outcome Failed -ExitCode 1)
+        }
+        Write-Log ("Validated approved settings profile version {0} for O&O file version range {1} (profile SHA-256 {2}; manifest SHA-256 {3}; {4} settings). Setting values are omitted from logs." -f $approvedProfile.Version, $approvedProfile.OOShutUpVersionRange, $approvedProfile.Sha256, $approvedProfile.ManifestSha256, $approvedProfile.SettingCount) -Level INFO
 
-    Set-OOShutUpLogStage -Stage ProfileApproval
-    $profileApprovalAccepted = Confirm-OOShutUpProfile `
-        -Profile $approvedProfile `
-        -ApprovedProfileSha256 $ApprovedProfileSha256 `
-        -ApprovedProfileManifestSha256 $ApprovedProfileManifestSha256 `
-        -NonInteractive:$NonInteractive `
-        -ProfileApprovalConfirmed:$ProfileApprovalConfirmed
-    if (-not $profileApprovalAccepted) {
-        Set-OOShutUpLogErrorCategory -Category ProfileRejected
-        Write-Log 'Profile approval was not granted; no configuration changes were started.' -Level ERROR
-        exit (Get-OOShutUpTerminalExitCode -Outcome Failed -ExitCode 1)
+        Set-OOShutUpLogStage -Stage ProfileApproval
+        $profileApprovalAccepted = Confirm-OOShutUpProfile `
+            -Profile $approvedProfile `
+            -ApprovedProfileSha256 $ApprovedProfileSha256 `
+            -ApprovedProfileManifestSha256 $ApprovedProfileManifestSha256 `
+            -NonInteractive:$NonInteractive `
+            -ProfileApprovalConfirmed:$ProfileApprovalConfirmed
+        if (-not $profileApprovalAccepted) {
+            Set-OOShutUpLogErrorCategory -Category ProfileRejected
+            Write-Log 'Profile approval was not granted; no configuration changes were started.' -Level ERROR
+            exit (Get-OOShutUpTerminalExitCode -Outcome Failed -ExitCode 1)
+        }
+        Write-Log 'Profile approval was accepted.' -Level INFO
     }
-    Write-Log 'Profile approval was accepted.' -Level INFO
 
     Set-OOShutUpLogStage -Stage Relocation
     $currentPath = $PSCommandPath
@@ -5200,6 +5230,25 @@ try {
     }
 
     Write-Log "Using O&O ShutUp10++ at: $exePath" -Level INFO
+
+    if ($setupOnly) {
+        if (-not $NonInteractive) {
+            try {
+                Start-Process -FilePath $exePath -WorkingDirectory $InstallPath -ErrorAction Stop | Out-Null
+            }
+            catch {
+                Set-OOShutUpLogErrorCategory -Category ProcessFailure
+                Write-Log 'The verified O&O application is installed but could not be opened. No privacy settings were applied.' -Level ERROR
+                exit (Get-OOShutUpTerminalExitCode -Outcome Failed -ExitCode 1)
+            }
+            Write-Log 'O&O ShutUp10++ was opened for manual setup. No privacy settings were applied and no update task was registered.' -Level SUCCESS
+        }
+        else {
+            Write-Log 'The verified O&O application is installed. No interactive console was available, so the application was not opened; no privacy settings were applied and no update task was registered.' -Level WARNING
+        }
+        Write-Log 'To apply settings later, add an owner-reviewed O&O export and its matching approval manifest to the profiles directory, then run the installer again.' -Level INFO
+        exit (Get-OOShutUpTerminalExitCode -Outcome SetupOnly -ExitCode 0)
+    }
 
     # Step 2: Prepare System Restore. The temporary frequency value is applied and restored inside New-SystemRestorePoint.
     Set-OOShutUpLogStage -Stage RestorePoint

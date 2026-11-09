@@ -97,7 +97,7 @@ This repository contains an installer framework for **O&O ShutUp10++**. It can a
 
 ### Clean-checkout profile availability
 
-**Approved configuration is unavailable from a clean checkout.** The repository includes `profiles/ooshutup10.cfg` as an estimated candidate, not an O&O-exported or owner-reviewed profile. The matching approval manifest and per-setting scope-evidence records are absent, so the installer rejects this incomplete package before relocation, restore-point work, registry changes, O&O launch, or scheduled-task registration. No approved default settings are included or implied. See [profiles/README.md](profiles/README.md) for owner-review and disposable-VM requirements.
+**Approved configuration is unavailable from a clean checkout.** The repository includes `profiles/ooshutup10.cfg` as an estimated candidate, not an O&O-exported or owner-reviewed profile. The matching approval manifest and per-setting scope-evidence records are absent, so no privacy settings or scheduled task can be applied. An interactive source-checkout run uses setup-only mode: it verifies or downloads O&O and opens the application without applying settings or creating a restore point. With redirected input, it leaves the application closed. No approved default settings are included or implied. See [profiles/README.md](profiles/README.md) for owner-review and disposable-VM requirements.
 
 ## Features
 
@@ -138,7 +138,7 @@ This repository contains an installer framework for **O&O ShutUp10++**. It can a
 
 ## Execution Policy and Safe Launch
 
-Do not change the stored `CurrentUser` or `LocalMachine` execution policy to run this installer. Production runs require organization-enforced `AllSigned` policy at `MachinePolicy`. The scheduled task requests `AllSigned`. The batch wrapper uses process-scoped `Bypass` so an explicit source-checkout `-DevelopmentMode` launch can load; this does not override Group Policy. The installer checks machine policy before loading repository helpers or starting machine work.
+Do not change the stored `CurrentUser` or `LocalMachine` execution policy to run this installer. Production runs require organization-enforced `AllSigned` policy at `MachinePolicy`. The scheduled task requests `AllSigned`. In a Git checkout without a release manifest, the launchers select `-DevelopmentMode` automatically when `MachinePolicy` does not enforce `AllSigned`; the batch wrapper uses process-scoped `Bypass` for this development path. This does not override Group Policy. The installer checks machine policy before loading repository helpers or starting machine work.
 
 On Windows, `MachinePolicy` and `UserPolicy` Group Policy settings take precedence. When neither is set, precedence is `Process`, then `CurrentUser`, then `LocalMachine`; a process-scoped launch cannot override Group Policy. Execution policy alone is not a complete application-control boundary, so production deployments must protect the launcher and PowerShell execution path with the organization's application-control policy as well. See [Microsoft's execution policy documentation](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_execution_policies).
 
@@ -163,23 +163,23 @@ The release manifest is a PowerShell data file with exactly these fields:
 }
 ```
 
-This checkout does not include a signed release manifest, signing certificate, or machine trust policy. `install.bat` therefore fails closed for a production launch. For local development only, run an elevated Command Prompt in the source checkout and pass `-DevelopmentMode` through the batch wrapper. The installer verifies a `.git` marker and warns that the source is not release-authenticated. That path may still apply the reviewed profile, but it never relocates the checkout or registers a scheduled task:
+This checkout does not include a signed release manifest, signing certificate, or machine trust policy. In this Git checkout, `install.bat` detects the missing release manifest and selects development mode automatically when `MachinePolicy` does not enforce `AllSigned`. It requests UAC through the development helper if needed. The installer warns that the source is not release-authenticated. That path may still apply the reviewed profile when a valid pair is present, but it never relocates the checkout or registers a scheduled task. Without a profile pair, it verifies or downloads O&O, opens the app for manual setup, and applies no settings. The checked-in estimated candidate is never applied. To select the same mode explicitly, use `install.bat -DevelopmentMode`.
 
 ```cmd
-install.bat -DevelopmentMode
+install.bat
 ```
 
 ```powershell
-pwsh.exe -NoProfile -ExecutionPolicy Bypass -File ".\Install-OOShutUp10.ps1" -DevelopmentMode
+pwsh.exe -NoProfile -ExecutionPolicy Bypass -File ".\Install-OOShutUp10.ps1"
 ```
 
 Windows PowerShell 5.1 can use the same development-only flow:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\Install-OOShutUp10.ps1" -DevelopmentMode
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\Install-OOShutUp10.ps1"
 ```
 
-Use that development path only on a disposable test machine with a harmless approved profile. It exits with partial setup because no task was registered.
+The source-checkout path is intended for local development and testing. Interactive setup-only mode opens O&O with no profile changes; redirected runs keep its window closed. A reviewed-profile run may change system settings and must be used only on a suitable test machine. Add a reviewed profile pair before applying settings. Development mode never creates the scheduled task.
 
 ## Usage
 
@@ -189,15 +189,15 @@ Use that development path only on a disposable test machine with a harmless appr
 
 ### Initial Installation and Setup
 
-Run the launcher from CMD. A configured production package checks administrator access before runtime discovery and requests UAC elevation through the signed helper when needed. Canceling the prompt stops before runtime installation or O&O launch:
+Run `install.bat` from CMD. It checks administrator access before runtime discovery, requests UAC elevation when needed, installs PowerShell 7 if it is missing, then installs or opens O&O. Canceling the prompt stops before runtime installation or O&O launch:
 
 ```cmd (elevated)
 <drive>:\path\to\script\install.bat
 ```
 
-The batch wrapper starts PowerShell 7 (`pwsh`) with process-scoped `-ExecutionPolicy Bypass` so an explicit `-DevelopmentMode` launch can load from an elevated Command Prompt. Group Policy `MachinePolicy` takes precedence over process settings. Production still requires the signed release package and organization-managed trust settings described above; an unsigned checkout is not a production package.
+The batch wrapper starts PowerShell 7 (`pwsh`) with process-scoped `-ExecutionPolicy Bypass`. A source checkout without a release manifest automatically uses development mode; an organization-enforced `MachinePolicy` still takes precedence. A valid reviewed profile pair enables the normal configuration flow. If the pair is absent, an interactive setup-only run opens O&O without applying privacy settings; redirected runs leave the window closed. Production still requires the signed release package and organization-managed trust settings described above.
 
-If PowerShell 7 is missing, an interactive launch calls WinGet without agreement-acceptance flags so WinGet can show its source and package terms. A launch with redirected input fails closed unless you separately reviewed both agreements and set `MYTECH_ACCEPT_WINGET_AGREEMENTS=YES`. When set on a launch that needs WinGet, this variable passes both acceptance flags and skips those WinGet prompts:
+If PowerShell 7 is missing, an interactive launch calls WinGet without agreement-acceptance flags so WinGet can show its source and package terms. After installation, the launcher checks PATH and the standard PowerShell install locations so it can run PowerShell without requiring a sign-out to refresh PATH. A launch with redirected input fails closed unless you separately reviewed both agreements and set `MYTECH_ACCEPT_WINGET_AGREEMENTS=YES`. When set on a launch that needs WinGet, this variable passes both acceptance flags and skips those WinGet prompts:
 
 ```cmd
 set "MYTECH_ACCEPT_WINGET_AGREEMENTS=YES"
@@ -219,7 +219,7 @@ pwsh.exe -NoProfile -ExecutionPolicy AllSigned -File "<drive>:\path\to\script\In
 
 ### What Happens During Installation
 
-These steps run only after an owner-reviewed profile pair passes validation. A clean checkout stops at the profile check described above.
+These configuration steps run only after an owner-reviewed profile pair passes validation. With no pair, a source checkout instead installs or verifies O&O and opens its UI without applying privacy settings, creating a restore point, or registering a task.
 
 1. ✅ Validates the selected profile and confirms the impact summary
 2. ✅ Checks if O&O ShutUp10++ is already installed and downloads it if needed
@@ -296,7 +296,7 @@ If the trusted interpreter is absent, redirected, or changes before candidate st
 
 If a later verification detects an interpreter change after a disabled validation task is staged, the candidate is rejected before replacing the existing task. If candidate cleanup cannot be confirmed, inspect the exact validation-task path named in the installer log and remove it only after confirming that it is disabled.
 
-If the approved settings are applied but the update task cannot be verified, setup is reported as partial and the installer exits with code `2`. The installer prints recovery instructions for repairing `\myTech.Today\Install-OOShutUp10`. Exit code `0` requires verified settings, an acceptable restore-point outcome, and a verified task.
+If the approved settings are applied but the update task cannot be verified, setup is reported as partial and the installer exits with code `2`. The installer prints recovery instructions for repairing `\myTech.Today\Install-OOShutUp10`. A configured install exits `0` only after the normal settings, restore-point, and task gates pass. Source-checkout setup-only mode also exits `0` after O&O is verified and opened (or verified and left unopened when no interactive console is available); the log outcome is `SetupOnly`, and no privacy settings or task are reported as complete.
 
 ### Task Security Descriptor
 
@@ -415,7 +415,7 @@ If the lookup fails, the task is absent, or multiple matches are returned, the c
 
 ### Initial Installation Flow
 
-1. Verify the signed PowerShell source and release manifest, then validate the profile and show its impact summary. An untrusted source, rejection, or cancellation stops before relocation or system changes.
+1. For production, verify the signed PowerShell source and release manifest. For a source checkout, use development mode. Then validate the profile and show its impact summary before configuration. An untrusted source, rejection, or cancellation stops before configuration changes.
 2. Check for O&O ShutUp10++ and download it from the official source if needed.
 3. Attempt a system restore point.
 4. Apply the approved profile quietly.
@@ -437,7 +437,7 @@ O&O ShutUp10++ is executed with the following arguments:
 - `/nosrp` - Don't create restore point (we create our own)
 - The absolute path to the approved `ooshutup10.cfg` profile
 
-Before relocation, registry changes, restore-point creation, scheduled-task changes, or O&O launch, interactive runs display the profile and manifest SHA-256 digests, setting IDs and states, reviewer-provided categories and impact descriptions, and each setting's scope and scope evidence. Type `YES` to accept, `NO` to reject, or `CANCEL` to stop. The summary uses the reviewed manifest text and does not infer setting names, categories, or scope from IDs.
+Before relocation, registry changes, restore-point creation, scheduled-task changes, or O&O profile application, interactive runs display the profile and manifest SHA-256 digests, setting IDs and states, reviewer-provided categories and impact descriptions, and each setting's scope and scope evidence. Type `YES` to accept, `NO` to reject, or `CANCEL` to stop. The summary uses the reviewed manifest text and does not infer setting names, categories, or scope from IDs. Setup-only mode has no profile summary because it applies no settings.
 
 Redirected or unavailable console input uses the non-interactive path and requires both exact approved digests before configuration changes.
 
@@ -470,7 +470,7 @@ Export the `.cfg` from O&O ShutUp10, review every setting ID and state, and chec
 
 Schema versions 1 through 3 are rejected. To migrate an older manifest, an owner must repeat the setting review against the exact O&O release or fully reviewed range, refresh each source and VM evidence record, set `schemaVersion` to `4`, add `ooshutupVersionRange`, and recalculate the cfg and manifest approval digests. Do not carry forward `profileVersion` or old review text as evidence of compatibility. Owners refresh evidence for a new O&O release by inspecting its current setting descriptions, availability, and scope, repeating the disposable two-account VM checks, then updating the range only after every included release is reviewed. A release outside the approved range requires this review and digest reapproval before application or task registration.
 
-This checkout currently contains no approved profile, so it exits with this message until both reviewed files are supplied:
+This checkout currently contains no approved profile. Production and configuration runs stop until both reviewed files are supplied. A source checkout without the pair uses setup-only mode as described above; it does not apply the estimated candidate. The configuration gate reports:
 
 > The approved settings profile is missing or invalid. No privacy settings were applied; place the reviewed profile in the configured directory.
 
