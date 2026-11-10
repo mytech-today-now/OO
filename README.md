@@ -97,7 +97,7 @@ This repository contains an installer framework for **O&O ShutUp10++**. It can a
 
 ### Clean-checkout profile availability
 
-**Approved configuration is unavailable from a clean checkout.** The repository includes `profiles/ooshutup10.cfg` as an estimated candidate, not an O&O-exported or owner-reviewed profile. The matching approval manifest and per-setting scope-evidence records are absent, so no privacy settings or scheduled task can be applied. An interactive source-checkout run uses setup-only mode: it reuses a verified machine copy when available; otherwise it installs the verified O&O executable under `%LOCALAPPDATA%\myTech.Today\O&O ShutUp10`, then opens it. This avoids a Program Files write for a first-time setup. No settings or restore point are applied or created. With redirected input, it leaves the application closed. No approved default settings are included or implied. See [profiles/README.md](profiles/README.md) for owner-review and disposable-VM requirements.
+**Approved configuration is unavailable from a clean checkout.** The repository includes `profiles/ooshutup10.cfg` as an estimated candidate, not an O&O-exported or owner-reviewed profile. The matching approval manifest and per-setting scope-evidence records are absent, so no privacy settings or scheduled task can be applied. An interactive source-checkout run uses setup-only mode: it reuses a verified machine copy when available; otherwise it installs the verified O&O executable under `%LOCALAPPDATA%\myTech.Today\O&O ShutUp10`. If that user folder cannot be prepared, it uses the elevated machine install directory. It then opens O&O. No settings or restore point are applied or created. With redirected input, it leaves the application closed. No approved default settings are included or implied. See [profiles/README.md](profiles/README.md) for owner-review and disposable-VM requirements.
 
 ## Features
 
@@ -163,7 +163,7 @@ The release manifest is a PowerShell data file with exactly these fields:
 }
 ```
 
-This checkout does not include a signed release manifest, signing certificate, or machine trust policy. In this Git checkout, `install.bat` detects the missing release manifest and selects development mode automatically when `MachinePolicy` does not enforce `AllSigned`. It requests UAC through the development helper if needed. The installer warns that the source is not release-authenticated. That path may still apply the reviewed profile when a valid pair is present, but it never relocates the checkout or registers a scheduled task. Without a profile pair, it reuses a verified machine copy or installs O&O under `%LOCALAPPDATA%\myTech.Today\O&O ShutUp10` and opens it for manual setup. The checked-in estimated candidate is never applied. To select the same mode explicitly, use `install.bat -DevelopmentMode`.
+This checkout does not include a signed release manifest, signing certificate, or machine trust policy. In this Git checkout, `install.bat` detects the missing release manifest and selects development mode automatically when `MachinePolicy` does not enforce `AllSigned`. It requests UAC through the development helper if needed. The installer warns that the source is not release-authenticated. That path may still apply the reviewed profile when a valid pair is present, but it never relocates the checkout or registers a scheduled task. Without a profile pair, it reuses a verified machine copy or installs O&O under `%LOCALAPPDATA%\myTech.Today\O&O ShutUp10`; if that folder is not writable, it falls back to the elevated machine install directory. It opens O&O for manual setup. The checked-in estimated candidate is never applied. To select the same mode explicitly, use `install.bat -DevelopmentMode`.
 
 ```cmd
 install.bat
@@ -189,7 +189,7 @@ The source-checkout path is intended for local development and testing. Interact
 
 ### Initial Installation and Setup
 
-Run `install.bat` from CMD. It checks administrator access before runtime discovery, requests UAC elevation when needed, installs PowerShell 7 if it is missing, then opens a verified O&O copy or installs one for the current user when setup-only mode is active. Canceling the prompt stops before runtime installation or O&O launch:
+Run `install.bat` from CMD. This one command needs no extra argument for a normal setup-only run. It checks administrator access before runtime discovery, requests UAC elevation when needed, installs PowerShell 7 if it is missing, then opens a verified O&O copy or installs one for the current user when setup-only mode is active. If the current-user folder is not writable, it falls back to the elevated machine install directory. Canceling the prompt stops before runtime installation or O&O launch:
 
 ```cmd (elevated)
 <drive>:\path\to\script\install.bat

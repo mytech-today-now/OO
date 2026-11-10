@@ -7,6 +7,7 @@
 - Automatically select source-checkout development mode when no release manifest or enforced `AllSigned` policy is present; use the development elevation helper only for that checkout path.
 - Add a setup-only first run that verifies or downloads O&O and opens its UI in interactive sessions when a reviewed profile pair is absent, without applying settings or creating a restore point or scheduled task.
 - Install a new setup-only O&O copy under the current user's LocalAppData when no verified machine copy exists, avoiding a Program Files write on first run; keep approved-profile installation machine-wide.
+- Fall back to the writable elevated machine directory when setup-only LocalAppData cannot be prepared, and include the underlying folder, download, or promotion error in the protected log.
 - Report the setup-only outcome separately from successful profile configuration and task registration.
 - Locate PowerShell 7 from PATH, standard machine paths, and the Windows app alias, including immediately after WinGet installation.
 - Add a protected, rotating SYSTEM application log with safe stage diagnostics; logging failures stop initialization or prevent a successful completion result.

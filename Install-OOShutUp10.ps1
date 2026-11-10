@@ -8,7 +8,7 @@
 .DESCRIPTION
     This script will:
     1. Validate the reviewed profile and obtain interactive approval or a matching unattended digest
-    2. Check if O&O ShutUp10++ is already installed and download it if not found; setup-only downloads go to the current user's LocalAppData
+    2. Check if O&O ShutUp10++ is already installed and download it if not found; setup-only installs prefer the current user's LocalAppData and fall back to the elevated machine directory when it is not writable
     3. Attempt a system restore point before applying the profile
     4. Apply the approved privacy settings profile quietly
     5. Create a scheduled task pinned to the approved profile and manifest digests
@@ -2352,6 +2352,50 @@ function Get-OOShutUpUserInstallPath {
     return [System.IO.Path]::GetFullPath((Join-Path $localAppDataPath 'myTech.Today\O&O ShutUp10'))
 }
 
+function Test-OOShutUpInstallDirectoryWritable {
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Path
+    )
+
+    $probePath = Join-Path $Path ('.oosu-write-check-{0}.tmp' -f [guid]::NewGuid().ToString('N'))
+    $stream = $null
+    try {
+        [System.IO.Directory]::CreateDirectory($Path) | Out-Null
+        $stream = [System.IO.File]::Open(
+            $probePath,
+            [System.IO.FileMode]::CreateNew,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::None
+        )
+        $stream.Dispose()
+        $stream = $null
+        [System.IO.File]::Delete($probePath)
+
+        return [pscustomobject]@{
+            Writable = $true
+            Error = $null
+        }
+    }
+    catch {
+        $failureMessage = $_.Exception.Message
+        if ($null -ne $stream) {
+            try { $stream.Dispose() } catch { }
+        }
+        if ([System.IO.File]::Exists($probePath)) {
+            try { [System.IO.File]::Delete($probePath) } catch { }
+        }
+
+        return [pscustomobject]@{
+            Writable = $false
+            Error = $failureMessage
+        }
+    }
+}
+
 function Get-OOShutUpApprovedProfile {
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -2786,9 +2830,7 @@ function Install-OOShutUp {
     }
 
     try {
-        if (-not (Test-Path -LiteralPath $InstallDirectory -PathType Container)) {
-            New-Item -LiteralPath $InstallDirectory -ItemType Directory -Force -ErrorAction Stop | Out-Null
-        }
+        [System.IO.Directory]::CreateDirectory($InstallDirectory) | Out-Null
 
         Write-Log "Downloading O&O ShutUp10++ from: $DownloadUrl" -Level INFO
 
@@ -2804,11 +2846,12 @@ function Install-OOShutUp {
             }
         }
         catch {
+            $downloadFailure = $_.Exception.Message
             if ($useDefaultInstallDirectory) {
-                Write-Log 'The O&O download failed. Check network connectivity and access to the managed machine directory, then retry.' -Level ERROR
+                Write-Log ("The O&O download failed. Check network connectivity and access to the managed machine directory, then retry. Details: {0}" -f $downloadFailure) -Level ERROR
             }
             else {
-                Write-Log ("The O&O download failed while targeting `"{0}`". Check network connectivity and directory access, then retry." -f $InstallDirectory) -Level ERROR
+                Write-Log ("The O&O download failed while targeting `"{0}`". Check network connectivity and directory access, then retry. Details: {1}" -f $InstallDirectory, $downloadFailure) -Level ERROR
             }
             return $false
         }
@@ -2821,7 +2864,7 @@ function Install-OOShutUp {
             Move-OOShutUpFileAtomically -SourcePath $stagingPath -DestinationPath $managedExecutablePath
         }
         catch {
-            Write-Log ("The verified O&O download could not be promoted into `"{0}`"; the existing executable was left in place. Check directory access and retry." -f $InstallDirectory) -Level ERROR
+            Write-Log ("The verified O&O download could not be promoted into `"{0}`"; the existing executable was left in place. Check directory access and retry. Details: {1}" -f $InstallDirectory, $_.Exception.Message) -Level ERROR
             return $false
         }
 
@@ -2830,7 +2873,7 @@ function Install-OOShutUp {
         return $true
     }
     catch {
-        Write-Log ("The O&O executable could not be stored in `"{0}`". No unverified executable was activated; check access to that directory and retry." -f $InstallDirectory) -Level ERROR
+        Write-Log ("The O&O executable could not be stored in `"{0}`". No unverified executable was activated; check access to that directory and retry. Details: {1}" -f $InstallDirectory, $_.Exception.Message) -Level ERROR
         return $false
     }
     finally {
@@ -5240,29 +5283,53 @@ try {
         Set-OOShutUpLogStage -Stage PayloadInstall
         Update-ScriptProgress -PercentComplete 20 -Status "Setup only: Preparing O&O" -CurrentOperation "Checking for a verified O&O ShutUp10++ copy"
 
-        # Prefer a verified machine copy when one already exists. A fresh setup-only
-        # install belongs to the current user and does not need a Program Files write.
+        # Prefer a verified machine copy when one already exists. Otherwise prefer a
+        # current-user install and use the machine directory only if the user folder
+        # cannot be prepared.
         $exePath = Get-OOShutUpPath
         if ($exePath) {
             Write-Log "Using the existing verified machine copy at: $exePath" -Level SUCCESS
         }
         else {
+            $setupUserInstallPath = $null
+            $setupUserPathError = $null
             try {
-                $setupInstallPath = Get-OOShutUpUserInstallPath
+                $setupUserInstallPath = Get-OOShutUpUserInstallPath
             }
             catch {
-                Set-OOShutUpLogErrorCategory -Category UnexpectedFailure
-                Write-Log 'The current user application-data directory is unavailable. O&O could not be installed for setup-only use.' -Level ERROR
-                exit (Get-OOShutUpTerminalExitCode -Outcome Failed -ExitCode 1)
+                $setupUserPathError = $_.Exception.Message
+            }
+
+            $setupInstallPath = $null
+            if (-not [string]::IsNullOrWhiteSpace($setupUserInstallPath)) {
+                $userDirectoryStatus = Test-OOShutUpInstallDirectoryWritable -Path $setupUserInstallPath
+                if ($userDirectoryStatus.Writable) {
+                    $setupInstallPath = $setupUserInstallPath
+                }
+                else {
+                    $setupUserPathError = [string]$userDirectoryStatus.Error
+                }
+            }
+
+            if ([string]::IsNullOrWhiteSpace($setupInstallPath)) {
+                $machineDirectoryStatus = Test-OOShutUpInstallDirectoryWritable -Path $InstallPath
+                if (-not $machineDirectoryStatus.Writable) {
+                    Set-OOShutUpLogErrorCategory -Category UnexpectedFailure
+                    Write-Log ("Neither the current-user O&O folder nor the elevated machine install folder is writable. Current-user path: `"{0}`". Current-user error: {1}. Machine path: `"{2}`". Machine error: {3}." -f $setupUserInstallPath, $setupUserPathError, $InstallPath, $machineDirectoryStatus.Error) -Level ERROR
+                    exit (Get-OOShutUpTerminalExitCode -Outcome Failed -ExitCode 1)
+                }
+
+                $setupInstallPath = $InstallPath
+                Write-Log ("The current-user O&O folder could not be prepared (`"{0}`": {1}). Using the writable machine folder `"{2}`" instead." -f $setupUserInstallPath, $setupUserPathError, $setupInstallPath) -Level WARNING
             }
 
             $exePath = Get-OOShutUpPath -InstallDirectory $setupInstallPath
             if (-not $exePath) {
-                Write-Log ("No verified O&O copy is present in the current-user directory. Installing it to: {0}" -f $setupInstallPath) -Level INFO
+                Write-Log ("No verified O&O copy is present in the selected install directory. Installing it to: {0}" -f $setupInstallPath) -Level INFO
                 if (-not (Install-OOShutUp -InstallDirectory $setupInstallPath)) {
                     Write-Progress -Activity "O&O ShutUp10++ Installation and Configuration" -Completed
                     Set-OOShutUpLogErrorCategory -Category UnexpectedFailure
-                    Write-Log ("O&O could not be installed to the current-user directory `"{0}`". See the preceding log line for download, file-verification, or folder-access details, then run install.bat again." -f $setupInstallPath) -Level ERROR
+                    Write-Log ("O&O could not be installed to the selected directory `"{0}`". See the preceding log line for download, file-verification, or folder-access details, then run install.bat again." -f $setupInstallPath) -Level ERROR
                     exit (Get-OOShutUpTerminalExitCode -Outcome Failed -ExitCode 1)
                 }
 
