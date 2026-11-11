@@ -76,17 +76,26 @@
     PowerShell policy blocks this production launch. No policy was changed; restore a trusted signed release or use -DevelopmentMode only from a source checkout.
 
     About myTech.Today:
-    myTech.Today is a Chicagoland-based MSP and IT consulting firm specializing in
-    PowerShell automation, infrastructure optimization, and custom development solutions.
-    With 20+ years of experience, we deliver tech solutions that improve efficiency
-    and drive business value.
+    myTech.Today provides IT consulting and support, custom PowerShell automation
+    and scripting, infrastructure optimization and system administration, cloud
+    integration (Azure, AWS, GCS, Microsoft 365), network design and management,
+    cybersecurity and compliance solutions, database management and custom development,
+    system setup, upgrades and troubleshooting, virus and spyware removal, and
+    hardware procurement, installation and configuration.
+    Service area: Omaha, NE and Lincoln, NE.
+
+    Why choose myTech.Today:
+    - 20+ years of IT consulting and software development experience
+    - Personalized service to 190+ satisfied clients
+    - 5-star review rating with consistent 24-hour solution delivery
+    - Payment-upon-success terms available
+    - Expertise in Windows automation, PowerShell scripting, and system optimization
 
     Contact Information:
     - Email: sales@mytech.today
     - Website: https://mytech.today
-    - Phone: (847) 767-4914
-    - Location: Lake Zurich, IL (Chicagoland area)
     - GitHub: https://github.com/mytech-today-now
+    - LinkedIn: https://linkedin.com/in/kylerode
 
 .EXAMPLE
     powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\Install-OOShutUp10.ps1" -DevelopmentMode
@@ -1158,26 +1167,34 @@ function Show-MyTechTodayBanner {
         "|                                                                              |",
         "+==============================================================================+",
         "|                                                                              |",
-        "|  This script is brought to you by myTech.Today - Your trusted partner       |",
-        "|  for IT consulting, managed services, and custom automation solutions.      |",
+        "|  Professional IT Services: Omaha, NE and Lincoln, NE                         |",
         "|                                                                              |",
         "|  Services:                                                                   |",
-        "|    - PowerShell Automation & Scripting                                      |",
-        "|    - Infrastructure Optimization                                            |",
-        "|    - Custom Application Development                                         |",
-        "|    - Cloud Integration (AWS, Azure, Google Cloud)                           |",
-        "|    - Managed IT Services (MSP)                                              |",
-        "|    - IT Consulting & Support                                                |",
+        "|    - IT Consulting and Support                                               |",
+        "|    - Custom PowerShell Automation and Scripting                              |",
+        "|    - Infrastructure Optimization and System Administration                   |",
+        "|    - Cloud Integration (Azure, AWS, GCS, Microsoft 365)                      |",
+        "|    - Network Design and Management                                           |",
+        "|    - Cybersecurity and Compliance Solutions                                  |",
+        "|    - Database Management and Custom Development                              |",
+        "|    - System Setup, Upgrades, and Troubleshooting                             |",
+        "|    - Virus and Spyware Removal                                               |",
+        "|    - Hardware Procurement, Installation, and Configuration                   |",
         "|                                                                              |",
-        "|  Service Area: Chicagoland (Lake Zurich, IL) & Remote Support Available     |",
+        "|  Service Area: Omaha, NE and Lincoln, NE                                     |",
         "|                                                                              |",
         "|  Contact Us:                                                                 |",
-        "|    Email:    sales@mytech.today                                             |",
-        "|    Website:  https://mytech.today                                           |",
-        "|    Phone:    (847) 767-4914                                                 |",
-        "|    GitHub:   https://github.com/mytech-today-now                            |",
+        "|    Email:    sales@mytech.today                                              |",
+        "|    Website:  https://mytech.today                                            |",
+        "|    GitHub:   https://github.com/mytech-today-now                             |",
+        "|    LinkedIn: https://linkedin.com/in/kylerode                                |",
         "|                                                                              |",
-        "|  20+ Years of Experience | 190+ Satisfied Clients | 5-Star Rating           |",
+        "|  Why Choose myTech.Today?                                                    |",
+        "|    - 20+ years of IT consulting and software development experience          |",
+        "|    - Personalized service to 190+ satisfied clients                          |",
+        "|    - 5-star review rating with consistent 24-hour solution delivery          |",
+        "|    - Payment-upon-success terms available                                    |",
+        "|    - Windows automation, PowerShell scripting, and system optimization       |",
         "|                                                                              |",
         "+==============================================================================+",
         ""
@@ -5510,22 +5527,18 @@ try {
             "|                                                                              |",
             "|  Need Professional IT Support or Custom Automation?                         |",
             "|                                                                              |",
-            "|  myTech.Today offers comprehensive IT services including:                   |",
-            "|    - Custom PowerShell automation and scripting solutions                   |",
-            "|    - Infrastructure optimization and management                             |",
-            "|    - Cloud migration and integration services                               |",
-            "|    - Managed IT services (MSP) for businesses                               |",
-            "|    - 24/7 IT support and consulting                                         |",
+            "|  myTech.Today serves businesses in Omaha, NE and Lincoln, NE.               |",
+            "|  Services include consulting, PowerShell automation, infrastructure,       |",
+            "|  cloud, networking, cybersecurity, databases, software, troubleshooting,    |",
+            "|  virus and spyware removal, and hardware setup and configuration.          |",
             "|                                                                              |",
             "|  Why Choose myTech.Today?                                                   |",
-            "|    - 20+ years of IT experience                                             |",
-            "|    - 190+ satisfied clients                                                 |",
-            "|    - 5-star customer rating                                                 |",
-            "|    - Fast 24-hour solution delivery                                         |",
-            "|    - Serving Chicagoland and remote clients nationwide                      |",
+            "|    - 20+ years of IT consulting and software development experience         |",
+            "|    - Personalized service to 190+ satisfied clients                         |",
+            "|    - 5-star review rating with consistent 24-hour solution delivery          |",
+            "|    - Payment-upon-success terms available                                   |",
             "|                                                                              |",
-            "|  Get a Free Consultation:                                                   |",
-            "|    Call: (847) 767-4914                                                     |",
+            "|  Contact Information:                                                       |",
             "|    Email: sales@mytech.today                                                |",
             "|    Visit: https://mytech.today                                              |",
             "|                                                                              |",

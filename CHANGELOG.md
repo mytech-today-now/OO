@@ -4,6 +4,7 @@
 
 ### Changed
 
+- Align the README company profile and installer help, banner, and completion text with the Omaha and Lincoln service area, listed services, and contact links.
 - Automatically select source-checkout development mode when no release manifest or enforced `AllSigned` policy is present; use the development elevation helper only for that checkout path.
 - Add a setup-only first run that verifies or downloads O&O and opens its UI in interactive sessions when a reviewed profile pair is absent, without applying settings or creating a restore point or scheduled task.
 - Install a new setup-only O&O copy under the current user's LocalAppData when no verified machine copy exists, avoiding a Program Files write on first run; keep approved-profile installation machine-wide.

@@ -4,7 +4,7 @@
 
 ## Developed by myTech.Today
 
-**Professional IT Services - Serving the Midwest**
+**Professional IT Services - Serving Omaha and Lincoln, NE**
 
 This PowerShell automation script is developed and maintained by **myTech.Today**, a professional IT consulting and managed services provider with 20+ years of experience delivering customized technology solutions.
 
@@ -15,7 +15,7 @@ This PowerShell automation script is developed and maintained by **myTech.Today*
 <tr>
 <td colspan="2" align="center">
 <h3>🏢 About myTech.Today</h3>
-<p><strong>myTech.Today</strong> specializes in providing expert IT consulting, automation, and support services to businesses and individuals across the Midwest. We deliver personalized solutions that improve efficiency, enhance security, and drive business value.</p>
+<p><strong>myTech.Today</strong> specializes in providing expert IT consulting, automation, and support services to businesses and individuals in Omaha and Lincoln, Nebraska. We deliver personalized solutions that improve efficiency, enhance security, and drive business value.</p>
 </td>
 </tr>
 </table>
@@ -32,7 +32,7 @@ This PowerShell automation script is developed and maintained by **myTech.Today*
 <li>IT Consulting and Support</li>
 <li>Custom PowerShell Automation and Scripting</li>
 <li>Infrastructure Optimization and System Administration</li>
-<li>Cloud Integration (Azure, AWS, Microsoft 365)</li>
+<li>Cloud Integration (Azure, AWS, GCS, Microsoft 365)</li>
 <li>Network Design and Management</li>
 <li>Cybersecurity and Compliance Solutions</li>
 <li>Database Management and Custom Development</li>
@@ -43,11 +43,8 @@ This PowerShell automation script is developed and maintained by **myTech.Today*
 
 <h4>📍 Service Area</h4>
 <ul>
-<li>Chicagoland, IL</li>
-<li>Illinois</li>
-<li>Southern Wisconsin</li>
-<li>Northern Indiana</li>
-<li>Southern Michigan</li>
+<li>Omaha, NE</li>
+<li>Lincoln, NE</li>
 </ul>
 
 </td>
@@ -67,7 +64,6 @@ This PowerShell automation script is developed and maintained by **myTech.Today*
 <h4>📬 Contact Information</h4>
 <table>
 <tr><td>📧 <strong>Email</strong></td><td><a href="mailto:sales@mytech.today">sales@mytech.today</a></td></tr>
-<tr><td>📞 <strong>Phone</strong></td><td>(847) 767-4914</td></tr>
 <tr><td>🌐 <strong>Website</strong></td><td><a href="https://mytech.today">mytech.today</a></td></tr>
 <tr><td>💻 <strong>GitHub</strong></td><td><a href="https://github.com/mytech-today-now">@mytech-today-now</a></td></tr>
 <tr><td>🔗 <strong>LinkedIn</strong></td><td><a href="https://linkedin.com/in/kylerode">linkedin.com/in/kylerode</a></td></tr>
@@ -82,7 +78,7 @@ This PowerShell automation script is developed and maintained by **myTech.Today*
 <table>
 <tr>
 <td colspan="2" align="center">
-<sub><strong>myTech.Today</strong> · Professional IT Services · Serving the Midwest · <a href="https://mytech.today">mytech.today</a> · (847) 767-4914</sub>
+<sub><strong>myTech.Today</strong> · Professional IT Services · Serving Omaha and Lincoln · <a href="https://mytech.today">mytech.today</a></sub>
 </td>
 </tr>
 </table>
@@ -603,69 +599,5 @@ For unversioned changes, see [CHANGELOG.md](CHANGELOG.md).
 
 ## Need Professional IT Support?
 
-**myTech.Today** is here to help with all your technology needs!
-
-### Our Expertise
-
-With over 20 years of experience in IT consulting and software development, we provide comprehensive technology solutions tailored to your specific needs. From simple troubleshooting to complex infrastructure optimization, we deliver results that drive business value.
-
-### Services We Offer
-
-**IT Consulting & Support:**
-- Expert consultation on purchasing decisions and system setup
-- Troubleshooting and problem resolution
-- System upgrades and optimization
-- Virus and spyware removal
-- Security solutions and compliance
-
-**Custom Development & Automation:**
-- PowerShell scripting and automation
-- Custom application development (C#, Python, React/Node)
-- Database management and integration
-- Workflow optimization
-- EDI and ERP systems integration
-
-**Infrastructure & Cloud Services:**
-- Infrastructure optimization and system administration
-- Cloud integration (Azure, AWS, Microsoft 365)
-- Network design and management
-- Server administration (Windows & Linux)
-- Backup and disaster recovery solutions
-
-**Specialized Services:**
-- Active Directory and Group Policy management
-- Email server setup and configuration
-- Website design and maintenance
-- SEO and digital marketing
-- Remote support and VPN solutions
-
-### Why Choose myTech.Today?
-
-- **Experienced:** 20+ years delivering technology solutions
-- **Trusted:** Serving 190+ satisfied clients with a 5-star rating
-- **Responsive:** Consistent 24-hour solution delivery
-- **Flexible:** Payment-upon-success terms available
-- **Results-Driven:** Proven track record of exceeding client goals
-
-### Service Area
-
-We proudly serve businesses and individuals throughout the Midwest:
-- **Chicagoland, IL** - Lake Zurich and surrounding areas
-- **Northern Illinois**
-- **Southern Wisconsin**
-- **Northern Indiana**
-- **Southern Michigan**
-
-### Get in Touch
-
-Ready to optimize your technology infrastructure? Contact us today!
-
-**Email:** sales@mytech.today
-**Phone:** (847) 767-4914
-**Website:** https://mytech.today
-**GitHub:** [@mytech-today-now](https://github.com/mytech-today-now)
-
----
-
-**myTech.Today** - *Professional IT Services Delivering Results Since 2016*
+See the myTech.Today services, Omaha and Lincoln service area, experience, and contact links in the company profile at the beginning of this README.
 
